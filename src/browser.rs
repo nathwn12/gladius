@@ -264,7 +264,21 @@ impl Browser {
         let shared = self.shared().await?;
         // Ensure an active page exists so the index space is well-defined.
         ensure_session(&shared).await?;
-        let infos = ordered_targets(&shared).await?;
+        // A click that opens a tab returns before Chrome lists the new
+        // target (measured: system Chrome still showed 1 target ~120ms
+        // after click_settle; headless-shell already showed 2). Bounded
+        // wait for the index to appear so select is deterministic.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let infos = loop {
+            let infos = ordered_targets(&shared).await?;
+            if infos.len() > index {
+                break infos;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("tabs: no tab at index {index}"));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
         let t = infos
             .get(index)
             .ok_or(format!("tabs: no tab at index {index}"))?;
@@ -1253,6 +1267,12 @@ fn headless_argv(profile_dir: &std::path::Path) -> Vec<String> {
             .to_string(),
         "--mute-audio".to_string(),
         "--disable-software-rasterizer".to_string(),
+        // Tab-opening clicks are synthetic (no trusted gesture), so a
+        // stock Chrome popup blocker swallows target=_blank opens
+        // (measured: window.open -> null on system Chrome, new target on
+        // headless-shell). Automation backends must not depend on which
+        // binary enforces the blocker.
+        "--disable-popup-blocking".to_string(),
         format!("--user-data-dir={}", profile_dir.display()),
         "about:blank".to_string(),
     ]
