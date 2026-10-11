@@ -29,14 +29,23 @@ struct Client {
 impl Client {
     fn spawn() -> Self {
         let bin = env!("CARGO_BIN_EXE_gladius");
-        let mut child = Command::new(bin)
-            .arg("mcp")
+        let mut cmd = Command::new(bin);
+        cmd.arg("mcp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
-            .creation_flags(0x08000000) // CREATE_NO_WINDOW
-            .spawn()
-            .expect("spawn gladius mcp");
+            .creation_flags(0x08000000); // CREATE_NO_WINDOW
+                                         // Default-engine tests locate the pinned engine binary: cargo runs
+                                         // the server from target/release (no obscura sibling there), so
+                                         // GLADIUS_OBSCURA points at the repo-pinned bin/obscura.exe. Still
+                                         // the default ENGINE (obscura); only the binary location is pinned
+                                         // for the cargo tree. The sibling layout itself is proved live by
+                                         // the Phase 2b proof session (bin/ gladius + obscura, no env set).
+        cmd.env(
+            "GLADIUS_OBSCURA",
+            format!("{}/bin/obscura.exe", env!("CARGO_MANIFEST_DIR")),
+        );
+        let mut child = cmd.spawn().expect("spawn gladius mcp");
         let stdin = child.stdin.take().expect("child stdin");
         let stdout: ChildStdout = child.stdout.take().expect("child stdout");
         let (tx, rx) = mpsc::channel();
@@ -211,9 +220,11 @@ fn e2e_mcp_fixture_flow() {
     assert!(ev.get("isError").is_none(), "evaluate ok: {ev}");
     let ev_text = content_text(&ev);
     let ev_obj: Value = serde_json::from_str(&ev_text).expect("evaluate json");
+    // Numeric compare (as_f64): engines differ in number shape (chrome
+    // returns `42`, Obscura `42.0`) while the VALUE is identical.
     assert_eq!(
-        ev_obj.get("value"),
-        Some(&json!(42)),
+        ev_obj.get("value").and_then(|v| v.as_f64()),
+        Some(42.0),
         "known value: {ev_text}"
     );
 

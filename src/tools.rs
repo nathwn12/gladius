@@ -245,7 +245,32 @@ async fn tool_navigate(browser: &Browser, url: &str) -> Result<Value, String> {
     // never sees the main-frame response status (there is no Network-domain
     // capture here), and a hardcoded 200 lies on every 404. A wrong field is
     // worse than no field, so the envelope is just url + title.
-    Ok(ok_text(json!({"url": cur, "title": title}).to_string()))
+    //
+    // Transient blank-load race (measured on Obscura: the engine
+    // double-fetches documents and the losing request can commit an EMPTY DOM
+    // - empty title, empty body - at the right URL): when the committed page
+    // is non-blank yet title AND body text are both empty, say so in a
+    // `warning` field so the caller can see it (and re-navigate - the flake
+    // is retryable). One extra eval, only on suspicious pages; no retry
+    // magic here.
+    if !title.is_empty() || cur.is_empty() || cur == "about:blank" {
+        return Ok(ok_text(json!({"url": cur, "title": title}).to_string()));
+    }
+    let body_len = browser
+        .eval("(((document.body && document.body.innerText) || '') + '').length")
+        .await
+        .ok()
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+    if body_len == 0 {
+        Ok(ok_text(
+            json!({"url": cur, "title": title,
+                   "warning": "possible blank-load race: committed URL with empty document (empty title and empty body text); re-navigate to confirm"})
+            .to_string(),
+        ))
+    } else {
+        Ok(ok_text(json!({"url": cur, "title": title}).to_string()))
+    }
 }
 
 /// Parse an AX ref arg (`@e3`) to its table id (`e3`). Selectors pass through

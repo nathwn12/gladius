@@ -33,6 +33,12 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        // Default-engine location pin (see e2e_mcp.rs): cargo tree has no
+        // obscura sibling, so point at the repo-pinned bin/obscura.exe.
+        cmd.env(
+            "GLADIUS_OBSCURA",
+            format!("{}/bin/obscura.exe", env!("CARGO_MANIFEST_DIR")),
+        );
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
