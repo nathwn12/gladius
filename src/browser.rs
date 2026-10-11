@@ -92,16 +92,16 @@ struct Shared {
 
 /// Ownership of the engine behind an `Inner` connection.
 ///
-/// - `Owned`: gladius launched the engine itself (the current launch path:
-///   throwaway `gladius-<pid>-*` profile, child handle, job cover). `close()`
-///   reaps the whole tree.
+/// - `Owned`: gladius launched the engine itself (child handle, job cover;
+///   the chrome path additionally owns a throwaway `gladius-<pid>-*`
+///   profile, the obscura path owns none). `close()` reaps the whole tree.
 /// - `Attached`: gladius connected to an externally started engine via
 ///   `GLADIUS_CDP_URL` (the stub-engine interface: the real replacement
 ///   engine plugs in here). The engine is NOT ours: `close()` only detaches
 ///   the CDP session we opened and never kills, never sweeps a profile.
 enum Engine {
     Owned {
-        _profile: ProfileDir,
+        _profile: Option<ProfileDir>,
         #[cfg(windows)]
         _job: Option<std::os::windows::io::OwnedHandle>,
         child: tokio::process::Child,
@@ -1546,7 +1546,7 @@ async fn launch_owned_chrome() -> Result<Inner, String> {
     drop(guard); // disarmed: child moved out, Drop is a no-op
     Ok(Inner {
         engine: Engine::Owned {
-            _profile: profile,
+            _profile: Some(profile),
             #[cfg(windows)]
             _job: job,
             child,
@@ -1635,10 +1635,80 @@ fn obscura_argv(port: u16) -> Vec<String> {
 /// session/target flow is never forked. Every wait here is bounded (the
 /// engine also drops idle browser WS connections at ~60-70 s, so clients
 /// connect lazily on first tool use and bound every wait).
+
+/// Confine the OWNED Obscura ws endpoint to our loopback port.
+///
+/// The owned path frees its chosen port before the engine binds it, so a
+/// local squatter can claim the port and advertise `ws://<somewhere-else>/`
+/// via `/json/version`. The attach path (`resolve_ws_url`) must keep
+/// accepting whatever the user pointed at, so confinement lives here and is
+/// applied ONLY to the owned resolve result: the scheme must be `ws`/`wss`,
+/// the host must be loopback (`127.0.0.1`, `::1`, `[::1]`, `localhost`), and
+/// the port must equal the port we chose. Pure: no I/O, unit-tested below.
+fn confine_owned_ws_url(port: u16, url: &str) -> Result<(), String> {
+    let s = url.trim();
+    let after_scheme = if let Some(rest) = s.strip_prefix("ws://") {
+        rest
+    } else if let Some(rest) = s.strip_prefix("wss://") {
+        rest
+    } else {
+        return Err(format!(
+            "owned ws endpoint rejected: non-ws scheme in {url:?}"
+        ));
+    };
+    let authority = after_scheme.split('/').next().unwrap_or("");
+    // Strip any userinfo (never expected, but never let it smuggle a host).
+    let hostport = authority.rsplit('@').next().unwrap_or("");
+    let (host, port_str) = if let Some(rest) = hostport.strip_prefix('[') {
+        // Bracketed literal, e.g. `[::1]:5555`.
+        match rest.find(']') {
+            Some(i) => {
+                let tail = &rest[i + 1..];
+                (&rest[..i], tail.strip_prefix(':').unwrap_or(""))
+            }
+            None => {
+                return Err(format!(
+                    "owned ws endpoint rejected: bad bracketed host in {url:?}"
+                ));
+            }
+        }
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h, p),
+            None => {
+                return Err(format!(
+                    "owned ws endpoint rejected: no port in {url:?}"
+                ));
+            }
+        }
+    };
+    let host_lc = host.to_ascii_lowercase();
+    if host_lc != "127.0.0.1"
+        && host_lc != "::1"
+        && host_lc != "[::1]"
+        && host_lc != "localhost"
+    {
+        return Err(format!(
+            "owned ws endpoint rejected: non-loopback host {host:?} in {url:?}"
+        ));
+    }
+    let got: u16 = port_str.parse().map_err(|_| {
+        format!("owned ws endpoint rejected: bad port in {url:?}")
+    })?;
+    if got != port {
+        return Err(format!(
+            "owned ws endpoint rejected: port {got} != owned port {port} in {url:?}"
+        ));
+    }
+    Ok(())
+}
+
 async fn launch_owned_obscura() -> Result<Inner, String> {
     let deadline = startup_timeout();
-    sweep_stale_profiles();
-    let profile = ProfileDir::create()?;
+    // No profile here: the engine's argv never receives one (measured: the
+    // engine writes 0 profile bytes), so a failed temp-dir creation must not
+    // abort a profile-free launch. The chrome path keeps its own sweep and
+    // profile above, untouched.
     let obscura = find_obscura()?;
     // Free loopback port: bind :0, read the port, drop it.
     let port = {
@@ -1687,8 +1757,31 @@ async fn launch_owned_obscura() -> Result<Inner, String> {
     let base = format!("http://127.0.0.1:{port}");
     let start = Instant::now();
     let ws_url = loop {
+        // Child-exit detection: if the engine died, the port may now belong
+        // to someone else - never keep polling it, fail on the exit status.
+        if let Ok(Some(status)) = guard
+            .child
+            .as_mut()
+            .expect("guard holds child")
+            .try_wait()
+        {
+            return Err(format!("obscura child exited during startup: {status}"));
+        }
         match resolve_ws_url(&base).await {
-            Ok(u) => break u,
+            Ok(u) => {
+                // A success that arrives after the deadline is still a
+                // timeout: the budget is enforced, not just tested on error.
+                if start.elapsed() >= deadline {
+                    return Err(format!(
+                        "timeout waiting for obscura /json/version on {base}: \
+                         deadline passed before accepting a ready endpoint"
+                    ));
+                }
+                // Owned path only: confine the advertised endpoint to our
+                // loopback port before connecting anywhere.
+                confine_owned_ws_url(port, &u)?;
+                break u;
+            }
             Err(e) => {
                 if start.elapsed() >= deadline {
                     return Err(format!(
@@ -1702,8 +1795,22 @@ async fn launch_owned_obscura() -> Result<Inner, String> {
         }
     };
 
-    let (ws, _) = connect_async(&ws_url)
+    // The connect also runs inside the startup budget: a stalled handshake
+    // must error on elapse, never overshoot the deadline unbounded.
+    if start.elapsed() >= deadline {
+        return Err(format!(
+            "timeout waiting for obscura ws connect on {ws_url}: startup budget exhausted"
+        ));
+    }
+    let remaining = deadline - start.elapsed();
+    let (ws, _) = tokio::time::timeout(remaining, connect_async(&ws_url))
         .await
+        .map_err(|_| {
+            format!(
+                "ws connect {ws_url} timed out after {}ms of remaining startup budget",
+                remaining.as_millis()
+            )
+        })?
         .map_err(|e| format!("ws connect {ws_url}: {e}"))?;
     let (sink, stream) = ws.split();
     let shared = new_shared(sink);
@@ -1713,7 +1820,7 @@ async fn launch_owned_obscura() -> Result<Inner, String> {
     drop(guard); // disarmed: child moved out, Drop is a no-op
     Ok(Inner {
         engine: Engine::Owned {
-            _profile: profile,
+            _profile: None,
             #[cfg(windows)]
             _job: job,
             child,
@@ -2031,7 +2138,7 @@ mod tests {
         let profile = ProfileDir::create().expect("profile");
         let inner = Inner {
             engine: Engine::Owned {
-                _profile: profile,
+                _profile: Some(profile),
                 #[cfg(windows)]
                 _job: None,
                 child,
@@ -2585,5 +2692,50 @@ mod tests {
             b.snap_url().await.is_empty(),
             "refusal must not touch the browser"
         );
+    }
+
+    /// Owned-endpoint confinement table: our loopback port passes, anything
+    /// else fails. The attach path (`resolve_ws_url`) is deliberately NOT
+    /// confined - it must keep accepting whatever the user pointed at.
+    #[test]
+    fn confine_owned_ws_url_accepts_only_our_loopback_port() {
+        confine_owned_ws_url(5555, "ws://127.0.0.1:5555/devtools/browser/x")
+            .expect("127.0.0.1 + owned port accepts");
+        confine_owned_ws_url(5555, "ws://localhost:5555/devtools/browser/x")
+            .expect("localhost + owned port accepts");
+        assert!(
+            confine_owned_ws_url(5555, "ws://127.0.0.1:5556/devtools/browser/x").is_err(),
+            "a different port must be rejected"
+        );
+        assert!(
+            confine_owned_ws_url(5555, "ws://192.168.1.10:5555/devtools/browser/x").is_err(),
+            "a non-loopback host must be rejected"
+        );
+        assert!(
+            confine_owned_ws_url(5555, "http://127.0.0.1:5555/devtools/browser/x").is_err(),
+            "a non-ws scheme must be rejected"
+        );
+    }
+
+    /// Composition: a squatter `/json/version` advertising a non-loopback
+    /// endpoint must fail the owned resolve+confine path. Bounded (the fake
+    /// answers immediately on loopback) and local only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_resolve_confine_rejects_squatter_endpoint() {
+        let (base, http) = fake_version_http("ws://192.0.2.1:9000/".to_string()).await;
+        let got = resolve_ws_url(&base).await.expect("squatter resolves");
+        assert_eq!(got, "ws://192.0.2.1:9000/");
+        let port: u16 = base
+            .rsplit(':')
+            .next()
+            .expect("base has a port")
+            .parse()
+            .expect("base port parses");
+        let r = confine_owned_ws_url(port, &got);
+        assert!(
+            r.is_err(),
+            "squatter endpoint must be confined, got: {got}"
+        );
+        http.abort();
     }
 }
