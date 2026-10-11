@@ -120,4 +120,15 @@ $finalA = Get-Sha256Hex $ObscuraPath
 $finalW = Get-Sha256Hex $WorkerPath
 Write-Host ("verify bin\obscura.exe: computed={0} expected={1}" -f $finalA, $ExpectedObscuraSha256)
 Write-Host ("verify bin\obscura-worker.exe: computed={0} expected={1}" -f $finalW, $ExpectedWorkerSha256)
+if ($finalA -ne $ExpectedObscuraSha256) {
+  Write-Host ("verify mismatch bin\obscura.exe: computed={0} expected={1}; removing mismatched file." -f $finalA, $ExpectedObscuraSha256)
+  Remove-Item -LiteralPath $ObscuraPath -Force -ErrorAction SilentlyContinue
+}
+if ($finalW -ne $ExpectedWorkerSha256) {
+  Write-Host ("verify mismatch bin\obscura-worker.exe: computed={0} expected={1}; removing mismatched file." -f $finalW, $ExpectedWorkerSha256)
+  Remove-Item -LiteralPath $WorkerPath -Force -ErrorAction SilentlyContinue
+}
+if ($finalA -ne $ExpectedObscuraSha256 -or $finalW -ne $ExpectedWorkerSha256) {
+  exit 1
+}
 Write-Host 'engine provisioned and verified.'
