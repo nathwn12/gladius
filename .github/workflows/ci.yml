@@ -1,12 +1,12 @@
+# nathwn12 house CI — stack: rust (copy to .github/workflows/ci.yml)
 name: ci
-
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
-
 jobs:
-  build-test:
+  build:
     runs-on: windows-latest
     # The test suites drive a headless Chrome over CDP. The suite probes the
     # ms-playwright headless-shell path first and falls back to a system
@@ -17,15 +17,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - name: fmt
-        run: cargo fmt --check
-        continue-on-error: true
-      - name: clippy
-        run: cargo clippy --all-targets
-        continue-on-error: true
-      - name: build
-        run: cargo build --release
-      - name: test
-        run: cargo test
+      - run: cargo build --locked
+      - run: cargo test --locked
