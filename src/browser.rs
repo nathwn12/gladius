@@ -1863,6 +1863,16 @@ async fn launch_owned_obscura() -> Result<Inner, String> {
             )
         })?
         .map_err(|e| format!("ws connect {ws_url}: {e}"))?;
+    // Post-connect child re-check: confinement only checks the advertised
+    // host and port, so a squatter on OUR OWN port advertising a same-port
+    // loopback URL passes it - the child's liveness is the only remaining
+    // discriminator. If the child died (e.g. its own bind failure) while
+    // the handshake awaited, this socket may belong to an impostor: fail
+    // here so the guard kills the tree and the socket is dropped.
+    // Review-enforced, not test-enforced: no test drives
+    // `launch_owned_obscura`, so removing this call (or the
+    // `owned_ws_request` confine above) stays green.
+    check_obscura_child(&mut guard)?;
     // Tokio's `timeout` polls the inner future first, so a handshake that
     // completes at/after expiry still returns `Ok`: re-enforce the deadline
     // after a successful connect, before building `Inner` or announcing
