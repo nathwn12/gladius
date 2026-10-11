@@ -32,6 +32,10 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        // Chrome opt-in: this test observes chrome-named processes and the
+        // profile token in the engine command line (chrome-only shape), so
+        // the reaping/sweep machinery is proved via the chrome backend.
+        cmd.env("GLADIUS_BACKEND", "chrome");
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;

@@ -6,8 +6,9 @@
 //! - `GLADIUS_BACKEND_CAPS=dom-only` refuses `screenshot` (no rendering
 //!   pipeline) while DOM tools keep working; `upload` needs no rendering
 //!   (DOM CDP only) so it keeps working too - proved live here.
-//! - Default path (neither var set) is unchanged: covered by `e2e_mcp` plus
-//!   the `initialize_reports_default_backend` fast check below (no browser).
+//! - Default path (neither var set) is the owned Obscura launch: covered by
+//!   `e2e_mcp` plus the `initialize_reports_default_backend` fast check below
+//!   (no browser).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -585,10 +586,10 @@ fn dom_only_refuses_screenshot_but_keeps_dom_tools() {
 
 #[test]
 fn initialize_reports_default_backend_without_launching() {
-    // Neither var set: cold handshake reports the owned render backend and
-    // launches nothing (no navigate here, so no browser spawns).
+    // Neither var set: cold handshake reports the owned Obscura render
+    // backend and launches nothing (no navigate here, so no browser spawns).
     let mut c = Client::spawn_with_env(&[]);
-    assert_initialize(&mut c, "chrome-headless-shell", "render");
+    assert_initialize(&mut c, "obscura", "render");
     let pong = c.result("ping", json!({}));
     assert_eq!(pong, json!({}), "ping replies {{}}");
     shutdown(c);

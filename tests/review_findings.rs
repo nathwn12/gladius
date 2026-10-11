@@ -69,7 +69,13 @@ impl Client {
     }
 
     fn spawn() -> Self {
-        Self::spawn_with_env(&[])
+        // Default-engine location pin (see e2e_mcp.rs): cargo tree has no
+        // obscura sibling, so point at the repo-pinned bin/obscura.exe.
+        // (The stub-timeout test below overrides with GLADIUS_BACKEND=chrome.)
+        Self::spawn_with_env(&[(
+            "GLADIUS_OBSCURA",
+            &format!("{}/bin/obscura.exe", env!("CARGO_MANIFEST_DIR")),
+        )])
     }
 
     fn recv(&self, what: &str) -> Value {
@@ -174,8 +180,11 @@ fn stub_pids() -> Vec<u32> {
 
 #[test]
 fn startup_timeout_kills_stub_tree() {
-    // Force the startup-timeout path: silent stub + 2s deadline.
+    // Force the startup-timeout path: silent stub + 2s deadline. Chrome
+    // opt-in: the GLADIUS_TEST_STUB_SLEEP_SECS hook lives in the
+    // chrome-headless-shell launch path.
     let mut c = Client::spawn_with_env(&[
+        ("GLADIUS_BACKEND", "chrome"),
         ("GLADIUS_TEST_STUB_SLEEP_SECS", "90"),
         ("GLADIUS_STARTUP_TIMEOUT_SECS", "2"),
     ]);

@@ -33,6 +33,11 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        // Chrome opt-in: these tests need REAL JS dialogs (alert/confirm
+        // auto-accept + typed reports). Obscura never fires
+        // Page.javascriptDialogOpening (its alert() is a silent no-op), so
+        // the dialog faces must run on the chrome backend.
+        cmd.env("GLADIUS_BACKEND", "chrome");
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;

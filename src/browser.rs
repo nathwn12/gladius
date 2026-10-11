@@ -159,12 +159,37 @@ pub fn cdp_url_override() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Selected launch backend, in strict order: an explicit `GLADIUS_CDP_URL`
+/// attaches to an external engine; `GLADIUS_BACKEND=chrome`
+/// (case-insensitive, surrounding whitespace ignored) opts into the
+/// chrome-headless-shell launch; anything else (unset, blank, or any other
+/// value) launches the owned Obscura engine, the default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BackendSel {
+    Attach,
+    Chrome,
+    Obscura,
+}
+
+/// Raw backend selection without connecting (safe on cold paths and in tests).
+pub fn selected_backend() -> BackendSel {
+    if cdp_url_override().is_some() {
+        return BackendSel::Attach;
+    }
+    match std::env::var("GLADIUS_BACKEND") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("chrome") => BackendSel::Chrome,
+        _ => BackendSel::Obscura,
+    }
+}
+
 /// Engine name for the initialize response: `external-cdp` when attached,
-/// otherwise the owned `chrome-headless-shell` launch path.
+/// `chrome-headless-shell` on the explicit chrome opt-in, otherwise the
+/// owned `obscura` default launch.
 pub fn backend_name() -> String {
-    match cdp_url_override() {
-        Some(_) => "external-cdp".to_string(),
-        None => "chrome-headless-shell".to_string(),
+    match selected_backend() {
+        BackendSel::Attach => "external-cdp".to_string(),
+        BackendSel::Chrome => "chrome-headless-shell".to_string(),
+        BackendSel::Obscura => "obscura".to_string(),
     }
 }
 
@@ -1214,6 +1239,11 @@ async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
         // Console ring: buffer console.* calls, uncaught exceptions, and
         // failed-resource log lines for the `console` tool. Bounded
         // (`CONSOLE_CAP`); a quiet page costs two string compares here.
+        // Engine note: `Log.enable` succeeds everywhere, but engines that
+        // never emit `Log.entryAdded` (measured: Obscura, zero events) lose
+        // the Log leg - `Runtime.consoleAPICalled` still flows, so the
+        // `console` tool works for page consoles and only loses Log-sourced
+        // entries.
         if v.get("method").and_then(|m| m.as_str()) == Some("Runtime.consoleAPICalled") {
             let params = v.get("params").cloned().unwrap_or(Value::Null);
             push_console(&shared, console_message(&params)).await;
@@ -1265,6 +1295,14 @@ async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
         // dialog is handled (measured: dlg-01 click HANG, 15s bench timeout).
         // Auto-ACCEPT immediately so a dialog can NEVER wedge a run, and
         // record it for the acting tool's typed report.
+        // Engine note: this send fires ONLY on `Page.javascriptDialogOpening`.
+        // On engines that never emit that event (measured: Obscura never
+        // fires it, and its `Page.handleJavaScriptDialog` answers `-32601
+        // Unknown Page method`), the flow goes inert - no send, no reply, so
+        // NO error path here can surface on such an engine. The user-visible
+        // effect is only the absence of dialog reports (`click` returns plain
+        // `{"ok":true}`, `evaluate` a plain value); Obscura's `alert()` is a
+        // silent no-op (returns undefined immediately), so no hang either.
         if v.get("method").and_then(|m| m.as_str()) == Some("Page.javascriptDialogOpening") {
             let params = v.get("params").cloned().unwrap_or(Value::Null);
             let dtype = params
@@ -1394,9 +1432,11 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Launch dispatcher: `GLADIUS_CDP_URL` set means attach to the external
-/// engine (the stub-engine interface) instead of launching. Neither var set
-/// keeps the byte-for-byte current launch path (`launch_owned`).
+/// Launch dispatcher, in strict order: `GLADIUS_CDP_URL` set means attach
+/// to the external engine (the stub-engine interface) instead of launching;
+/// `GLADIUS_BACKEND=chrome` means the chrome-headless-shell launch
+/// (`launch_owned_chrome`); anything else launches the owned Obscura engine
+/// (`launch_owned_obscura`, the default).
 async fn launch() -> Result<Inner, String> {
     // A bad caps value is a config error: fail fast on either path.
     if let Err(e) = backend_caps() {
@@ -1405,10 +1445,16 @@ async fn launch() -> Result<Inner, String> {
     if let Some(raw) = cdp_url_override() {
         return attach(&raw).await;
     }
-    launch_owned().await
+    match selected_backend() {
+        BackendSel::Chrome => launch_owned_chrome().await,
+        _ => launch_owned_obscura().await,
+    }
 }
 
-async fn launch_owned() -> Result<Inner, String> {
+/// Explicit chrome opt-in launch (`GLADIUS_BACKEND=chrome`). Byte-for-byte
+/// the former default path: throwaway `gladius-<pid>-*` profile, DevTools
+/// listening line parsed from engine stderr, whole tree reaped on close.
+async fn launch_owned_chrome() -> Result<Inner, String> {
     let deadline = startup_timeout();
     sweep_stale_profiles();
     let profile = ProfileDir::create()?;
@@ -1496,6 +1542,173 @@ async fn launch_owned() -> Result<Inner, String> {
     let shared = new_shared(sink);
     let reader = tokio::spawn(reader_loop(stream, shared.clone()));
     eprintln!("[gladius] browser ready pid={pid}");
+    let child = guard.child.take().expect("guard holds child");
+    drop(guard); // disarmed: child moved out, Drop is a no-op
+    Ok(Inner {
+        engine: Engine::Owned {
+            _profile: profile,
+            #[cfg(windows)]
+            _job: job,
+            child,
+            pid,
+        },
+        shared,
+        reader,
+    })
+}
+
+#[cfg(windows)]
+const OBSCURA_FILE: &str = "obscura.exe";
+#[cfg(not(windows))]
+const OBSCURA_FILE: &str = "obscura";
+
+/// Obscura (default engine) resolution: `GLADIUS_OBSCURA` wins when set and
+/// non-blank, otherwise `obscura.exe` as a sibling of the running executable
+/// (`std::env::current_exe()` parent dir - the engine ships beside
+/// `gladius.exe`). A missing engine is a CLEAR error naming
+/// `scripts/fetch-engine.ps1`: never a silent fallback to Chrome, and never
+/// a system-browser path (there is deliberately no headed-capable fallback,
+/// same rule as `find_chrome`).
+fn find_obscura() -> Result<std::path::PathBuf, String> {
+    if let Ok(p) = std::env::var("GLADIUS_OBSCURA") {
+        if !p.trim().is_empty() {
+            let cand = std::path::PathBuf::from(p.trim());
+            if cand.is_file() {
+                return Ok(cand);
+            }
+            return Err(format!(
+                "obscura engine not found: GLADIUS_OBSCURA='{}' is not a file; \
+                 run scripts/fetch-engine.ps1 to provision the pinned engine",
+                cand.display()
+            ));
+        }
+    }
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join(OBSCURA_FILE)));
+    match sibling {
+        Some(cand) if cand.is_file() => Ok(cand),
+        Some(cand) => Err(format!(
+            "obscura engine not found: expected {} beside the running gladius \
+             executable; run scripts/fetch-engine.ps1 to provision the pinned engine",
+            cand.display()
+        )),
+        None => Err(
+            "obscura engine not found: cannot locate the running executable; \
+             set GLADIUS_OBSCURA to the engine path or run scripts/fetch-engine.ps1 \
+             to provision the pinned engine"
+                .to_string(),
+        ),
+    }
+}
+
+/// Obscura serve argv for `port`. Each flag appears EXACTLY ONCE: the
+/// engine's clap parser hard-fails on a repeated flag (`error: the argument
+/// '<flag>' cannot be used multiple times`). Both gate flags are MANDATORY
+/// and measured, not guessed: without `--allow-private-network`,
+/// `Page.navigate` to loopback fails `-32000 Network error: Access to
+/// private/internal IP address 127.0.0.1 is not allowed`; without
+/// `--allow-file-access`, `file://` navigate fails `-32601 Page.navigate to
+/// file:// is disabled` and `DOM.setFileInputFiles` is refused. That
+/// re-opens the engine's SSRF gate and allows local-file reads; the trade is
+/// deliberate (parity with chrome-headless-shell, loopback-bound CDP).
+fn obscura_argv(port: u16) -> Vec<String> {
+    vec![
+        "serve".to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "--allow-private-network".to_string(),
+        "--allow-file-access".to_string(),
+    ]
+}
+
+/// Default owned launch: the Obscura engine (`serve` on a free loopback
+/// port), modelled as `Engine::Owned` so `close()` kills the tree we
+/// started. Readiness polls `GET http://127.0.0.1:<port>/json/version` for
+/// `webSocketDebuggerUrl` inside `startup_timeout()`: a ready-file is NOT
+/// trusted (measured flaking twice - the engine serving with no file
+/// published). The ws URL then flows through the SAME shared machinery the
+/// attach path uses (`resolve_ws_url` handles `http://...` ->
+/// `/json/version` -> `webSocketDebuggerUrl`), so the post-connect
+/// session/target flow is never forked. Every wait here is bounded (the
+/// engine also drops idle browser WS connections at ~60-70 s, so clients
+/// connect lazily on first tool use and bound every wait).
+async fn launch_owned_obscura() -> Result<Inner, String> {
+    let deadline = startup_timeout();
+    sweep_stale_profiles();
+    let profile = ProfileDir::create()?;
+    let obscura = find_obscura()?;
+    // Free loopback port: bind :0, read the port, drop it.
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| format!("obscura free port: {e}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| format!("obscura free port: {e}"))?
+            .port();
+        drop(listener);
+        port
+    };
+    eprintln!(
+        "[gladius] backend: obscura {} (port {port})",
+        obscura.display()
+    );
+    let mut std_cmd = std::process::Command::new(&obscura);
+    std_cmd.args(obscura_argv(port));
+    // Readiness is the HTTP poll below, so engine stdio is discarded (never
+    // a piped-but-undrained buffer the engine could block on).
+    std_cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        std_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let spawned = Command::from(std_cmd)
+        .spawn()
+        .map_err(|e| format!("spawn obscura: {e}"))?;
+    // Guard is armed from here on: any `?`/early-return kills the tree.
+    let mut guard = ChildGuard {
+        pid: spawned.id().unwrap_or(u32::MAX),
+        child: Some(spawned),
+    };
+    if guard.pid == u32::MAX {
+        return Err("obscura child has no pid".to_string());
+    }
+    // Hard-kill cover (G-4), same as the chrome path: the OS reaps the tree
+    // when gladius dies by ANY means.
+    #[cfg(windows)]
+    let job = job::arm(guard.child.as_ref().expect("guard holds child"));
+    let pid = guard.pid;
+    let base = format!("http://127.0.0.1:{port}");
+    let start = Instant::now();
+    let ws_url = loop {
+        match resolve_ws_url(&base).await {
+            Ok(u) => break u,
+            Err(e) => {
+                if start.elapsed() >= deadline {
+                    return Err(format!(
+                        "timeout waiting for obscura /json/version on {base}: last error: {e}"
+                    ));
+                }
+                // Engine still starting: re-poll at 100 ms cadence inside
+                // the same deadline.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+
+    let (ws, _) = connect_async(&ws_url)
+        .await
+        .map_err(|e| format!("ws connect {ws_url}: {e}"))?;
+    let (sink, stream) = ws.split();
+    let shared = new_shared(sink);
+    let reader = tokio::spawn(reader_loop(stream, shared.clone()));
+    eprintln!("[gladius] browser ready pid={pid} (obscura)");
     let child = guard.child.take().expect("guard holds child");
     drop(guard); // disarmed: child moved out, Drop is a no-op
     Ok(Inner {
@@ -2234,17 +2447,107 @@ mod tests {
     }
 
     /// Default path selection: with neither env var set the backend is the
-    /// owned headless-shell launch with render caps.
+    /// owned Obscura launch with render caps.
     #[test]
-    fn default_path_is_owned_render_when_no_env() {
-        let (_lock, _env) = EnvGuard::hold(&["GLADIUS_CDP_URL", "GLADIUS_BACKEND_CAPS"]);
+    fn default_path_is_obscura_render_when_no_env() {
+        let (_lock, _env) = EnvGuard::hold(&[
+            "GLADIUS_CDP_URL",
+            "GLADIUS_BACKEND",
+            "GLADIUS_BACKEND_CAPS",
+        ]);
         assert_eq!(cdp_url_override(), None);
+        assert_eq!(selected_backend(), BackendSel::Obscura);
         assert_eq!(backend_caps().unwrap(), BackendCaps::Render);
-        assert_eq!(backend_name(), "chrome-headless-shell");
+        assert_eq!(backend_name(), "obscura");
         let info = backend_info();
-        assert_eq!(info.get("backend"), Some(&json!("chrome-headless-shell")));
+        assert_eq!(info.get("backend"), Some(&json!("obscura")));
         assert_eq!(info.get("caps"), Some(&json!("render")));
         assert!(info.get("cdpUrl").is_none());
+    }
+
+    /// Backend selection order: unset -> obscura (default),
+    /// `GLADIUS_BACKEND=chrome` (case-insensitive) -> chrome,
+    /// `GLADIUS_CDP_URL` set -> attach (wins over both).
+    #[test]
+    fn backend_selection_prefers_attach_then_chrome_then_obscura() {
+        let (_lock, _env) = EnvGuard::hold(&["GLADIUS_CDP_URL", "GLADIUS_BACKEND"]);
+        assert_eq!(selected_backend(), BackendSel::Obscura);
+        assert_eq!(backend_name(), "obscura");
+        std::env::set_var("GLADIUS_BACKEND", "chrome");
+        assert_eq!(selected_backend(), BackendSel::Chrome);
+        assert_eq!(backend_name(), "chrome-headless-shell");
+        std::env::set_var("GLADIUS_BACKEND", "  CHROME  ");
+        assert_eq!(selected_backend(), BackendSel::Chrome);
+        std::env::set_var("GLADIUS_BACKEND", "bogus");
+        assert_eq!(selected_backend(), BackendSel::Obscura);
+        assert_eq!(backend_name(), "obscura");
+        std::env::set_var("GLADIUS_BACKEND", "");
+        assert_eq!(selected_backend(), BackendSel::Obscura);
+        std::env::set_var("GLADIUS_CDP_URL", "ws://127.0.0.1:9/");
+        assert_eq!(selected_backend(), BackendSel::Attach);
+        assert_eq!(backend_name(), "external-cdp");
+    }
+
+    /// Obscura argv: the serve subcommand, loopback host/port, and BOTH gate
+    /// flags - each flag exactly once (the engine's clap parser hard-fails
+    /// on a repeated flag).
+    #[test]
+    fn obscura_argv_has_gates_once_and_no_duplicates() {
+        let argv = obscura_argv(19431);
+        assert_eq!(argv.first().map(|s| s.as_str()), Some("serve"));
+        for flag in [
+            "--host",
+            "--port",
+            "--allow-private-network",
+            "--allow-file-access",
+        ] {
+            let n = argv.iter().filter(|a| a.as_str() == flag).count();
+            assert_eq!(n, 1, "flag {flag} must appear exactly once: {argv:?}");
+        }
+        let h = argv.iter().position(|a| a == "--host").expect("--host");
+        assert_eq!(argv.get(h + 1).map(|s| s.as_str()), Some("127.0.0.1"));
+        let i = argv.iter().position(|a| a == "--port").expect("--port");
+        assert_eq!(argv.get(i + 1).map(|s| s.as_str()), Some("19431"));
+        // No other flag-like token: exactly the four known flags.
+        let mut flags: Vec<&str> = argv
+            .iter()
+            .filter(|a| a.starts_with("--"))
+            .map(|s| s.as_str())
+            .collect();
+        flags.sort_unstable();
+        assert_eq!(
+            flags,
+            vec![
+                "--allow-file-access",
+                "--allow-private-network",
+                "--host",
+                "--port"
+            ],
+            "no extra or duplicated flags: {argv:?}"
+        );
+    }
+
+    /// Obscura-missing: an explicit bad override AND a blank override (sibling
+    /// lookup, which ships no engine beside the test binary) both fail with
+    /// the clear error naming the provision script.
+    #[test]
+    fn obscura_missing_reports_fetch_script() {
+        let (_lock, _env) = EnvGuard::hold(&["GLADIUS_OBSCURA"]);
+        std::env::set_var(
+            "GLADIUS_OBSCURA",
+            r"C:\no-such-gladius-dir-xyz\obscura.exe",
+        );
+        let e = find_obscura().expect_err("missing engine must fail");
+        assert!(
+            e.contains("scripts/fetch-engine.ps1"),
+            "names the provision script, got: {e}"
+        );
+        std::env::set_var("GLADIUS_OBSCURA", "   ");
+        let e2 = find_obscura().expect_err("missing sibling must fail");
+        assert!(
+            e2.contains("scripts/fetch-engine.ps1"),
+            "sibling miss names the script, got: {e2}"
+        );
     }
 
     /// dom-only refusal: screenshot errors naming the backend and the
