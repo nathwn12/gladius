@@ -56,10 +56,23 @@ async fn handle(req: &Value, browser: &Arc<Browser>) -> Option<Value> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("2025-06-18")
                 .to_string();
+            let info = crate::browser::backend_info();
+            let mut server_info = serde_json::Map::new();
+            server_info.insert("name".to_string(), json!("gladius"));
+            server_info.insert("version".to_string(), json!(env!("CARGO_PKG_VERSION")));
+            if let Some(b) = info.get("backend") {
+                server_info.insert("backend".to_string(), b.clone());
+            }
+            if let Some(caps) = info.get("caps") {
+                server_info.insert("caps".to_string(), caps.clone());
+            }
+            if let Some(url) = info.get("cdpUrl") {
+                server_info.insert("cdpUrl".to_string(), url.clone());
+            }
             Some(json!({"jsonrpc": "2.0", "id": id, "result": {
                 "protocolVersion": ver,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "gladius", "version": env!("CARGO_PKG_VERSION")}
+                "serverInfo": server_info
             }}))
         }
         "notifications/initialized" => None, // notification: no reply

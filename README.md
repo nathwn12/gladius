@@ -97,6 +97,17 @@ Environment:
 - `GLADIUS_STARTUP_TIMEOUT_SECS` — DevTools-line startup deadline (default 30).
 - `GLADIUS_TEST_STUB_SLEEP_SECS` — test-only: spawn a silent sleeper instead
   of Chrome to exercise the startup-timeout path.
+- `GLADIUS_CDP_URL` — attach instead of launching: a `ws://`/`wss://` endpoint
+  to connect to, or an `http://`/`https://` base resolved via
+  `GET <base>/json/version`. The attached engine is NOT owned: `close`
+  detaches the CDP session gladius opened and leaves the external process
+  running; gladius creates no profile and kills nothing.
+- `GLADIUS_BACKEND_CAPS` — `render` (default) or `dom-only`. With `dom-only`
+  there is no rendering pipeline: `screenshot` refuses with a typed error
+  instead of returning a fake image (`upload` needs no rendering — DOM CDP
+  only — so it keeps working). `initialize` reports
+  `serverInfo.backend` (`chrome-headless-shell` or `external-cdp`) and
+  `serverInfo.caps` (`render` or `dom-only`).
 
 ## Build from source
 

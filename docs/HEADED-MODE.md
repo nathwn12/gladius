@@ -61,8 +61,12 @@ Drop `--headless`, keep the memory and hygiene flags, add a real window:
 
 ## Non-goals
 
-- **Attach mode is still deferred.** Driving the owner's already-running browser needs it to have
-  been started with a debug port, which cannot be retrofitted; it stays a later `CDP_URL` feature.
+- **Attach mode is BUILT (2026-10-11):** `GLADIUS_CDP_URL` attaches to an
+  externally started engine instead of launching (ws:// connects directly,
+  http:// resolves via `/json/version`). Ownership rule: the attached engine
+  is NOT ours — `close` detaches the session gladius opened and never kills,
+  never sweeps. Driving the owner's already-running browser still needs it to
+  have been started with a debug port, which cannot be retrofitted.
 - No per-call "show me this one page" argument.
 - No change to the 13 tool schemas.
 

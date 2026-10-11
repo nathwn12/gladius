@@ -90,14 +90,187 @@ struct Shared {
     net_enabled: AsyncMutex<bool>,
 }
 
+/// Ownership of the engine behind an `Inner` connection.
+///
+/// - `Owned`: gladius launched the engine itself (the current launch path:
+///   throwaway `gladius-<pid>-*` profile, child handle, job cover). `close()`
+///   reaps the whole tree.
+/// - `Attached`: gladius connected to an externally started engine via
+///   `GLADIUS_CDP_URL` (the stub-engine interface: the real replacement
+///   engine plugs in here). The engine is NOT ours: `close()` only detaches
+///   the CDP session we opened and never kills, never sweeps a profile.
+enum Engine {
+    Owned {
+        _profile: ProfileDir,
+        #[cfg(windows)]
+        _job: Option<std::os::windows::io::OwnedHandle>,
+        child: tokio::process::Child,
+        pid: u32,
+    },
+    Attached {
+        cdp_url: String,
+    },
+}
+
 struct Inner {
-    _profile: ProfileDir,
-    #[cfg(windows)]
-    _job: Option<std::os::windows::io::OwnedHandle>,
-    child: tokio::process::Child,
-    pid: u32,
+    engine: Engine,
     shared: Arc<Shared>,
     reader: tokio::task::JoinHandle<()>,
+}
+
+/// Declared backend capability (`GLADIUS_BACKEND_CAPS`).
+///
+/// - `Render` (default): a real rendering pipeline exists; `screenshot`
+///   returns pixels.
+/// - `DomOnly`: no rendering pipeline (the stub-engine contract: DOM/CDP
+///   only). Pixel tools must refuse, never fake an image.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BackendCaps {
+    Render,
+    DomOnly,
+}
+
+/// Parse one `GLADIUS_BACKEND_CAPS` value. Only `render` and `dom-only`
+/// (case-insensitive, surrounding whitespace ignored) are accepted.
+pub fn parse_backend_caps(s: &str) -> Result<BackendCaps, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "render" => Ok(BackendCaps::Render),
+        "dom-only" => Ok(BackendCaps::DomOnly),
+        other => Err(format!(
+            "GLADIUS_BACKEND_CAPS: unknown value '{other}' (want 'render' or 'dom-only')"
+        )),
+    }
+}
+
+/// Effective backend capability. Unset/blank means `render` (the current
+/// default path is unchanged).
+pub fn backend_caps() -> Result<BackendCaps, String> {
+    match std::env::var("GLADIUS_BACKEND_CAPS") {
+        Ok(v) if !v.trim().is_empty() => parse_backend_caps(&v),
+        _ => Ok(BackendCaps::Render),
+    }
+}
+
+/// Raw `GLADIUS_CDP_URL` override (trimmed, empty means unset).
+pub fn cdp_url_override() -> Option<String> {
+    std::env::var("GLADIUS_CDP_URL")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Engine name for the initialize response: `external-cdp` when attached,
+/// otherwise the owned `chrome-headless-shell` launch path.
+pub fn backend_name() -> String {
+    match cdp_url_override() {
+        Some(_) => "external-cdp".to_string(),
+        None => "chrome-headless-shell".to_string(),
+    }
+}
+
+/// `(backend, caps)` labels for the initialize response. Never connects:
+/// safe on the cold handshake path. An invalid caps value reports
+/// `invalid` here; the tool path surfaces the typed error.
+pub fn backend_info() -> Value {
+    let caps = match backend_caps() {
+        Ok(BackendCaps::DomOnly) => "dom-only",
+        Ok(BackendCaps::Render) => "render",
+        Err(_) => "invalid",
+    };
+    match cdp_url_override() {
+        Some(url) => json!({"backend": backend_name(), "caps": caps, "cdpUrl": url}),
+        None => json!({"backend": backend_name(), "caps": caps}),
+    }
+}
+
+/// Build the WS `Shared` half from a connected sink. One constructor for
+/// both the owned launch path and the attach path, so the session/target
+/// flow after the connect (`ensure_session` / `attach_to` / tools) is the
+/// SAME code, never a fork.
+fn new_shared(sink: WsSink) -> Arc<Shared> {
+    Arc::new(Shared {
+        sink: AsyncMutex::new(sink),
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        next_id: AtomicU64::new(1),
+        session: AsyncMutex::new(None),
+        target: AsyncMutex::new(None),
+        dialog: AsyncMutex::new(None),
+        load_notify: tokio::sync::Notify::new(),
+        tab_order: AsyncMutex::new(Vec::new()),
+        console: AsyncMutex::new(VecDeque::new()),
+        net_inflight: AsyncMutex::new(HashSet::new()),
+        net_notify: tokio::sync::Notify::new(),
+        net_enabled: AsyncMutex::new(false),
+    })
+}
+
+/// Resolve a `GLADIUS_CDP_URL` value to a ws:// endpoint.
+///
+/// - `ws://` / `wss://` connect directly.
+/// - `http://` / `https://` resolve via the documented readiness endpoint
+///   `GET <base>/json/version` (`webSocketDebuggerUrl`), so the http path
+///   never depends on engine stderr wording.
+async fn resolve_ws_url(raw: &str) -> Result<String, String> {
+    let s = raw.trim();
+    if s.starts_with("ws://") || s.starts_with("wss://") {
+        return Ok(s.to_string());
+    }
+    if s.starts_with("http://") || s.starts_with("https://") {
+        let base = s.trim_end_matches('/');
+        let ver_url = if base.ends_with("/json/version") {
+            base.to_string()
+        } else {
+            format!("{base}/json/version")
+        };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("cdp http client: {e}"))?;
+        let resp = client
+            .get(&ver_url)
+            .send()
+            .await
+            .map_err(|e| format!("cdp GET {ver_url}: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("cdp GET {ver_url}: http {}", resp.status()));
+        }
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("cdp GET {ver_url} body: {e}"))?;
+        let v: Value =
+            serde_json::from_str(&text).map_err(|e| format!("cdp {ver_url}: bad json: {e}"))?;
+        let ws = v
+            .get("webSocketDebuggerUrl")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if ws.is_empty() {
+            return Err(format!("cdp {ver_url}: no webSocketDebuggerUrl in response"));
+        }
+        return Ok(ws);
+    }
+    Err("GLADIUS_CDP_URL must be a ws://, wss://, http:// or https:// endpoint".to_string())
+}
+
+/// Attach to an externally started engine (the stub-engine interface).
+/// Connects to the resolved ws endpoint, then reuses the EXISTING
+/// session/target flow. Creates no profile, sweeps nothing, owns no pid.
+async fn attach(raw: &str) -> Result<Inner, String> {
+    let ws_url = resolve_ws_url(raw).await?;
+    eprintln!("[gladius] backend: external-cdp {ws_url} (attach; engine not owned)");
+    let (ws, _) = connect_async(&ws_url)
+        .await
+        .map_err(|e| format!("ws connect {ws_url}: {e}"))?;
+    let (sink, stream) = ws.split();
+    let shared = new_shared(sink);
+    let reader = tokio::spawn(reader_loop(stream, shared.clone()));
+    eprintln!("[gladius] browser ready attached external-cdp");
+    Ok(Inner {
+        engine: Engine::Attached { cdp_url: ws_url },
+        shared,
+        reader,
+    })
 }
 
 pub struct Browser {
@@ -171,7 +344,11 @@ impl Browser {
         }
         let inner = launch().await?;
         let shared = inner.shared.clone();
-        *self.pid.lock().unwrap() = Some(inner.pid);
+        let owned_pid: Option<u32> = match &inner.engine {
+            Engine::Owned { pid, .. } => Some(*pid),
+            Engine::Attached { .. } => None,
+        };
+        *self.pid.lock().unwrap() = owned_pid;
         *self.state.lock().await = Some(inner);
         Ok(shared)
     }
@@ -394,21 +571,49 @@ impl Browser {
     pub async fn close(&self) -> Result<(), String> {
         let inner = self.state.lock().await.take();
         if let Some(inner) = inner {
-            let pid = inner.pid;
-            inner.reader.abort();
-            let mut child = inner.child;
-            // Fast path: terminate the direct child and wait for it. The
-            // KILL_ON_JOB_CLOSE job handle (`_job`, dropped below with the
-            // rest of `inner`) reaps surviving grandchildren, so the old
-            // taskkill spawn (~220 ms measured) is fallback-only.
-            let _ = child.kill().await;
-            let exited =
-                tokio::time::timeout(Duration::from_secs(2), child.wait())
-                    .await
-                    .is_ok();
-            if !exited {
-                kill_tree(pid);
-                let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+            let Inner {
+                engine,
+                shared,
+                reader,
+            } = inner;
+            match engine {
+                Engine::Owned { mut child, pid, .. } => {
+                    reader.abort();
+                    // Fast path: terminate the direct child and wait for it. The
+                    // KILL_ON_JOB_CLOSE job handle (dropped with the rest of the
+                    // owned state) reaps surviving grandchildren, so the old
+                    // taskkill spawn (~220 ms measured) is fallback-only.
+                    let _ = child.kill().await;
+                    let exited =
+                        tokio::time::timeout(Duration::from_secs(2), child.wait())
+                            .await
+                            .is_ok();
+                    if !exited {
+                        kill_tree(pid);
+                        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                    }
+                }
+                Engine::Attached { cdp_url } => {
+                    // Ownership rule: the attached engine is NOT ours. Detach
+                    // the CDP session we opened (best-effort, before the
+                    // reader goes away so the reply can route), then drop the
+                    // connection. Never kill_tree, never kill a pid, never
+                    // sweep a profile we did not create. Pages/targets in the
+                    // external engine stay open by design.
+                    if let Some(sid) = shared.session.lock().await.clone() {
+                        let _ = send_raw(
+                            &shared,
+                            "Target.detachFromTarget",
+                            json!({"sessionId": sid}),
+                            None,
+                        )
+                        .await;
+                    }
+                    *shared.session.lock().await = None;
+                    *shared.target.lock().await = None;
+                    reader.abort();
+                    eprintln!("[gladius] detach: external engine left running (not owned) {cdp_url}");
+                }
             }
         }
         *self.pid.lock().unwrap() = None;
@@ -1189,7 +1394,21 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Launch dispatcher: `GLADIUS_CDP_URL` set means attach to the external
+/// engine (the stub-engine interface) instead of launching. Neither var set
+/// keeps the byte-for-byte current launch path (`launch_owned`).
 async fn launch() -> Result<Inner, String> {
+    // A bad caps value is a config error: fail fast on either path.
+    if let Err(e) = backend_caps() {
+        return Err(e);
+    }
+    if let Some(raw) = cdp_url_override() {
+        return attach(&raw).await;
+    }
+    launch_owned().await
+}
+
+async fn launch_owned() -> Result<Inner, String> {
     let deadline = startup_timeout();
     sweep_stale_profiles();
     let profile = ProfileDir::create()?;
@@ -1274,32 +1493,19 @@ async fn launch() -> Result<Inner, String> {
         .await
         .map_err(|e| format!("ws connect {ws_url}: {e}"))?;
     let (sink, stream) = ws.split();
-    let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-    let shared = Arc::new(Shared {
-        sink: AsyncMutex::new(sink),
-        pending,
-        next_id: AtomicU64::new(1),
-        session: AsyncMutex::new(None),
-        target: AsyncMutex::new(None),
-        dialog: AsyncMutex::new(None),
-        load_notify: tokio::sync::Notify::new(),
-        tab_order: AsyncMutex::new(Vec::new()),
-        console: AsyncMutex::new(VecDeque::new()),
-        net_inflight: AsyncMutex::new(HashSet::new()),
-        net_notify: tokio::sync::Notify::new(),
-        net_enabled: AsyncMutex::new(false),
-    });
+    let shared = new_shared(sink);
     let reader = tokio::spawn(reader_loop(stream, shared.clone()));
     eprintln!("[gladius] browser ready pid={pid}");
     let child = guard.child.take().expect("guard holds child");
     drop(guard); // disarmed: child moved out, Drop is a no-op
     Ok(Inner {
-        _profile: profile,
-        #[cfg(windows)]
-        _job: job,
-        child,
-        pid,
+        engine: Engine::Owned {
+            _profile: profile,
+            #[cfg(windows)]
+            _job: job,
+            child,
+            pid,
+        },
         shared,
         reader,
     })
@@ -1594,20 +1800,7 @@ mod tests {
         let url = format!("ws://127.0.0.1:{port}/");
         let (ws, _) = connect_async(&url).await.expect("ws connect");
         let (sink, stream) = ws.split();
-        let shared = Arc::new(Shared {
-            sink: AsyncMutex::new(sink),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicU64::new(1),
-            session: AsyncMutex::new(None),
-            target: AsyncMutex::new(None),
-            dialog: AsyncMutex::new(None),
-            load_notify: tokio::sync::Notify::new(),
-            tab_order: AsyncMutex::new(Vec::new()),
-            console: AsyncMutex::new(VecDeque::new()),
-            net_inflight: AsyncMutex::new(HashSet::new()),
-            net_notify: tokio::sync::Notify::new(),
-            net_enabled: AsyncMutex::new(false),
-        });
+        let shared = new_shared(sink);
         let reader = tokio::spawn(reader_loop(stream, shared.clone()));
         let mut std_cmd = std::process::Command::new("powershell");
         std_cmd
@@ -1624,11 +1817,13 @@ mod tests {
         let pid = child.id().expect("sleeper pid");
         let profile = ProfileDir::create().expect("profile");
         let inner = Inner {
-            _profile: profile,
-            #[cfg(windows)]
-            _job: None,
-            child,
-            pid,
+            engine: Engine::Owned {
+                _profile: profile,
+                #[cfg(windows)]
+                _job: None,
+                child,
+                pid,
+            },
             shared: shared.clone(),
             reader,
         };
@@ -1756,5 +1951,336 @@ mod tests {
         }
         pusher.await.expect("pusher");
         rig.shutdown().await;
+    }
+
+    /// Serialize env-touching tests: `GLADIUS_BACKEND_CAPS` / `GLADIUS_CDP_URL`
+    /// are process-global, so caps/url tests never run against each other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn hold(keys: &[&str]) -> (std::sync::MutexGuard<'static, ()>, EnvGuard) {
+            let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut saved = Vec::new();
+            for k in keys {
+                saved.push((k.to_string(), std::env::var(k).ok()));
+                std::env::remove_var(k);
+            }
+            (guard, EnvGuard { saved })
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(val) => std::env::set_var(&k, val),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+    }
+
+    /// Minimal fake external CDP engine (loopback WS only): answers the
+    /// browser-domain calls the attach flow needs, records detach.
+    struct FakeCdp {
+        ws_url: String,
+        detach_seen: Arc<std::sync::atomic::AtomicBool>,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    async fn fake_cdp() -> FakeCdp {
+        let detach_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let port = ln.local_addr().expect("loopback addr").port();
+        let flag = detach_seen.clone();
+        let srv = tokio::spawn(async move {
+            while let Ok((s, _)) = ln.accept().await {
+                let flag = flag.clone();
+                tokio::spawn(async move {
+                    let mut ws = match tokio_tungstenite::accept_async(s).await {
+                        Ok(w) => w,
+                        Err(_) => return,
+                    };
+                    while let Some(msg) = ws.next().await {
+                        let text = match msg {
+                            Ok(Message::Text(t)) => t.to_string(),
+                            Ok(Message::Binary(b)) => String::from_utf8_lossy(&b).into_owned(),
+                            _ => continue,
+                        };
+                        let v: Value = match serde_json::from_str(&text) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let id = match v.get("id").and_then(|i| i.as_u64()) {
+                            Some(i) => i,
+                            None => continue,
+                        };
+                        let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        if method == "Target.detachFromTarget" {
+                            flag.store(true, Ordering::SeqCst);
+                        }
+                        let result = match method {
+                            "Target.getTargets" => json!({"targetInfos": [
+                                {"targetId": "T1", "type": "page",
+                                 "url": "about:blank", "title": "fake"}
+                            ]}),
+                            "Target.attachToTarget" => json!({"sessionId": "S1"}),
+                            "Runtime.evaluate" => json!({"result": {"type": "string", "value": "fake"}}),
+                            _ => json!({}),
+                        };
+                        let _ = ws
+                            .send(Message::Text(
+                                json!({"id": id, "result": result}).to_string().into(),
+                            ))
+                            .await;
+                    }
+                });
+            }
+        });
+        FakeCdp {
+            ws_url: format!("ws://127.0.0.1:{port}/"),
+            detach_seen,
+            tasks: vec![srv],
+        }
+    }
+
+    /// Fake `/json/version` HTTP endpoint pointing at `ws_url` (loopback).
+    async fn fake_version_http(ws_url: String) -> (String, tokio::task::JoinHandle<()>) {
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let port = ln.local_addr().expect("loopback addr").port();
+        let h = tokio::spawn(async move {
+            loop {
+                let (mut s, _) = match ln.accept().await {
+                    Ok(x) => x,
+                    Err(_) => break,
+                };
+                let ws_url = ws_url.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 4096];
+                    let mut req = Vec::new();
+                    loop {
+                        match s.read(&mut buf).await {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                req.extend_from_slice(&buf[..n]);
+                                if req.windows(4).any(|w| w == b"\r\n\r\n") || req.len() > 8192 {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    let body = serde_json::json!({
+                        "webSocketDebuggerUrl": ws_url,
+                        "Browser": "Fake/1.0",
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), h)
+    }
+
+    fn wrap_attached(inner: Inner) -> Browser {
+        Browser {
+            state: AsyncMutex::new(Some(inner)),
+            pid: Mutex::new(None),
+            refs: AsyncMutex::new(HashMap::new()),
+            snap_url: AsyncMutex::new(String::new()),
+        }
+    }
+
+    /// Spawn a sleeper standing in for the EXTERNAL engine process. Returns
+    /// (pid, child): the child is owned by the test, never by gladius.
+    async fn external_sleeper() -> (u32, tokio::process::Child) {
+        let mut std_cmd = std::process::Command::new("powershell");
+        std_cmd
+            .args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 120"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            std_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        let child = Command::from(std_cmd).spawn().expect("spawn external sleeper");
+        let pid = child.id().expect("external sleeper pid");
+        (pid, child)
+    }
+
+    /// Attach over ws:// connects and runs the shared CDP flow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_over_ws_runs_shared_flow() {
+        let fake = fake_cdp().await;
+        let inner = attach(&fake.ws_url).await.expect("attach over ws");
+        assert!(
+            matches!(inner.engine, Engine::Attached { .. }),
+            "ws attach must build the attached engine"
+        );
+        let b = wrap_attached(inner);
+        // Shared flow: a session-scoped command attaches (T1/S1) and runs.
+        let v = b.eval("1+1").await.expect("eval over attach");
+        assert_eq!(v, json!("fake"), "fake engine answers: {v:?}");
+        b.close().await.expect("detach close");
+        for t in fake.tasks {
+            t.abort();
+        }
+    }
+
+    /// Attach over http:// resolves the ws endpoint via /json/version.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attach_over_http_resolves_via_json_version() {
+        let fake = fake_cdp().await;
+        let (base, http) = fake_version_http(fake.ws_url.clone()).await;
+        let inner = attach(&base).await.expect("attach over http");
+        match &inner.engine {
+            Engine::Attached { cdp_url } => assert_eq!(
+                cdp_url, &fake.ws_url,
+                "http attach must resolve to the version endpoint url"
+            ),
+            Engine::Owned { .. } => panic!("http attach built the owned engine"),
+        }
+        let b = wrap_attached(inner);
+        let v = b.eval("1+1").await.expect("eval over http attach");
+        assert_eq!(v, json!("fake"), "fake engine answers: {v:?}");
+        b.close().await.expect("detach close");
+        http.abort();
+        for t in fake.tasks {
+            t.abort();
+        }
+    }
+
+    /// Ownership on close: an attached close detaches (server sees
+    /// detachFromTarget) and leaves the external process alive; it never
+    /// sweeps a profile it did not create (a canary stale dir planted
+    /// before attach must survive the close), and the attached variant
+    /// owns no pid by construction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attached_close_leaves_external_process_alive() {
+        let fake = fake_cdp().await;
+        let (ext_pid, mut ext_child) = external_sleeper().await;
+        // Canary: a stale `gladius-<deadpid>-*` dir that only a sweep would
+        // remove. No unit test ever calls the owned launch (the sole sweep
+        // site), so survival proves the attach+close path never sweeps.
+        let canary =
+            std::env::temp_dir().join(format!("gladius-2147483646-canary-{}", ext_pid));
+        std::fs::create_dir_all(&canary).expect("plant canary");
+        let inner = attach(&fake.ws_url).await.expect("attach");
+        assert!(
+            matches!(inner.engine, Engine::Attached { .. }),
+            "attach must build the attached engine (which owns no profile by construction)"
+        );
+        let b = wrap_attached(inner);
+        let _ = b.eval("1+1").await.expect("session up");
+        b.close().await.expect("detach close");
+        assert!(
+            fake.detach_seen.load(Ordering::SeqCst),
+            "attached close must detach the session we opened"
+        );
+        // External process still alive: no wait exit, pid answers.
+        match ext_child.try_wait().expect("try_wait external") {
+            None => {}
+            Some(status) => panic!("external process died on detach: {status}"),
+        }
+        #[cfg(windows)]
+        assert!(
+            job::process_alive(ext_pid),
+            "external pid {ext_pid} must still be alive after detach"
+        );
+        assert!(
+            canary.is_dir(),
+            "attached close must never sweep a profile it did not create"
+        );
+        std::fs::remove_dir_all(&canary).ok();
+        // Test cleanup owns the sleeper: kill it here, never via gladius.
+        #[cfg(windows)]
+        {
+            let _ = ext_child.kill().await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), ext_child.wait()).await;
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = ext_child.kill().await;
+        }
+        for t in fake.tasks {
+            t.abort();
+        }
+    }
+
+    /// Capability parsing: only `render` and `dom-only` are accepted.
+    #[test]
+    fn backend_caps_parse_accepts_only_known_values() {
+        assert_eq!(parse_backend_caps("render").unwrap(), BackendCaps::Render);
+        assert_eq!(parse_backend_caps("dom-only").unwrap(), BackendCaps::DomOnly);
+        assert_eq!(parse_backend_caps("  DOM-ONLY ").unwrap(), BackendCaps::DomOnly);
+        assert!(parse_backend_caps("").is_err());
+        assert!(parse_backend_caps("bogus").is_err());
+    }
+
+    /// Default path selection: with neither env var set the backend is the
+    /// owned headless-shell launch with render caps.
+    #[test]
+    fn default_path_is_owned_render_when_no_env() {
+        let (_lock, _env) = EnvGuard::hold(&["GLADIUS_CDP_URL", "GLADIUS_BACKEND_CAPS"]);
+        assert_eq!(cdp_url_override(), None);
+        assert_eq!(backend_caps().unwrap(), BackendCaps::Render);
+        assert_eq!(backend_name(), "chrome-headless-shell");
+        let info = backend_info();
+        assert_eq!(info.get("backend"), Some(&json!("chrome-headless-shell")));
+        assert_eq!(info.get("caps"), Some(&json!("render")));
+        assert!(info.get("cdpUrl").is_none());
+    }
+
+    /// dom-only refusal: screenshot errors naming the backend and the
+    /// reason, before any engine launch (no browser needed to prove it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dom_only_screenshot_refuses_without_image() {
+        let (_lock, _env) = EnvGuard::hold(&["GLADIUS_BACKEND_CAPS"]);
+        std::env::set_var("GLADIUS_BACKEND_CAPS", "dom-only");
+        let b = Browser::new();
+        let r = crate::tools::call("screenshot", &json!({}), &b).await;
+        assert!(
+            r.get("isError").is_some(),
+            "dom-only screenshot must be a tool error: {r}"
+        );
+        let msg = r
+            .get("content")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        assert!(
+            msg.contains("dom-only"),
+            "refusal names the backend, got: {msg}"
+        );
+        assert!(
+            msg.contains("no rendering pipeline"),
+            "refusal names the reason, got: {msg}"
+        );
+        assert!(
+            !msg.contains("iVBORw0KGgo"),
+            "refusal must never carry image bytes"
+        );
+        // No engine was launched proving it: state stays empty.
+        assert!(
+            b.snap_url().await.is_empty(),
+            "refusal must not touch the browser"
+        );
     }
 }

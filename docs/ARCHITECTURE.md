@@ -16,7 +16,7 @@
 | `evaluate` | `expression: string` | JSON-serialised JS result |
 | `wait_for` | `text?: string, timeout_ms?: number` | `{ ok: true }` when text appears or timeout elapses |
 | `fetch_text` | `url?: string` (default: current page) | rendered text content (readability-style, no tags) |
-| `close` | - | `{ ok: true }`; reaps the browser process tree |
+| `close` | - | `{ ok: true }`; reaps the browser process tree (or detaches from an attached external engine, leaving it running) |
 
 Rules: tools are **dumb primitives** - no planner, no LLM, no judgement-retries in the server
 (RESEARCH rule 7). Selector grammar is deliberately tiny; anything fancier goes through `evaluate`.
@@ -34,8 +34,13 @@ Rules: tools are **dumb primitives** - no planner, no LLM, no judgement-retries 
 | **Tier 2 (opt-in)** | Full Chrome headed/headless | pixel-perfect only | Flag-gated (`--full-chrome`) for screenshots/canvas/WebGL
   where Tier 0 fidelity is insufficient. Never the default. |
 
-Selection: `--backend {shell, lightpanda, full-chrome}` (default `shell`) + `CDP_URL` env to
-**attach** to an existing endpoint instead of launching (RESEARCH rule 5).
+Selection: `--backend {shell, lightpanda, full-chrome}` (default `shell`) + `GLADIUS_CDP_URL`
+to **attach** to an existing endpoint instead of launching (RESEARCH rule 5) — BUILT
+2026-10-11: `ws://`/`wss://` connects directly, `http://`/`https://` resolves via
+`GET <base>/json/version`; the session/target flow after the connect is shared with the
+launch path. Ownership: an attached engine is NOT ours — `close` detaches the session
+gladius opened and never kills, never sweeps. `GLADIUS_BACKEND_CAPS` declares `render`
+(default) or `dom-only` (no rendering pipeline: `screenshot` refuses, never fakes).
 
 ## 3. MCP stdio frame shape
 
@@ -46,7 +51,9 @@ Selection: `--backend {shell, lightpanda, full-chrome}` (default `shell`) + `CDP
 - Each `tools/call` response is `{ content: [{ type: "text"|"image", ... }] }` per MCP content
   convention; `screenshot` returns an `image` part (base64 PNG), everything else `text`.
 - Server answers `initialize` with **no browser running** (lazy start, §4) - cold MCP handshake
-  must never pay browser-launch cost.
+  must never pay browser-launch cost. The response carries `serverInfo.backend`
+  (`chrome-headless-shell` or `external-cdp`) and `serverInfo.caps` (`render` or
+  `dom-only`) so a client can see which engine and which caps it is talking to.
 
 ## 4. Browser lifecycle (lazy start, kill-tree on close)
 
@@ -56,6 +63,13 @@ tools/call (first, non-close) --► resolve backend binary --► spawn child
       --► CDP connect --► new target/page --► execute --► keep warm for session
 tools/call close  --OR--  stdio EOF / SIGTERM --► CDP Browser.close --► kill-tree (job object) --► reap
 ```
+
+Attach variant (same flow after the connect, §2): `GLADIUS_CDP_URL` set --► resolve ws
+endpoint (http:// via `/json/version`) --► CDP connect (no spawn, no profile, no sweep)
+--► shared target/session flow --► execute --► keep warm for session.
+`close`/EOF on an attached engine detaches the session gladius opened
+(`Target.detachFromTarget`) and drops the connection; the external process is left
+running by design - no `kill_tree`, no pid kill, no profile sweep.
 
 - **Lazy start:** no child process exists until the first browser-touching tool call.
 - **One session per agent connection:** each stdio client gets its own browser context/page;
