@@ -1,14 +1,22 @@
-<p align="center"><img src="assets/icon.svg" width="96" alt="gladius"></p>
-
-<p align="center"><h1 align="center">gladius</h1></p>
-
-<p align="center">Fast, headless, ultra-lightweight browser-use MCP server — a native binary with no Node.js and no Playwright in the runtime path.</p>
-
+<!-- Header. The repo's ART.md verdict allows a text banner: the framed banner
+     below replaces the icon image - never both. -->
+```
++--------------------------------------+
+|           __          ___            |
+|    ____ _/ /___ _____/ (_)_  _______ |
+|   / __ `/ / __ `/ __  / / / / / ___/ |
+|  / /_/ / / /_/ / /_/ / / /_/ (__  )  |
+|  \__, /_/\__,_/\__,_/_/\__,_/____/   |
+| /____/                               |
++--------------------------------------+
+```
+<h1 align="center">gladius</h1>
+<p align="center"><strong>Drive headless Chrome over CDP from any MCP client — Rust.</strong></p>
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="license: MIT"></a>
-  <img src="https://img.shields.io/badge/language-Rust-orange.svg" alt="language: Rust">
-  <img src="https://img.shields.io/badge/platform-Windows-blue.svg" alt="platform: Windows">
-  <a href="https://github.com/nathwn12/gladius/actions/workflows/ci.yml"><img src="https://github.com/nathwn12/gladius/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/nathwn12/gladius" alt="License" /></a>
+  <img src="https://img.shields.io/github/languages/top/nathwn12/gladius" alt="Language" />
+  <img src="https://img.shields.io/badge/platform-windows--64bit-2b3137?logo=windows&logoColor=white" alt="Platform" />
+  <a href="https://github.com/nathwn12/gladius/actions/workflows/ci.yml"><img src="https://github.com/nathwn12/gladius/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
 </p>
 
 ## What it is
@@ -16,53 +24,46 @@
 Gladius is a browser-use MCP server written in Rust. It drives headless Chrome
 directly over CDP (Chrome DevTools Protocol) via WebSocket and serves MCP over
 stdio — one static native binary, no Node.js and no Playwright in the runtime
-path.
-
-MCP transport: hand-rolled JSON-RPC 2.0 over stdin/stdout, newline-delimited
-(one JSON object per line). STDOUT carries only protocol frames; all logs go
-to STDERR.
+path. MCP transport is hand-rolled JSON-RPC 2.0 over stdin/stdout,
+newline-delimited (one JSON object per line); STDOUT carries only protocol
+frames and all logs go to STDERR.
 
 ## Why
 
-- **No Node.js.** The entire server is a single native binary.
-- **No Playwright.** Chrome is driven directly over CDP via WebSocket —
-  no driver binaries, no Node runtime between the agent and the browser.
-- **Native binary.** `cargo build --release` produces one static
-  `gladius.exe`; the browser lifecycle (spawn headless, reap the whole
-  process tree on `close`) is managed inside the binary.
+The entire server is a single native binary: Chrome is driven directly over
+CDP via WebSocket, so there are no driver binaries and no Node runtime between
+the agent and the browser, and the browser lifecycle (spawn headless, reap the
+whole process tree on `close`) is managed inside the binary.
 
-## Features
+## Tools
 
 15 tools over the active page (plus a browser-free fast path):
 
-- **Navigate & observe:** `navigate`, `snapshot` (AX snapshot: one line per
-  actionable node with a stable ref `@e1`, `@e2`, … plus page text; pass
-  `{"mode":"text"}` for the legacy text-only output; slices page text in-page
-  before transfer, then caps at 8000 chars), `screenshot` (viewport PNG,
-  `fullPage` for full page), `fetch_text` (plain HTTP, no browser — the fast path)
-- **Act:** `click` (CSS selector or AX ref), `type` (with optional submit),
-  `hover`, `select` (by `value` or visible `text`), `key` (named keys on the
-  focused element), `upload` (set files on an `<input type=file>`)
-- **Script & sync:** `evaluate` (JS in the page, awaits promises),
-  `wait_for` (selector/text, delay, or network idle; never exceeds its budget,
-  clamped to 15s max; `ms: 0` is an immediate no-op success), `console`
-  (buffered console messages + uncaught exceptions, ring buffer cap 200)
-- **Tabs & lifecycle:** `tabs` (`list`/`new`/`close`/`select`), `close`
-  (shuts down the browser process tree)
+- `navigate` — load a URL in the active tab.
+- `snapshot` — AX snapshot: one line per actionable node with a stable ref (`@e1`, `@e2`, …) plus page text; pass `{"mode":"text"}` for the legacy text-only output; slices page text in-page before transfer, then caps at 8000 chars.
+- `screenshot` — viewport PNG of the active page; `fullPage` for the full page.
+- `fetch_text` — plain HTTP fetch with no browser (the fast path).
+- `click` — click by CSS selector or AX ref.
+- `type` — type text, with optional submit.
+- `hover` — hover over a CSS selector or AX ref.
+- `select` — choose an option by `value` or visible `text`.
+- `key` — send named keys to the focused element.
+- `upload` — set files on an `<input type=file>`.
+- `evaluate` — run JS in the page, awaiting promises; evaluating `undefined` is a tool error (`no value`), distinct from explicit `null` which yields `{"value":null}`.
+- `wait_for` — wait for a selector/text, a delay, or network idle; never exceeds its budget, clamped to 15s max; `ms: 0` is an immediate no-op success.
+- `console` — buffered console messages plus uncaught exceptions (ring buffer, cap 200).
+- `tabs` — `list`, `new`, `close`, and `select` browser tabs.
+- `close` — shut down the browser process tree.
 
-Behavior notes:
-
-- JSON-RPC notifications (requests with no `id`) get no reply.
-- `evaluate` of `undefined` is a tool error (`no value`), distinct from
-  explicit `null` which yields `{"value":null}`.
-- Every browser spawn is RAII-guarded: ANY startup failure (including a
-  timeout waiting for the DevTools line) kills the process tree — no survivors.
+JSON-RPC notifications (requests with no `id`) get no reply. Every browser
+spawn is RAII-guarded: any startup failure (including a timeout waiting for the
+DevTools line) kills the process tree, so no survivors.
 
 ## Install
 
-A prebuilt Windows binary (`gladius.exe`) is attached to the
-[GitHub Releases](https://github.com/nathwn12/gladius/releases) page.
-Download it, then point your MCP client at it:
+1. Download the prebuilt Windows binary (`gladius.exe`) from the
+   [GitHub Releases](https://github.com/nathwn12/gladius/releases) page.
+2. Point your MCP client at it:
 
 ```jsonc
 {
@@ -75,9 +76,9 @@ Download it, then point your MCP client at it:
 }
 ```
 
-The alternative is building from source (see
-[Build from source](#build-from-source)) and pointing the `command` at your
-local `target\release\gladius.exe`.
+3. The alternative is building from source (see
+   [Build from source](#build-from-source)) and pointing the `command` at your
+   local `target\release\gladius.exe`.
 
 ## Usage
 
@@ -87,30 +88,16 @@ Serve MCP over stdio (the default — no args also works):
 gladius.exe mcp
 ```
 
-Wire it into your MCP client config:
-
-```jsonc
-{
-  "mcp": {
-    "gladius": {
-      "type": "local",
-      "command": ["<path-to>\\gladius.exe", "mcp"]
-    }
-  }
-}
-```
-
 Self-check without a client:
 
 ```powershell
 gladius.exe selftest # internal end-to-end check, exits 0 on pass
 ```
 
-Backend browser resolution order: `GLADIUS_CHROME` env var → newest
-`%LOCALAPPDATA%\ms-playwright\chromium_headless_shell-*\chrome-headless-shell-win64\chrome-headless-shell.exe`
-→ `C:\Program Files\Google\Chrome\Application\chrome.exe`.
-Spawned headless with `CREATE_NO_WINDOW`; killed as a whole process tree on
-`close`.
+Backend browser resolution order: `GLADIUS_CHROME` env var, then newest
+`%LOCALAPPDATA%\ms-playwright\chromium_headless_shell-*\chrome-headless-shell-win64\chrome-headless-shell.exe`,
+then the system Chrome install. Spawned headless with `CREATE_NO_WINDOW`;
+killed as a whole process tree on `close`.
 
 Environment:
 
@@ -120,6 +107,8 @@ Environment:
   of Chrome to exercise the startup-timeout path.
 
 ## Build from source
+
+Prerequisite: a stable Rust toolchain (`rustup`).
 
 ```powershell
 cargo build --release
@@ -146,12 +135,18 @@ target\release\gladius.exe selftest
 - [docs/HEADED-MODE.md](docs/HEADED-MODE.md) — headed-mode decision record (designed, not built)
 - [docs/OPT-SURVEY.md](docs/OPT-SURVEY.md) — optimization and feature survey with measured timings
 
-## Unverified / limitations
+## Status
 
-- Headless Chromium only; no headed-mode support.
-- `snapshot` is text-only (no element refs) and capped at 8000 chars.
-- `wait_for` budget clamped to 15s max.
+**Unverified** — as-is, use at your own risk.
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+<!-- nathwn12 house footer: identical in every repo. Do not edit. -->
+<p align="center">
+  <a href="https://github.com/nathwn12"><img src="assets/signature.svg" width="96" alt="nathwn12" /></a>
+</p>
+<p align="center">
+  <sub>Built by <a href="https://github.com/nathwn12">nathwn12</a> · <a href="https://github.com/nathwn12?tab=repositories">All projects</a> · MIT</sub>
+</p>
