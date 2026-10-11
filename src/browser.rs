@@ -11,7 +11,15 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{
+        Message,
+        client::IntoClientRequest,
+        handshake::client::Request as WsRequest,
+        http::Uri as TungsteniteHttpUri,
+    },
+};
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
@@ -1624,18 +1632,6 @@ fn obscura_argv(port: u16) -> Vec<String> {
     ]
 }
 
-/// Default owned launch: the Obscura engine (`serve` on a free loopback
-/// port), modelled as `Engine::Owned` so `close()` kills the tree we
-/// started. Readiness polls `GET http://127.0.0.1:<port>/json/version` for
-/// `webSocketDebuggerUrl` inside `startup_timeout()`: a ready-file is NOT
-/// trusted (measured flaking twice - the engine serving with no file
-/// published). The ws URL then flows through the SAME shared machinery the
-/// attach path uses (`resolve_ws_url` handles `http://...` ->
-/// `/json/version` -> `webSocketDebuggerUrl`), so the post-connect
-/// session/target flow is never forked. Every wait here is bounded (the
-/// engine also drops idle browser WS connections at ~60-70 s, so clients
-/// connect lazily on first tool use and bound every wait).
-
 /// Confine the OWNED Obscura ws endpoint to our loopback port.
 ///
 /// The owned path frees its chosen port before the engine binds it, so a
@@ -1643,65 +1639,103 @@ fn obscura_argv(port: u16) -> Vec<String> {
 /// via `/json/version`. The attach path (`resolve_ws_url`) must keep
 /// accepting whatever the user pointed at, so confinement lives here and is
 /// applied ONLY to the owned resolve result: the scheme must be `ws`/`wss`,
-/// the host must be loopback (`127.0.0.1`, `::1`, `[::1]`, `localhost`), and
-/// the port must equal the port we chose. Pure: no I/O, unit-tested below.
-fn confine_owned_ws_url(port: u16, url: &str) -> Result<(), String> {
-    let s = url.trim();
-    let after_scheme = if let Some(rest) = s.strip_prefix("ws://") {
-        rest
-    } else if let Some(rest) = s.strip_prefix("wss://") {
-        rest
-    } else {
+/// the host (exactly as the connector's parser reports it, brackets
+/// stripped) must be loopback (`127.0.0.1`, `::1`, `localhost`), and the
+/// explicit port must equal the port we chose (a missing port is rejected).
+/// Pure: no I/O, unit-tested below.
+fn confine_owned_ws_uri(port: u16, uri: &TungsteniteHttpUri) -> Result<(), String> {
+    let scheme_ok = uri
+        .scheme_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case("ws") || s.eq_ignore_ascii_case("wss"));
+    if !scheme_ok {
         return Err(format!(
-            "owned ws endpoint rejected: non-ws scheme in {url:?}"
+            "owned ws endpoint rejected: non-ws scheme in {uri:?}"
         ));
-    };
-    let authority = after_scheme.split('/').next().unwrap_or("");
-    // Strip any userinfo (never expected, but never let it smuggle a host).
-    let hostport = authority.rsplit('@').next().unwrap_or("");
-    let (host, port_str) = if let Some(rest) = hostport.strip_prefix('[') {
-        // Bracketed literal, e.g. `[::1]:5555`.
-        match rest.find(']') {
-            Some(i) => {
-                let tail = &rest[i + 1..];
-                (&rest[..i], tail.strip_prefix(':').unwrap_or(""))
-            }
-            None => {
-                return Err(format!(
-                    "owned ws endpoint rejected: bad bracketed host in {url:?}"
-                ));
-            }
-        }
-    } else {
-        match hostport.rsplit_once(':') {
-            Some((h, p)) => (h, p),
-            None => {
-                return Err(format!(
-                    "owned ws endpoint rejected: no port in {url:?}"
-                ));
-            }
-        }
-    };
-    let host_lc = host.to_ascii_lowercase();
-    if host_lc != "127.0.0.1"
-        && host_lc != "::1"
-        && host_lc != "[::1]"
-        && host_lc != "localhost"
+    }
+    // Host exactly as the connector's parser (`http::Uri`, the same parse
+    // `connect_async` dials off) reports it. `http` keeps the brackets on a
+    // bracketed IPv6 literal (`Authority::host` returns `[::1]`), so strip
+    // one surrounding pair before comparing; compare case-insensitively.
+    // `Authority::host` already drops any userinfo, so a `user@host` shape
+    // cannot smuggle a host past this check.
+    let host = uri.host().unwrap_or("");
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if !(bare.eq_ignore_ascii_case("127.0.0.1")
+        || bare.eq_ignore_ascii_case("::1")
+        || bare.eq_ignore_ascii_case("localhost"))
     {
         return Err(format!(
-            "owned ws endpoint rejected: non-loopback host {host:?} in {url:?}"
+            "owned ws endpoint rejected: non-loopback host {host:?} in {uri:?}"
         ));
     }
-    let got: u16 = port_str.parse().map_err(|_| {
-        format!("owned ws endpoint rejected: bad port in {url:?}")
-    })?;
-    if got != port {
-        return Err(format!(
-            "owned ws endpoint rejected: port {got} != owned port {port} in {url:?}"
-        ));
+    match uri.port_u16() {
+        Some(got) if got == port => Ok(()),
+        Some(got) => Err(format!(
+            "owned ws endpoint rejected: port {got} != owned port {port} in {uri:?}"
+        )),
+        None => Err(format!("owned ws endpoint rejected: no port in {uri:?}")),
     }
-    Ok(())
 }
+
+/// Parse an owned-path ws URL ONCE with the connector's own parser
+/// (`IntoClientRequest` - the same parse `connect_async` performs), confine
+/// the resulting URI to our loopback port, and return the SAME request for
+/// the connector to dial. Production (`launch_owned_obscura`) and the
+/// confinement tests both call this, so validation and dialing can never
+/// parse differently: the connector reads host/port off `request.uri()`,
+/// which is the exact value confined here. Never hand-roll URI parsing.
+fn owned_ws_request(port: u16, url: &str) -> Result<WsRequest, String> {
+    let request = url
+        .into_client_request()
+        .map_err(|e| format!("owned ws endpoint rejected: bad ws url {url:?}: {e}"))?;
+    confine_owned_ws_uri(port, request.uri())?;
+    Ok(request)
+}
+
+/// Remaining startup budget from a SINGLE clock sample. Returns `None` once
+/// the deadline has passed; callers map `None` to their phase's timeout
+/// error. The single sample is the point: deriving the expiry check and the
+/// subtraction from two separate `elapsed()` calls lets the subtraction
+/// underflow and panic instead of timing out.
+fn startup_remaining(start: Instant, deadline: Duration) -> Option<Duration> {
+    let elapsed = start.elapsed();
+    if elapsed >= deadline {
+        None
+    } else {
+        Some(deadline - elapsed)
+    }
+}
+
+/// Fail-closed child poll for the owned startup loop: an exited child is an
+/// error (the port may now belong to someone else - never keep polling it),
+/// and a `try_wait` failure is an error too (an unknown child state is never
+/// treated as alive).
+fn check_obscura_child(guard: &mut ChildGuard) -> Result<(), String> {
+    match guard.child.as_mut().expect("guard holds child").try_wait() {
+        Ok(Some(status)) => Err(format!("obscura child exited during startup: {status}")),
+        Ok(None) => Ok(()),
+        Err(e) => Err(format!("obscura child wait failed during startup: {e}")),
+    }
+}
+
+/// Default owned launch: the Obscura engine (`serve` on a free loopback
+/// port), modelled as `Engine::Owned` so `close()` kills the tree we
+/// started. Readiness polls `GET http://127.0.0.1:<port>/json/version` for
+/// `webSocketDebuggerUrl` inside `startup_timeout()`: a ready-file is NOT
+/// trusted (measured flaking twice - the engine serving with no file
+/// published). The ws URL then flows through the SAME shared machinery the
+/// attach path uses (`resolve_ws_url` handles `http://...` ->
+/// `/json/version` -> `webSocketDebuggerUrl`, bounded here by the remaining
+/// startup budget so one poll iteration can never exceed it), then through
+/// the SAME `owned_ws_request` the tests exercise (connector-parser parse +
+/// loopback-port confine, and the returned request is what `connect_async`
+/// dials - no re-parse), so the post-connect session/target flow is never
+/// forked. Every wait here is bounded (the engine also drops idle browser
+/// WS connections at ~60-70 s, so clients connect lazily on first tool use
+/// and bound every wait).
 
 async fn launch_owned_obscura() -> Result<Inner, String> {
     let deadline = startup_timeout();
@@ -1756,19 +1790,33 @@ async fn launch_owned_obscura() -> Result<Inner, String> {
     let pid = guard.pid;
     let base = format!("http://127.0.0.1:{port}");
     let start = Instant::now();
-    let ws_url = loop {
+    let ws_request = loop {
         // Child-exit detection: if the engine died, the port may now belong
         // to someone else - never keep polling it, fail on the exit status.
-        if let Ok(Some(status)) = guard
-            .child
-            .as_mut()
-            .expect("guard holds child")
-            .try_wait()
-        {
-            return Err(format!("obscura child exited during startup: {status}"));
-        }
-        match resolve_ws_url(&base).await {
-            Ok(u) => {
+        // Fail-closed: a `try_wait` error is never treated as "still alive".
+        check_obscura_child(&mut guard)?;
+        // Single-sample budget: this one sample feeds BOTH the expiry check
+        // and the per-iteration bound below, so the subtraction cannot race
+        // and underflow-panic.
+        let remaining = startup_remaining(start, deadline).ok_or_else(|| {
+            format!(
+                "timeout waiting for obscura /json/version on {base}: \
+                 deadline passed with no ready endpoint"
+            )
+        })?;
+        // Bound ONE poll iteration by the remaining budget: `resolve_ws_url`
+        // carries its own 10 s client timeout, so without this wrap a 1 s
+        // startup budget could take ~10 s. `resolve_ws_url` itself stays
+        // unrestricted for the attach path - the bound lives here, on the
+        // owned path only.
+        match tokio::time::timeout(remaining, resolve_ws_url(&base)).await {
+            Err(_) => {
+                return Err(format!(
+                    "timeout waiting for obscura /json/version on {base}: \
+                     deadline passed while awaiting resolve"
+                ));
+            }
+            Ok(Ok(u)) => {
                 // A success that arrives after the deadline is still a
                 // timeout: the budget is enforced, not just tested on error.
                 if start.elapsed() >= deadline {
@@ -1777,12 +1825,17 @@ async fn launch_owned_obscura() -> Result<Inner, String> {
                          deadline passed before accepting a ready endpoint"
                     ));
                 }
-                // Owned path only: confine the advertised endpoint to our
-                // loopback port before connecting anywhere.
-                confine_owned_ws_url(port, &u)?;
-                break u;
+                // Re-check the child: it may have died while `resolve_ws_url`
+                // awaited - a late resolve from a dead engine's port must
+                // never be accepted as a live owned engine.
+                check_obscura_child(&mut guard)?;
+                // Owned path only: parse with the CONNECTOR's parser and
+                // confine the advertised endpoint to our loopback port before
+                // connecting anywhere. The loop yields the SAME request the
+                // connector will dial (no re-parse).
+                break owned_ws_request(port, &u)?;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 if start.elapsed() >= deadline {
                     return Err(format!(
                         "timeout waiting for obscura /json/version on {base}: last error: {e}"
@@ -1797,13 +1850,11 @@ async fn launch_owned_obscura() -> Result<Inner, String> {
 
     // The connect also runs inside the startup budget: a stalled handshake
     // must error on elapse, never overshoot the deadline unbounded.
-    if start.elapsed() >= deadline {
-        return Err(format!(
-            "timeout waiting for obscura ws connect on {ws_url}: startup budget exhausted"
-        ));
-    }
-    let remaining = deadline - start.elapsed();
-    let (ws, _) = tokio::time::timeout(remaining, connect_async(&ws_url))
+    let ws_url = ws_request.uri().to_string();
+    let remaining = startup_remaining(start, deadline).ok_or_else(|| {
+        format!("timeout waiting for obscura ws connect on {ws_url}: startup budget exhausted")
+    })?;
+    let (ws, _) = tokio::time::timeout(remaining, connect_async(ws_request))
         .await
         .map_err(|_| {
             format!(
@@ -1812,6 +1863,16 @@ async fn launch_owned_obscura() -> Result<Inner, String> {
             )
         })?
         .map_err(|e| format!("ws connect {ws_url}: {e}"))?;
+    // Tokio's `timeout` polls the inner future first, so a handshake that
+    // completes at/after expiry still returns `Ok`: re-enforce the deadline
+    // after a successful connect, before building `Inner` or announcing
+    // readiness.
+    if start.elapsed() >= deadline {
+        return Err(format!(
+            "timeout waiting for obscura ws connect on {ws_url}: \
+             handshake completed after the startup budget expired"
+        ));
+    }
     let (sink, stream) = ws.split();
     let shared = new_shared(sink);
     let reader = tokio::spawn(reader_loop(stream, shared.clone()));
@@ -2694,31 +2755,92 @@ mod tests {
         );
     }
 
-    /// Owned-endpoint confinement table: our loopback port passes, anything
-    /// else fails. The attach path (`resolve_ws_url`) is deliberately NOT
-    /// confined - it must keep accepting whatever the user pointed at.
+    /// Owned-endpoint confinement table, through the SAME `owned_ws_request`
+    /// production dials (parse with the connector's parser, confine
+    /// `request.uri()`, hand the request to `connect_async`). The attach
+    /// path (`resolve_ws_url`) is deliberately NOT confined - it must keep
+    /// accepting whatever the user pointed at.
     #[test]
-    fn confine_owned_ws_url_accepts_only_our_loopback_port() {
-        confine_owned_ws_url(5555, "ws://127.0.0.1:5555/devtools/browser/x")
-            .expect("127.0.0.1 + owned port accepts");
-        confine_owned_ws_url(5555, "ws://localhost:5555/devtools/browser/x")
-            .expect("localhost + owned port accepts");
+    fn owned_ws_request_accepts_only_our_loopback_port() {
+        for url in [
+            "ws://127.0.0.1:5555/devtools/browser/x",
+            "ws://127.0.0.1:5555/",
+            "ws://localhost:5555/devtools/browser/x",
+            "ws://LOCALHOST:5555/devtools/browser/x",
+            "ws://[::1]:5555/devtools/browser/x",
+            "wss://127.0.0.1:5555/devtools/browser/x",
+        ] {
+            owned_ws_request(5555, url).unwrap_or_else(|e| panic!("must accept {url:?}: {e}"));
+        }
+        for url in [
+            "ws://127.0.0.1:5556/devtools/browser/x",    // wrong port
+            "ws://192.168.1.10:5555/devtools/browser/x", // foreign IP
+            "ws://192.0.2.1:9000/",                      // TEST-NET-1 squatter shape
+            "http://127.0.0.1:5555/devtools/browser/x",  // non-ws scheme
+            "https://127.0.0.1:5555/x",
+            "ws://127.0.0.1.evil.com:5555/x", // suffix smuggle
+            "ws://localhost.evil.com:5555/x",
+            "ws://localhost.:5555/x", // trailing dot
+            "ws://127.0.0.1.:5555/x",
+            "ws://127.0.0.1/x", // missing port
+            "ws://localhost/x",
+        ] {
+            assert!(owned_ws_request(5555, url).is_err(), "must reject {url:?}");
+        }
+    }
+
+    /// Bypass regressions: the old hand-rolled parser ended the authority at
+    /// `/` only and took text after the last `@` as the host, so BOTH of
+    /// these were accepted for owned port 5555 while the CONNECTOR (which
+    /// ends the authority at the first `/`, `?`, or `#`) dials
+    /// `192.0.2.1:9000`. Validated through the same `owned_ws_request`
+    /// production dials: the connector parses identically because it reads
+    /// the same `request.uri()`.
+    #[test]
+    fn owned_ws_request_rejects_query_fragment_host_smuggle() {
+        let q = "ws://192.0.2.1:9000?@127.0.0.1:5555/";
+        let q_err = owned_ws_request(5555, q).expect_err("query smuggle must be rejected");
+        eprintln!("owned confinement rejects query-smuggle url {q}: {q_err}");
+        let f = "ws://192.0.2.1:9000#@127.0.0.1:5555/";
+        let f_err = owned_ws_request(5555, f).expect_err("fragment smuggle must be rejected");
+        eprintln!("owned confinement rejects fragment-smuggle url {f}: {f_err}");
+    }
+
+    /// Budget helper through the SAME `startup_remaining` production uses: a
+    /// fresh start yields the remaining budget, an expired start yields
+    /// `None` (the timeout error), and the boundary is already expired - a
+    /// handshake completing AT expiry is late (Tokio's `timeout` polls the
+    /// inner future first, so completion at expiry would otherwise read as
+    /// success).
+    #[test]
+    fn startup_remaining_enforces_the_deadline() {
+        let deadline = Duration::from_millis(200);
+        let got = startup_remaining(Instant::now(), deadline).expect("fresh start has budget");
         assert!(
-            confine_owned_ws_url(5555, "ws://127.0.0.1:5556/devtools/browser/x").is_err(),
-            "a different port must be rejected"
+            !got.is_zero() && got <= deadline,
+            "fresh start must yield a live budget, got {got:?}"
         );
         assert!(
-            confine_owned_ws_url(5555, "ws://192.168.1.10:5555/devtools/browser/x").is_err(),
-            "a non-loopback host must be rejected"
+            startup_remaining(Instant::now() - Duration::from_secs(60), deadline).is_none(),
+            "a long-past start is expired"
         );
         assert!(
-            confine_owned_ws_url(5555, "http://127.0.0.1:5555/devtools/browser/x").is_err(),
-            "a non-ws scheme must be rejected"
+            startup_remaining(Instant::now(), Duration::ZERO).is_none(),
+            "a zero budget is immediately expired"
+        );
+        // Boundary: started exactly one deadline ago means elapsed >=
+        // deadline (elapsed only grows from here), so this is expired.
+        assert!(
+            startup_remaining(Instant::now() - deadline, deadline).is_none(),
+            "completion AT expiry is late"
         );
     }
 
-    /// Composition: a squatter `/json/version` advertising a non-loopback
-    /// endpoint must fail the owned resolve+confine path. Bounded (the fake
+    /// Composition: squatter `/json/version` endpoints resolve over a REAL
+    /// local listener and are then rejected by the SAME `owned_ws_request`
+    /// production dials. Covers the plain foreign endpoint AND the crafted
+    /// query/fragment smuggle shapes (which carry the owned port after the
+    /// `@`, exactly what the old parser accepted). Bounded (the fake
     /// answers immediately on loopback) and local only.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn owned_resolve_confine_rejects_squatter_endpoint() {
@@ -2731,11 +2853,24 @@ mod tests {
             .expect("base has a port")
             .parse()
             .expect("base port parses");
-        let r = confine_owned_ws_url(port, &got);
-        assert!(
-            r.is_err(),
-            "squatter endpoint must be confined, got: {got}"
-        );
+        let r = owned_ws_request(port, &got);
+        assert!(r.is_err(), "squatter endpoint must be confined, got: {got}");
         http.abort();
+        // Crafted shapes: the smuggled port IS the owned port under test
+        // (any fixed port works - the check compares against it).
+        let owned: u16 = 5555;
+        for crafted in [
+            format!("ws://192.0.2.1:9000?@127.0.0.1:{owned}/"),
+            format!("ws://192.0.2.1:9000#@127.0.0.1:{owned}/"),
+        ] {
+            let (base_c, http_c) = fake_version_http(crafted.clone()).await;
+            let got_c = resolve_ws_url(&base_c)
+                .await
+                .expect("smuggle shape resolves");
+            assert_eq!(got_c, crafted, "resolve must pass the URL through");
+            let err = owned_ws_request(owned, &got_c).expect_err("smuggle shape must be confined");
+            eprintln!("owned resolve+confine rejects squatter url {got_c}: {err}");
+            http_c.abort();
+        }
     }
 }
