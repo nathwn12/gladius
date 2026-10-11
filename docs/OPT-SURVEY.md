@@ -10,7 +10,7 @@
 
 ## 1. Provenance
 
-No `.git` in `<user-profile>\projects\gladius` (directory listing: `.gitignore` only). Provenance is
+No `.git` in `<repo>` (directory listing: `.gitignore` only). Provenance is
 established by hashes + mtimes + an isolated fresh rebuild.
 
 | Artifact | Size (B) | mtime (local) | SHA256 |
@@ -46,7 +46,7 @@ in link timestamps/GUID (normal MSVC linker metadata).
 | `target\release\gladius.exe selftest` | **0** | `SELFTEST navigate/snapshot/evaluate/click/click-toggle/close: PASS` + `SELFTEST: ALL PASS` |
 | fresh-build `gladius.exe selftest` | **0** | same six PASS lines from the scratch build |
 
-Resolved backend (stderr): `<user-profile>\AppData\Local\ms-playwright\chromium_headless_shell-1247\chrome-headless-shell-win64\chrome-headless-shell.exe`,
+Resolved backend (stderr): `<ms-playwright>/chromium_headless_shell-<rev>/chrome-headless-shell.exe`,
 job object armed `KILL_ON_JOB_CLOSE`, throwaway profile `%TEMP%\gladius-<pid>-...`. All test browser
 trees were reaped: **zero `chrome-headless-shell` processes survive** (checked after every run).
 
