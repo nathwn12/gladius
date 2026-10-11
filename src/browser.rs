@@ -1111,10 +1111,15 @@ async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
     }
 }
 
-fn find_chrome() -> std::path::PathBuf {
+/// Headless-shell-only engine resolution: `GLADIUS_CHROME` wins, else the
+/// newest `chrome-headless-shell.exe` under `%LOCALAPPDATA%\ms-playwright`.
+/// There is deliberately NO system-Chrome fallback: only the headless shell
+/// backend is supported, so a missing shell is a clear error, never a
+/// silent switch to a headed-capable binary.
+fn find_chrome() -> Result<std::path::PathBuf, String> {
     if let Ok(p) = std::env::var("GLADIUS_CHROME") {
         if !p.trim().is_empty() {
-            return std::path::PathBuf::from(p);
+            return Ok(std::path::PathBuf::from(p));
         }
     }
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
@@ -1132,11 +1137,17 @@ fn find_chrome() -> std::path::PathBuf {
             }
             cands.sort();
             if let Some(newest) = cands.pop() {
-                return newest;
+                return Ok(newest);
             }
         }
     }
-    std::path::PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+    Err(format!(
+        "chrome backend not found: no chrome-headless-shell.exe under \
+         %LOCALAPPDATA%\\ms-playwright\\*\\chrome-headless-shell-win64\\ \
+         (e.g. %LOCALAPPDATA%\\ms-playwright\\chromium_headless_shell-*/\
+         chrome-headless-shell-win64\\chrome-headless-shell.exe); \
+         set GLADIUS_CHROME to an explicit browser binary path"
+    ))
 }
 
 /// Startup deadline for the DevTools listening line (default 30s).
@@ -1193,10 +1204,7 @@ async fn launch() -> Result<Inner, String> {
             &format!("Start-Sleep -Seconds {secs} # GLADIUS_STARTUP_STUB"),
         ]);
     } else {
-        let chrome = find_chrome();
-        if !chrome.is_file() {
-            return Err(format!("chrome backend not found: {}", chrome.display()));
-        }
+        let chrome = find_chrome()?;
         eprintln!("[gladius] backend: {}", chrome.display());
         eprintln!("[gladius] profile: {}", profile.path().display());
         std_cmd = std::process::Command::new(&chrome);
@@ -1413,11 +1421,17 @@ fn owner_alive(_pid: u32) -> bool {
 
 #[cfg(windows)]
 fn kill_tree(pid: u32) {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
+    let mut cmd = std::process::Command::new("taskkill");
+    cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let _ = cmd.status();
 }
 
 #[cfg(not(windows))]

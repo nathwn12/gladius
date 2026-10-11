@@ -87,7 +87,8 @@ gladius.exe selftest # internal end-to-end check, exits 0 on pass
 
 Backend browser resolution order: `GLADIUS_CHROME` env var, then newest
 `%LOCALAPPDATA%\ms-playwright\chromium_headless_shell-*\chrome-headless-shell-win64\chrome-headless-shell.exe`,
-then the system Chrome install. Spawned headless with `CREATE_NO_WINDOW`;
+else a clear error naming the expected path and the override. Headless-shell
+only: there is no system-Chrome fallback. Spawned headless with `CREATE_NO_WINDOW`;
 killed as a whole process tree on `close`.
 
 Environment:
