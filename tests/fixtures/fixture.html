@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head><title>Gladius Fixture</title></head>
+<body>
+<h1 id="marker">GLADIUS_MARKER_hello-12345</h1>
+<p>Some filler text for the snapshot path.</p>
+<button id="toggle" onclick="this.textContent='TOGGLED_OK'">CLICK_ME</button>
+<form id="login" onsubmit="event.preventDefault();document.getElementById('submit-result').textContent='SUBMITTED:'+document.getElementById('name').value;return false;">
+<input id="name" type="text" value="">
+<button type="submit" id="go">GO</button>
+</form>
+<p id="submit-result">NOT_SUBMITTED</p>
+<div id="hover-target" onmouseover="document.getElementById('hover-result').textContent='HOVERED_OK'" style="margin-top:1200px;padding:40px;background:#eee;">HOVER_ME</div>
+<p id="hover-result">NOT_HOVERED</p>
+<select id="color" onchange="document.getElementById('select-result').textContent='SELECTED:'+this.value">
+<option value="r">Red</option>
+<option value="g">Green</option>
+<option value="b">Blue</option>
+</select>
+<p id="select-result">NOT_SELECTED</p>
+<button id="disabled-btn" disabled onclick="document.getElementById('disabled-result').textContent='DISABLED_CLICKED'">DISABLED_BTN</button>
+<p id="disabled-result">NOT_CLICKED</p>
+<input id="disabled-input" type="text" disabled value="">
+<input id="readonly-input" type="text" readonly value="orig">
+<div id="hidden-box" style="display:none;" onclick="document.getElementById('hidden-result').textContent='HIDDEN_CLICKED'">HIDDEN</div>
+<p id="hidden-result">NOT_CLICKED</p>
+<script>window.__gladiusValue = 42;</script>
+</body>
+</html>

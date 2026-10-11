@@ -1,0 +1,9 @@
+/target
+/bin
+/gladius-bench-refs
+/real-world
+/gauntlet
+/.playwright-mcp
+__pycache__/
+*.old-*
+*.pyc

@@ -1,0 +1,10 @@
+<!doctype html>
+<html>
+<head><title>Gladius Dialog Fixture</title></head>
+<body>
+<h1>DIALOG_FIXTURE_MARKER</h1>
+<button id="alert-btn" onclick="document.getElementById('result').textContent='RESULT:'+ (alert('DLG_PROBE_alert-xyz'), 'accepted')">FIRE_ALERT</button>
+<button id="confirm-btn" onclick="document.getElementById('result').textContent='CONFIRM:'+confirm('DLG_PROBE_confirm-xyz')">FIRE_CONFIRM</button>
+<div id="result">RESULT:none</div>
+</body>
+</html>

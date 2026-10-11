@@ -1,0 +1,37 @@
+[package]
+name = "gladius"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gladius"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "stream"] }
+futures-util = "0.3"
+serde_json = "1"
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# ---------------------------------------------------------------- build speed
+# Fast inner loop. `line-tables-only` keeps file:line backtraces but drops
+# variable/type debuginfo. Measured (MSVC, this toolchain): dev PDB 63.2 -> 26.8 MB
+# (-57.7 %) for gladius and 11,677,696 -> 6,074,368 B (-48.0 %) for puppet; dev
+# target dir 774 -> 487 MB. Wall-clock effect: none measurable (see §1.3) - this
+# is a disk/I-O/staging win.
+[profile.dev]
+debug = "line-tables-only"   # MSRV 1.71 for string values
+incremental = true           # already the default; stated so nobody "optimises" it away
+opt-level = 0                # already the default; keep it (see §6)
+
+# `test` inherits `dev`, so `cargo test` gets the same treatment. Explicit for clarity.
+[profile.test]
+inherits = "dev"
+
+# ---------------------------------------------------------------- release
+# DELIBERATELY EMPTY: the release defaults are already the build-time-friendly
+# set (opt-level=3, codegen-units=16, lto=false, panic="unwind", debug=false,
+# strip="none"). Adding lto/codegen-units=1 makes builds SLOWER and changes the
+# H2H-benched artifact - see §5. Do not add a [profile.release] block.
