@@ -256,13 +256,16 @@ async fn tool_navigate(browser: &Browser, url: &str) -> Result<Value, String> {
     if !title.is_empty() || cur.is_empty() || cur == "about:blank" {
         return Ok(ok_text(json!({"url": cur, "title": title}).to_string()));
     }
+    // NOTE: `.length` arrives as an int on chrome-headless-shell but as a
+    // float on Obscura (`42` vs `42.0` number shape), so compare as f64 -
+    // `as_i64` would miss the empty case on Obscura entirely.
     let body_len = browser
         .eval("(((document.body && document.body.innerText) || '') + '').length")
         .await
         .ok()
-        .and_then(|v| v.as_i64())
-        .unwrap_or(-1);
-    if body_len == 0 {
+        .and_then(|v| v.as_f64())
+        .unwrap_or(-1.0);
+    if body_len == 0.0 {
         Ok(ok_text(
             json!({"url": cur, "title": title,
                    "warning": "possible blank-load race: committed URL with empty document (empty title and empty body text); re-navigate to confirm"})
