@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    # The test suites drive a headless Chrome over CDP. The suite probes the
+    # ms-playwright headless-shell path first and falls back to a system
+    # Chrome; the code honours GLADIUS_CHROME, so point it at the runner's
+    # preinstalled Chrome explicitly.
+    env:
+      GLADIUS_CHROME: 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: fmt
+        run: cargo fmt --check
+        continue-on-error: true
+      - name: clippy
+        run: cargo clippy --all-targets
+        continue-on-error: true
+      - name: build
+        run: cargo build --release
+      - name: test
+        run: cargo test
