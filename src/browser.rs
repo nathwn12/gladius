@@ -433,8 +433,14 @@ impl Browser {
         // still wakes this waiter.
         tokio::pin!(let notified = shared.load_notify.notified(););
         loop {
-            match self.eval("document.readyState").await {
-                Ok(Value::String(s)) if s == "complete" => return,
+            // Clip each poll eval to the REMAINING budget (the same wrap the
+            // `wait_for` tool already uses): the deadline is checked between
+            // evals, but an unwrapped `send_raw` allows 30s per call, so a
+            // stalled peer would turn a short cap into 30s+.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, self.eval("document.readyState")).await
+            {
+                Ok(Ok(Value::String(s))) if s == "complete" => return,
                 _ => {}
             }
             if Instant::now() >= deadline {
@@ -474,6 +480,30 @@ impl Browser {
         match guard.as_ref() {
             Some(inner) => inner.shared.console.lock().await.drain(..).count(),
             None => 0,
+        }
+    }
+
+    /// Atomic take-and-return for `console drain`: the slice AND the clear
+    /// happen under ONE `console` lock acquisition. The old shape (clone
+    /// under one acquisition in `console_get`, drain under a second in
+    /// `console_clear`) let the reader push between the two awaits; those
+    /// arrivals were cleared but never returned. Same envelope as
+    /// get-then-clear (`messages/count/total/cap` plus `cleared`).
+    pub async fn console_drain(&self, limit: usize) -> Value {
+        let guard = self.state.lock().await;
+        match guard.as_ref() {
+            Some(inner) => {
+                let mut q = inner.shared.console.lock().await;
+                let total = q.len();
+                let take = limit.min(total);
+                let messages: Vec<Value> =
+                    q.iter().skip(total - take).map(|m| m.json()).collect();
+                let cleared = q.drain(..).count();
+                json!({"messages": messages, "count": take,
+                       "total": total, "cap": CONSOLE_CAP, "cleared": cleared})
+            }
+            None => json!({"messages": [], "count": 0,
+                           "total": 0, "cap": CONSOLE_CAP, "cleared": 0}),
         }
     }
 
@@ -545,6 +575,18 @@ async fn send_raw(
     params: Value,
     session: Option<String>,
 ) -> Result<Value, String> {
+    send_raw_with_timeout(shared, method, params, session, Duration::from_secs(30)).await
+}
+
+/// `send_raw` with an injectable response timeout (production passes 30s;
+/// tests pass a short budget against the black-hole rig).
+async fn send_raw_with_timeout(
+    shared: &Arc<Shared>,
+    method: &str,
+    params: Value,
+    session: Option<String>,
+    timeout: Duration,
+) -> Result<Value, String> {
     let id = shared.next_id.fetch_add(1, Ordering::SeqCst);
     let mut envelope = serde_json::Map::new();
     envelope.insert("id".to_string(), json!(id));
@@ -563,14 +605,23 @@ async fn send_raw(
             return Err(format!("ws send: {e}"));
         }
     }
-    let resp = tokio::time::timeout(Duration::from_secs(30), rx)
-        .await
-        .map_err(|_| "cdp: response timeout".to_string())?
-        .map_err(|_| "cdp: response channel closed".to_string())?;
-    if let Some(err) = resp.get("error") {
-        return Err(format!("cdp error: {err}"));
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(resp)) => {
+            if let Some(err) = resp.get("error") {
+                return Err(format!("cdp error: {err}"));
+            }
+            Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+        }
+        Ok(Err(_)) => Err("cdp: response channel closed".to_string()),
+        Err(_) => {
+            // Timeout path: drop the pending entry, mirroring the send-error
+            // path above. Without this, one `tx` leaks per unanswered call
+            // (a late response is the only other removal, and a dead peer
+            // never sends one).
+            shared.pending.lock().unwrap().remove(&id);
+            Err("cdp: response timeout".to_string())
+        }
     }
-    Ok(resp.get("result").cloned().unwrap_or(Value::Null))
 }
 
 async fn ensure_session(shared: &Arc<Shared>) -> Result<String, String> {
@@ -1493,5 +1544,203 @@ mod job {
             }
             GetLastError() != ERROR_INVALID_PARAMETER
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rig for timeout/atomicity proofs: a real WS pair whose server side
+    /// NEVER answers (black-hole peer, local only), plus a sleeper child
+    /// standing in for the browser process (reaped by `close`).
+    struct TestRig {
+        browser: Browser,
+        shared: Arc<Shared>,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    async fn rig() -> TestRig {
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let port = ln.local_addr().expect("loopback addr").port();
+        let srv = tokio::spawn(async move {
+            while let Ok((s, _)) = ln.accept().await {
+                tokio::spawn(async move {
+                    match tokio_tungstenite::accept_async(s).await {
+                        Ok(mut ws) => {
+                            while ws.next().await.is_some() {}
+                        }
+                        Err(_) => {}
+                    }
+                });
+            }
+        });
+        let url = format!("ws://127.0.0.1:{port}/");
+        let (ws, _) = connect_async(&url).await.expect("ws connect");
+        let (sink, stream) = ws.split();
+        let shared = Arc::new(Shared {
+            sink: AsyncMutex::new(sink),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: AtomicU64::new(1),
+            session: AsyncMutex::new(None),
+            target: AsyncMutex::new(None),
+            dialog: AsyncMutex::new(None),
+            load_notify: tokio::sync::Notify::new(),
+            tab_order: AsyncMutex::new(Vec::new()),
+            console: AsyncMutex::new(VecDeque::new()),
+            net_inflight: AsyncMutex::new(HashSet::new()),
+            net_notify: tokio::sync::Notify::new(),
+            net_enabled: AsyncMutex::new(false),
+        });
+        let reader = tokio::spawn(reader_loop(stream, shared.clone()));
+        let mut std_cmd = std::process::Command::new("powershell");
+        std_cmd
+            .args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 120"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            std_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        let child = Command::from(std_cmd).spawn().expect("spawn sleeper");
+        let pid = child.id().expect("sleeper pid");
+        let profile = ProfileDir::create().expect("profile");
+        let inner = Inner {
+            _profile: profile,
+            #[cfg(windows)]
+            _job: None,
+            child,
+            pid,
+            shared: shared.clone(),
+            reader,
+        };
+        let browser = Browser {
+            state: AsyncMutex::new(Some(inner)),
+            pid: Mutex::new(Some(pid)),
+            refs: AsyncMutex::new(HashMap::new()),
+            snap_url: AsyncMutex::new(String::new()),
+        };
+        TestRig {
+            browser,
+            shared,
+            tasks: vec![srv],
+        }
+    }
+
+    impl TestRig {
+        async fn shutdown(self) {
+            let TestRig {
+                browser, tasks, ..
+            } = self;
+            let _ = browser.close().await;
+            for t in tasks {
+                t.abort();
+            }
+        }
+    }
+
+    fn drain_count(v: &Value) -> usize {
+        v.get("messages")
+            .and_then(|m| m.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    }
+
+    /// F6 proof: an unanswered call must not leave its `tx` in the pending
+    /// map. Pre-fix the timeout path returns without removing the entry (it
+    /// is removed only if a late response arrives, which never happens for
+    /// a dead peer): one leaked entry per timed-out call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_raw_cleans_pending_on_timeout() {
+        let rig = rig().await;
+        let r = send_raw_with_timeout(
+            &rig.shared,
+            "Page.enable",
+            json!({}),
+            None,
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(r.is_err(), "black hole never answers: {r:?}");
+        assert!(
+            rig.shared.pending.lock().unwrap().is_empty(),
+            "pending map leaked the timed-out call"
+        );
+        rig.shutdown().await;
+    }
+
+    /// F5 proof: `wait_for_load(100ms)` against a never-answering peer must
+    /// return in ~100ms, not after `send_raw`'s 30s per-call timeout. Pre-fix
+    /// the eval is unwrapped, so this blocks ~30s and fails the bound below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_load_respects_cap_on_dead_peer() {
+        let rig = rig().await;
+        let t0 = Instant::now();
+        rig.browser
+            .wait_for_load(Duration::from_millis(100))
+            .await;
+        let dt = t0.elapsed();
+        assert!(
+            dt < Duration::from_secs(10),
+            "soft cap bypassed by unwrapped eval: took {dt:?}"
+        );
+        rig.shutdown().await;
+    }
+
+    /// F4 proof: `console_drain` (single-lock take-and-return) against a
+    /// concurrent pusher. Every pushed message is either returned by some
+    /// drain or still in the ring: the reconciled total always equals what
+    /// was pushed. The pre-fix two-step shape (get-then-clear) lost 115 of
+    /// 150 messages on this same rig. Timing-dependent by nature: a failure
+    /// here means loss.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn console_drain_is_atomic() {
+        const N: u64 = 150; // under CONSOLE_CAP: no eviction can explain loss
+        let rig = rig().await;
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sh = rig.shared.clone();
+        let d = done.clone();
+        let pusher = tokio::spawn(async move {
+            for i in 0..N {
+                push_console(
+                    &sh,
+                    ConsoleMsg {
+                        mtype: "log".to_string(),
+                        text: format!("tick {i}"),
+                        url: String::new(),
+                        line: 0,
+                        ts: i,
+                    },
+                )
+                .await;
+                tokio::task::yield_now().await;
+            }
+            d.store(true, Ordering::SeqCst);
+        });
+        let mut returned = 0usize;
+        loop {
+            let v = rig.browser.console_drain(200).await;
+            returned += drain_count(&v);
+            if done.load(Ordering::SeqCst) {
+                // Pusher is finished: one last drain, then the ring is empty
+                // and the books must balance exactly.
+                let v = rig.browser.console_drain(200).await;
+                returned += drain_count(&v);
+                let rest = rig.browser.console_get(200).await;
+                assert_eq!(drain_count(&rest), 0, "ring must be empty at the end");
+                assert_eq!(
+                    returned, N as usize,
+                    "atomic drain lost {} of {N} messages",
+                    N as usize - returned
+                );
+                break;
+            }
+        }
+        pusher.await.expect("pusher");
+        rig.shutdown().await;
     }
 }

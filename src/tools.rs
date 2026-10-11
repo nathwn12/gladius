@@ -241,7 +241,11 @@ async fn tool_navigate(browser: &Browser, url: &str) -> Result<Value, String> {
         .as_str()
         .unwrap_or(url)
         .to_string();
-    Ok(ok_text(json!({"url": cur, "title": title, "status": 200}).to_string()))
+    // NOTE: no HTTP status is reported. The tool speaks CDP, not HTTP: it
+    // never sees the main-frame response status (there is no Network-domain
+    // capture here), and a hardcoded 200 lies on every 404. A wrong field is
+    // worse than no field, so the envelope is just url + title.
+    Ok(ok_text(json!({"url": cur, "title": title}).to_string()))
 }
 
 /// Parse an AX ref arg (`@e3`) to its table id (`e3`). Selectors pass through
@@ -510,9 +514,13 @@ async fn tool_click(browser: &Browser, element: &str) -> Result<Value, String> {
     {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
+            // Clip each probe to the REMAINING budget (the same wrap the
+            // `wait_for` tool already uses): a stalled peer must not turn
+            // this 3s presence cap into a 30s `send_raw` timeout.
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let probe = format!("(!!document.querySelector({sel}))");
-            match browser.eval(&probe).await {
-                Ok(Value::Bool(true)) => break,
+            match tokio::time::timeout(remaining, browser.eval(&probe)).await {
+                Ok(Ok(Value::Bool(true))) => break,
                 _ => {}
             }
             if std::time::Instant::now() >= deadline {
@@ -707,11 +715,9 @@ async fn tool_console(
     match action {
         "get" => Ok(ok_text(browser.console_get(lim).await.to_string())),
         "drain" => {
-            let v = browser.console_get(lim).await;
-            let cleared = browser.console_clear().await;
-            let mut obj = v.as_object().cloned().unwrap_or_default();
-            obj.insert("cleared".to_string(), json!(cleared));
-            Ok(ok_text(Value::Object(obj).to_string()))
+            // Atomic take-and-return (single lock inside `console_drain`):
+            // arrivals during a drain are either returned or kept, never lost.
+            Ok(ok_text(browser.console_drain(lim).await.to_string()))
         }
         "clear" => {
             let n = browser.console_clear().await;
