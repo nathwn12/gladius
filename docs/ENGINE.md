@@ -34,6 +34,30 @@ accepts an optional `-SourcePath <zip>` that skips the download and verifies a
 local zip instead (useful for offline or test use); the default path always
 downloads the pinned release asset.
 
+## How gladius runs it (launch contract)
+
+Gladius launches the owned engine as:
+
+```
+obscura.exe serve --host 127.0.0.1 --port <free> --allow-private-network --allow-file-access
+```
+
+each flag exactly once (the engine's clap parser hard-fails on a repeated
+flag), spawned with `CREATE_NO_WINDOW`, with readiness discovered by polling
+`GET http://127.0.0.1:<port>/json/version` for `webSocketDebuggerUrl` (the
+`--ready-file` publish is not trusted - it was measured flaking). Backend
+selection is `GLADIUS_CDP_URL` (attach, never owned) first, then
+`GLADIUS_BACKEND=chrome` (explicit chrome-headless-shell opt-in), otherwise
+this Obscura launch is the default; `GLADIUS_OBSCURA` overrides the engine
+path. Both gate flags are MANDATORY and measured: without
+`--allow-private-network`, loopback/LAN navigation fails; without
+`--allow-file-access`, `file://` navigation and `DOM.setFileInputFiles` are
+refused.
+
+Full capability record (gate-flag failures verbatim, per-tool matrix,
+quirks, blank-load race, head-to-head numbers):
+`docs/OBSCURA-COMPAT.md`.
+
 ## Console-subsystem requirement
 
 Both exes are PE32+ (optional-header magic `0x020B`) with Subsystem 3

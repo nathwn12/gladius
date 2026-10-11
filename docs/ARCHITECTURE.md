@@ -25,20 +25,29 @@ Rules: tools are **dumb primitives** - no planner, no LLM, no judgement-retries 
 
 | Tier | Backend | When | Notes |
 |---|---|---|---|
-| **Tier 0 (default)** | `chrome-headless-shell` | now | Official no-UI Chromium (https://googlechromelabs.github.io/chrome-for-testing/).
-  Resolved at runtime: `%LOCALAPPDATA%\ms-playwright\chromium_headless_shell-*\chrome-headless-shell-win64\chrome-headless-shell.exe`;
-  fallback: full Chrome binary. Full JS/DOM fidelity, no compositor/GPU-process tax. |
+| **Tier 0 (default)** | owned Obscura engine | now | `bin\obscura.exe` beside `gladius.exe`, provisioned by
+  `scripts/fetch-engine.ps1` (pinned v0.2.4, sha256-verified). Launched as
+  `obscura serve --host 127.0.0.1 --port <free> --allow-private-network
+  --allow-file-access`, readiness via `GET /json/version`. Full capability
+  record: `docs/OBSCURA-COMPAT.md`. |
+| **Tier 0b (opt-in)** | `chrome-headless-shell` | now | Explicit opt-in via `GLADIUS_BACKEND=chrome`.
+  Resolved at runtime: `GLADIUS_CHROME`, else newest
+  `%LOCALAPPDATA%\ms-playwright\chromium_headless_shell-*\chrome-headless-shell-win64\chrome-headless-shell.exe`;
+  no system-Chrome fallback. Full JS/DOM fidelity, no compositor/GPU-process tax. |
 | **Tier 1 (future)** | Lightpanda no-render | when Windows-viable | `lightpanda serve --protocol cdp` behind the *same* 9 tools
   (https://github.com/lightpanda-io/browser). Renderless DOM/fetch at a fraction of the RAM.
   Blocked today: no native Windows binary. |
 | **Tier 2 (opt-in)** | Full Chrome headed/headless | pixel-perfect only | Flag-gated (`--full-chrome`) for screenshots/canvas/WebGL
   where Tier 0 fidelity is insufficient. Never the default. |
 
-Selection: `--backend {shell, lightpanda, full-chrome}` (default `shell`) + `GLADIUS_CDP_URL`
-to **attach** to an existing endpoint instead of launching (RESEARCH rule 5) — BUILT
-2026-10-11: `ws://`/`wss://` connects directly, `http://`/`https://` resolves via
-`GET <base>/json/version`; the session/target flow after the connect is shared with the
-launch path. Ownership: an attached engine is NOT ours — `close` detaches the session
+Selection: `GLADIUS_CDP_URL` to **attach** to an existing endpoint instead of
+launching (RESEARCH rule 5) — BUILT 2026-10-11: `ws://`/`wss://` connects
+directly, `http://`/`https://` resolves via `GET <base>/json/version`; the
+session/target flow after the connect is shared with the launch path — then
+`GLADIUS_BACKEND=chrome` (case-insensitive) for the explicit
+chrome-headless-shell opt-in, otherwise the owned Obscura launch (the
+default; `GLADIUS_OBSCURA` overrides the engine path, `GLADIUS_CHROME` only
+applies inside the chrome path). Ownership: an attached engine is NOT ours — `close` detaches the session
 gladius opened and never kills, never sweeps. `GLADIUS_BACKEND_CAPS` declares `render`
 (default) or `dom-only` (no rendering pipeline: `screenshot` refuses, never fakes).
 
@@ -52,14 +61,15 @@ gladius opened and never kills, never sweeps. `GLADIUS_BACKEND_CAPS` declares `r
   convention; `screenshot` returns an `image` part (base64 PNG), everything else `text`.
 - Server answers `initialize` with **no browser running** (lazy start, §4) - cold MCP handshake
   must never pay browser-launch cost. The response carries `serverInfo.backend`
-  (`chrome-headless-shell` or `external-cdp`) and `serverInfo.caps` (`render` or
+  (`obscura`, `chrome-headless-shell`, or `external-cdp`) and `serverInfo.caps` (`render` or
   `dom-only`) so a client can see which engine and which caps it is talking to.
 
 ## 4. Browser lifecycle (lazy start, kill-tree on close)
 
 ```
 tools/call (first, non-close) --► resolve backend binary --► spawn child
-      (chrome-headless-shell --headless --remote-debugging-port=0 --about:blank)
+      (default: obscura serve on a free loopback port, both gate flags;
+       chrome opt-in: chrome-headless-shell --headless --remote-debugging-port=0 --about:blank)
       --► CDP connect --► new target/page --► execute --► keep warm for session
 tools/call close  --OR--  stdio EOF / SIGTERM --► CDP Browser.close --► kill-tree (job object) --► reap
 ```

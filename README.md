@@ -85,15 +85,27 @@ Self-check without a client:
 gladius.exe selftest # internal end-to-end check, exits 0 on pass
 ```
 
-Backend browser resolution order: `GLADIUS_CHROME` env var, then newest
-`%LOCALAPPDATA%\ms-playwright\chromium_headless_shell-*\chrome-headless-shell-win64\chrome-headless-shell.exe`,
-else a clear error naming the expected path and the override. Headless-shell
-only: there is no system-Chrome fallback. Spawned headless with `CREATE_NO_WINDOW`;
-killed as a whole process tree on `close`.
+Backend browser resolution order: `GLADIUS_CDP_URL` (attach to an external
+engine, never owned), then `GLADIUS_BACKEND=chrome` for the explicit
+chrome-headless-shell opt-in (`GLADIUS_CHROME` path override, else newest
+`%LOCALAPPDATA%\ms-playwright\chromium_headless_shell-*\chrome-headless-shell-win64\chrome-headless-shell.exe`),
+else the owned Obscura default (`GLADIUS_OBSCURA` path override, else
+`bin\obscura.exe` beside `gladius.exe`, provisioned by
+`scripts/fetch-engine.ps1`; a missing engine is a clear error naming that
+script). Headless-shell only inside the chrome path: there is no
+system-Chrome fallback. The owned engine is spawned with `CREATE_NO_WINDOW`;
+killed as a whole process tree on `close` (an attached engine is only
+detached, never killed).
 
 Environment:
 
-- `GLADIUS_CHROME` — explicit browser binary path (overrides detection).
+- `GLADIUS_BACKEND` — `chrome` (case-insensitive) opts into the
+  chrome-headless-shell launch; anything else (including unset) launches the
+  owned Obscura engine, the default.
+- `GLADIUS_OBSCURA` — explicit Obscura engine binary path (overrides the
+  default sibling lookup).
+- `GLADIUS_CHROME` — explicit browser binary path (applies inside the
+  `GLADIUS_BACKEND=chrome` opt-in path only).
 - `GLADIUS_STARTUP_TIMEOUT_SECS` — DevTools-line startup deadline (default 30).
 - `GLADIUS_TEST_STUB_SLEEP_SECS` — test-only: spawn a silent sleeper instead
   of Chrome to exercise the startup-timeout path.
@@ -106,7 +118,7 @@ Environment:
   there is no rendering pipeline: `screenshot` refuses with a typed error
   instead of returning a fake image (`upload` needs no rendering — DOM CDP
   only — so it keeps working). `initialize` reports
-  `serverInfo.backend` (`chrome-headless-shell` or `external-cdp`) and
+  `serverInfo.backend` (`obscura`, `chrome-headless-shell`, or `external-cdp`) and
   `serverInfo.caps` (`render` or `dom-only`).
 
 ## Build from source

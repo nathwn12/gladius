@@ -22,18 +22,24 @@ Status: **designed, not built.** Owner-facing contract is unchanged until it lan
 |---|---|---|
 | env | `GLADIUS_HEADED=1` | run the backend as a visible window |
 | cli | `gladius mcp --headed` | same, for a client config entry |
-| env | `GLADIUS_CHROME=<path>` | explicit engine override (wins in both modes) |
+| env | `GLADIUS_CHROME=<path>` | explicit engine override (applies inside the `GLADIUS_BACKEND=chrome` opt-in path and headed mode) |
+| env | `GLADIUS_OBSCURA=<path>` | explicit engine override for the default (Obscura) path |
 | env | `GLADIUS_PROFILE_DIR=<path>` | override the headed profile location |
 
-Precedence: `GLADIUS_CHROME` > mode default. Helm only - no MCP tool argument exposes it.
+Precedence: `GLADIUS_OBSCURA` (default path) / `GLADIUS_CHROME` (chrome opt-in
+path) > mode default. Helm only - no MCP tool argument exposes it.
 
 ## Engine resolution
 
 `chrome-headless-shell` **cannot display a window** (it is headless-only), and the full Playwright
 chromium build was deliberately reclaimed, so headed mode needs a real browser binary.
 
-- **Headless (unchanged):** `GLADIUS_CHROME` -> newest `chrome-headless-shell-*` under
-  `%LOCALAPPDATA%\ms-playwright` -> error. Always launched with `--headless`.
+- **Headless (default is now Obscura):** `GLADIUS_OBSCURA` -> `obscura.exe`
+  beside `gladius.exe` -> error naming `scripts/fetch-engine.ps1`. The
+  chrome opt-in inside headless mode: `GLADIUS_BACKEND=chrome`, then
+  `GLADIUS_CHROME` -> newest `chrome-headless-shell-*` under
+  `%LOCALAPPDATA%\ms-playwright` -> error. The chrome path is always
+  launched with `--headless`.
 - **Headed:** `GLADIUS_CHROME` -> `C:\Program Files\Google\Chrome\Application\chrome.exe` ->
   `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe` -> error naming what was searched.
 - Measured on this machine: Chrome **155.0.8059.39** present, Edge **154.0.4258.62** present.

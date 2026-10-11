@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+- Obscura is now the DEFAULT engine: unless `GLADIUS_CDP_URL` attaches or
+  `GLADIUS_BACKEND=chrome` opts in, gladius launches the owned Obscura engine
+  (`obscura.exe serve --host 127.0.0.1 --port <free> --allow-private-network
+  --allow-file-access` beside `gladius.exe`, `CREATE_NO_WINDOW`, readiness by
+  polling `GET /json/version`). Provisioned by `scripts/fetch-engine.ps1`
+  (pinned v0.2.4, sha256-verified, `bin\obscura.exe` +
+  `bin\obscura-worker.exe`); a missing engine is a clear error naming that
+  script, never a silent fallback. `GLADIUS_OBSCURA` overrides the engine
+  path. `initialize` reports `serverInfo.backend` `obscura` on this path.
+- Chrome-headless-shell is now an explicit opt-in (`GLADIUS_BACKEND=chrome`,
+  case-insensitive): `GLADIUS_CHROME` wins inside that path, else the newest
+  shell under `%LOCALAPPDATA%\ms-playwright`; the no-system-Chrome-fallback
+  rule is unchanged. Full capability record (gate flags, per-tool matrix,
+  quirks, numbers): `docs/OBSCURA-COMPAT.md`.
+- Capability exceptions on the Obscura path: JS dialogs are inert
+  (`Page.javascriptDialogOpening` never fires, `Page.handleJavaScriptDialog`
+  is unknown, `alert`/`confirm`/`prompt` silent no-ops); the `console` tool's
+  `Log.entryAdded` leg is blind (`Runtime.consoleAPICalled` still flows);
+  `upload` hard-requires the `--allow-file-access` gate flag (gladius always
+  passes it); the engine can commit a blank page on a double-fetch race,
+  surfaced as a `warning` field on `navigate` (re-navigate to confirm, no
+  auto-retry).
 - External-CDP attach path (`GLADIUS_CDP_URL`): when set to a `ws://`
   (`wss://`) endpoint gladius connects to it instead of launching an engine;
   an `http://` (`https://`) value resolves the ws endpoint from the
