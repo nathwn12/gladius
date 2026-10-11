@@ -1,15 +1,6 @@
-<!-- Header. The repo's ART.md verdict allows a text banner: the framed banner
-     below replaces the icon image - never both. -->
-```
-+--------------------------------------+
-|           __          ___            |
-|    ____ _/ /___ _____/ (_)_  _______ |
-|   / __ `/ / __ `/ __  / / / / / ___/ |
-|  / /_/ / / /_/ / /_/ / / /_/ (__  )  |
-|  \__, /_/\__,_/\__,_/_/\__,_/____/   |
-| /____/                               |
-+--------------------------------------+
-```
+<p align="center">
+  <img src="assets/icon.svg" alt="gladius" width="120" height="120">
+</p>
 <h1 align="center">gladius</h1>
 <p align="center"><strong>Drive headless Chrome over CDP from any MCP client — Rust.</strong></p>
 <p align="center">
