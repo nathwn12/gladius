@@ -9,7 +9,7 @@ pub fn list() -> Value {
          "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
         {"name": "snapshot", "description": "AX snapshot: one line per actionable node with a stable ref (@e1, @e2, ...), role/name/value, plus page text. Pass {\"mode\":\"text\"} for the legacy text-only output.",
          "inputSchema": {"type": "object", "properties": {"mode": {"type": "string"}}}},
-        {"name": "screenshot", "description": "PNG screenshot of the active page",
+        {"name": "screenshot", "description": "PNG screenshot of the active page (unavailable with GLADIUS_BACKEND_CAPS=dom-only: no rendering pipeline)",
          "inputSchema": {"type": "object", "properties": {"fullPage": {"type": "boolean"}}}},
         {"name": "click", "description": "Click an element by CSS selector or AX ref (@eN from snapshot; exact, never first-match)",
          "inputSchema": {"type": "object", "properties": {"element": {"type": "string"}}, "required": ["element"]}},
@@ -44,7 +44,7 @@ pub fn list() -> Value {
          "inputSchema": {"type": "object", "properties": {
              "action": {"type": "string"}, "url": {"type": "string"}, "index": {"type": "integer"}},
              "required": ["action"]}},
-        {"name": "close", "description": "Shut down the browser process tree",
+        {"name": "close", "description": "Shut down the browser (owned process tree) or detach from an attached external engine (GLADIUS_CDP_URL; engine left running)",
          "inputSchema": {"type": "object", "properties": {}}}
     ]})
 }
@@ -464,6 +464,20 @@ async fn tool_snapshot_text(browser: &Browser) -> Result<Value, String> {
 }
 
 async fn tool_screenshot(browser: &Browser, full_page: bool) -> Result<Value, String> {
+    // Capability gate: a dom-only backend has no rendering pipeline, so
+    // there are no pixels to capture. Refuse with the backend and the
+    // reason, never a fake or blank image. Checked before any browser
+    // launch, so a dom-only refusal never spawns an engine.
+    // (`upload` needs no gate: it speaks DOM CDP only -
+    // DOM.enable/getDocument/querySelector/setFileInputFiles - with no
+    // compositor/pixel path. Verified, not assumed.)
+    match crate::browser::backend_caps() {
+        Ok(crate::browser::BackendCaps::DomOnly) => {
+            return Err("screenshot: unavailable with GLADIUS_BACKEND_CAPS=dom-only backend (no rendering pipeline; refusing instead of returning a fake image)".to_string());
+        }
+        Ok(crate::browser::BackendCaps::Render) => {}
+        Err(e) => return Err(format!("screenshot: {e}")),
+    }
     let params = if full_page {
         json!({"format": "png", "captureBeyondViewport": true, "fromSurface": true})
     } else {
