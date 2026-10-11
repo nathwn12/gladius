@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+- Console-flash hardening: the `taskkill` reaper now spawns with
+  `CREATE_NO_WINDOW`, so closing never flashes a console window even for
+  launchers that give gladius no console of its own.
+- Headless-shell-only backend: engine resolution is `GLADIUS_CHROME`, then
+  the newest `chrome-headless-shell.exe` under `%LOCALAPPDATA%\ms-playwright`;
+  the system-Chrome fallback is gone, a missing shell is a clear error.
+- New `no_console_flash` guard test: every process-spawn site must carry the
+  windowless flag, and no system-browser fallback may regress into `src/`.
+
 ## [0.1.0] - 2026-10-11
 
 Initial release.
