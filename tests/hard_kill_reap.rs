@@ -118,7 +118,7 @@ fn profile_dirs(owner_pid: u32) -> Vec<std::path::PathBuf> {
         .unwrap_or_default()
 }
 
-/// PIDs of live `chrome-headless-shell.exe` whose command line mentions
+/// PIDs of live browser processes (chrome-headless-shell.exe or chrome.exe) whose command line mentions
 /// `token` (read-only WMI query; never kills anything). Excludes the query
 /// process itself by construction (powershell.exe, not chrome).
 fn chrome_pids_with(token: &str) -> Vec<u32> {
@@ -128,7 +128,7 @@ fn chrome_pids_with(token: &str) -> Vec<u32> {
         "-NonInteractive",
         "-Command",
         &format!(
-            "Get-CimInstance Win32_Process -Filter \"Name='chrome-headless-shell.exe'\" | Where-Object {{ $_.CommandLine -like '*{token}*' }} | ForEach-Object {{ $_.ProcessId }}"
+            "Get-CimInstance Win32_Process -Filter \"(Name='chrome-headless-shell.exe' OR Name='chrome.exe')\" | Where-Object {{ $_.CommandLine -like '*{token}*' }} | ForEach-Object {{ $_.ProcessId }}"
         ),
     ])
     .stdin(Stdio::null())
