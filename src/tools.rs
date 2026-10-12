@@ -53,19 +53,76 @@ fn ok_text(s: String) -> Value {
     json!({"content": [{"type": "text", "text": s}]})
 }
 
-fn err_text(e: String) -> Value {
-    json!({"content": [{"type": "text", "text": e}], "isError": true})
+/// Typed tool error: the unchanged prose string plus the machine-readable
+/// code/reason/context minted at the error SITE (where the failure is
+/// known), never derived by re-reading the prose. The prose is partly
+/// caller-controlled (selectors, paths, option names), so classifying from
+/// it is unsound; each site passes its own code/reason and the real
+/// argument value through instead.
+///
+/// Envelope contract (G1): the prose in `content[0].text` is byte-for-byte
+/// what it always was - clients that pattern-match English keep working -
+/// and `isError` is unchanged. `structuredContent` rides alongside; a
+/// client that ignores the new field sees the old envelope exactly.
+struct ToolErr {
+    prose: String,
+    sc: Value,
 }
+
+impl ToolErr {
+    /// A failure the site types explicitly: stable code/reason plus the
+    /// real offending value (`ref` for an AX ref, `element` for a selector,
+    /// `path` for a local file, `want` for a wanted option, `name` for an
+    /// unknown tool).
+    fn typed(prose: String, sc: Value) -> Self {
+        Self { prose, sc }
+    }
+
+    /// Anything that genuinely knows nothing (CDP/js-engine failures and
+    /// other untyped strings): code only, never an invented reason.
+    fn fallback(prose: String) -> Self {
+        Self {
+            prose,
+            sc: json!({"code": "error"}),
+        }
+    }
+
+    fn envelope(self) -> Value {
+        json!({"content": [{"type": "text", "text": self.prose}], "isError": true, "structuredContent": self.sc})
+    }
+}
+
+/// `?` on engine calls (`browser.command` / `browser.eval` / serde): those
+/// failures carry no site-known type, so they keep the generic fallback.
+impl From<String> for ToolErr {
+    fn from(prose: String) -> Self {
+        Self::fallback(prose)
+    }
+}
+
+/// Closed machine-readable code set for tool errors, minted at the site:
+///
+///   stale_ref        reason unknown|navigated|node_gone      (+ tool, ref)
+///   not_actionable   reason hidden|disabled|readonly         (+ tool, ref|element)
+///   invalid_target   reason not_select|not_found|not_file   (+ tool, ref|element)
+///   option_not_found reason no_match                         (+ tool, want)
+///   capability_gated reason dom_only                         (+ tool)
+///   timeout          reason budget_exceeded                   (+ tool)
+///   invalid_args     reason missing_arg|bad_index|unknown_action|unknown_tool|need_option
+///   error            fallback, code only (cdp/js-engine failures and anything untyped)
 
 /// Dispatch a tool call. Always returns the MCP result object
 /// (`{"content": [...]}` with optional `isError`); tool failures are NOT
 /// protocol errors.
 pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
-    let r: Result<Value, String> = match name {
+    let r: Result<Value, ToolErr> = match name {
         "navigate" => {
             let url = match args.get("url").and_then(|v| v.as_str()) {
                 Some(u) => u.to_string(),
-                None => return err_text("navigate: missing required arg 'url'".into()),
+                None => return ToolErr::typed(
+                    "navigate: missing required arg 'url'".to_string(),
+                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "navigate"}),
+                ).envelope(),
             };
             tool_navigate(browser, &url).await
         }
@@ -80,7 +137,10 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
         "click" => {
             let el = match args.get("element").and_then(|v| v.as_str()) {
                 Some(e) => e.to_string(),
-                None => return err_text("click: missing required arg 'element'".into()),
+                None => return ToolErr::typed(
+                    "click: missing required arg 'element'".to_string(),
+                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "click"}),
+                ).envelope(),
             };
             tool_click(browser, &el).await
         }
@@ -90,7 +150,10 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                 args.get("text").and_then(|v| v.as_str()),
             ) {
                 (Some(e), Some(t)) => (e.to_string(), t.to_string()),
-                _ => return err_text("type: missing required args 'element'/'text'".into()),
+                _ => return ToolErr::typed(
+                    "type: missing required args 'element'/'text'".to_string(),
+                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "type"}),
+                ).envelope(),
             };
             let submit = args
                 .get("submit")
@@ -101,7 +164,10 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
         "evaluate" => {
             let expr = match args.get("expression").and_then(|v| v.as_str()) {
                 Some(e) => e.to_string(),
-                None => return err_text("evaluate: missing required arg 'expression'".into()),
+                None => return ToolErr::typed(
+                    "evaluate: missing required arg 'expression'".to_string(),
+                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "evaluate"}),
+                ).envelope(),
             };
             tool_evaluate(browser, &expr).await
         }
@@ -134,7 +200,10 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
         "upload" => {
             let el = match args.get("element").and_then(|v| v.as_str()) {
                 Some(e) => e.to_string(),
-                None => return err_text("upload: missing required arg 'element'".into()),
+                None => return ToolErr::typed(
+                    "upload: missing required arg 'element'".to_string(),
+                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "upload"}),
+                ).envelope(),
             };
             let paths: Option<Vec<String>> = args
                 .get("paths")
@@ -148,31 +217,43 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                 });
             let paths = match paths {
                 Some(p) => p,
-                None => return err_text("upload: missing required arg 'paths' (array of strings)".into()),
+                None => return ToolErr::typed(
+                    "upload: missing required arg 'paths' (array of strings)".to_string(),
+                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "upload"}),
+                ).envelope(),
             };
             tool_upload(browser, &el, &paths).await
         }
         "fetch_text" => {
             let url = match args.get("url").and_then(|v| v.as_str()) {
                 Some(u) => u.to_string(),
-                None => return err_text("fetch_text: missing required arg 'url'".into()),
+                None => return ToolErr::typed(
+                    "fetch_text: missing required arg 'url'".to_string(),
+                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "fetch_text"}),
+                ).envelope(),
             };
             match fetch_text(&url).await {
                 Ok(t) => Ok(ok_text(t)),
-                Err(e) => Err(e),
+                Err(e) => Err(ToolErr::fallback(e)),
             }
         }
         "hover" => {
             let el = match args.get("element").and_then(|v| v.as_str()) {
                 Some(e) => e.to_string(),
-                None => return err_text("hover: missing required arg 'element'".into()),
+                None => return ToolErr::typed(
+                    "hover: missing required arg 'element'".to_string(),
+                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "hover"}),
+                ).envelope(),
             };
             tool_hover(browser, &el).await
         }
         "select" => {
             let el = match args.get("element").and_then(|v| v.as_str()) {
                 Some(e) => e.to_string(),
-                None => return err_text("select: missing required arg 'element'".into()),
+                None => return ToolErr::typed(
+                    "select: missing required arg 'element'".to_string(),
+                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "select"}),
+                ).envelope(),
             };
             let value = args
                 .get("value")
@@ -187,14 +268,20 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
         "key" => {
             let key = match args.get("key").and_then(|v| v.as_str()) {
                 Some(k) => k.to_string(),
-                None => return err_text("key: missing required arg 'key'".into()),
+                None => return ToolErr::typed(
+                    "key: missing required arg 'key'".to_string(),
+                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "key"}),
+                ).envelope(),
             };
             tool_key(browser, &key).await
         }
         "tabs" => {
             let action = match args.get("action").and_then(|v| v.as_str()) {
                 Some(a) => a.to_string(),
-                None => return err_text("tabs: missing required arg 'action'".into()),
+                None => return ToolErr::typed(
+                    "tabs: missing required arg 'action'".to_string(),
+                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "tabs"}),
+                ).envelope(),
             };
             let url = args
                 .get("url")
@@ -205,17 +292,20 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
         }
         "close" => match browser.close().await {
             Ok(()) => Ok(ok_text(json!({"ok": true}).to_string())),
-            Err(e) => Err(e),
+            Err(e) => Err(ToolErr::fallback(e)),
         },
-        other => return err_text(format!("unknown tool: {other}")),
+        other => return ToolErr::typed(
+            format!("unknown tool: {other}"),
+            json!({"code": "invalid_args", "reason": "unknown_tool", "name": other}),
+        ).envelope(),
     };
     match r {
         Ok(v) => v,
-        Err(e) => err_text(e),
+        Err(e) => e.envelope(),
     }
 }
 
-async fn tool_navigate(browser: &Browser, url: &str) -> Result<Value, String> {
+async fn tool_navigate(browser: &Browser, url: &str) -> Result<Value, ToolErr> {
     browser
         .command("Page.enable", json!({}), true)
         .await?;
@@ -224,7 +314,7 @@ async fn tool_navigate(browser: &Browser, url: &str) -> Result<Value, String> {
         .await?;
     if let Some(err) = nav.get("errorText").and_then(|v| v.as_str()) {
         if !err.is_empty() {
-            return Err(format!("navigate: {err}"));
+            return Err(ToolErr::fallback(format!("navigate: {err}")));
         }
     }
     // Wait for load (event-driven: wakes on Page.loadEventFired, 10s cap).
@@ -293,10 +383,11 @@ fn parse_ref(s: &str) -> Option<String> {
 /// Guard a ref-targeted action: unknown refs and post-navigation refs fail
 /// with a TYPED stale-ref error naming the reason - never a silent
 /// wrong-element click. Returns the ref id (`eN`) when it may proceed.
-async fn guard_ref(browser: &Browser, tool: &str, _element: &str, id: &str) -> Result<String, String> {
+async fn guard_ref(browser: &Browser, tool: &str, _element: &str, id: &str) -> Result<String, ToolErr> {
     if browser.ref_label(id).await.is_none() {
-        return Err(format!(
-            "stale ref: {tool}: unknown ref @{id} (no such ref; take a fresh snapshot)"
+        return Err(ToolErr::typed(
+            format!("stale ref: {tool}: unknown ref @{id} (no such ref; take a fresh snapshot)"),
+            json!({"code": "stale_ref", "reason": "unknown", "tool": tool, "ref": format!("@{id}")}),
         ));
     }
     let snap = browser.snap_url().await;
@@ -308,20 +399,62 @@ async fn guard_ref(browser: &Browser, tool: &str, _element: &str, id: &str) -> R
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_default();
         if !cur.is_empty() && cur != snap {
-            return Err(format!(
-                "stale ref: {tool}: ref @{id} is stale (page navigated from {snap} to {cur}; take a fresh snapshot)"
+            return Err(ToolErr::typed(
+                format!("stale ref: {tool}: ref @{id} is stale (page navigated from {snap} to {cur}; take a fresh snapshot)"),
+                json!({"code": "stale_ref", "reason": "navigated", "tool": tool, "ref": format!("@{id}")}),
             ));
         }
     }
     Ok(format!("@{id}"))
 }
 
-fn stale_gone(tool: &str, element: &str, id: &str) -> String {
+fn stale_gone(tool: &str, element: &str, id: &str) -> ToolErr {
     let _ = element;
-    format!("stale ref: {tool}: ref @{id} is stale (node gone; take a fresh snapshot)")
+    ToolErr::typed(
+        format!("stale ref: {tool}: ref @{id} is stale (node gone; take a fresh snapshot)"),
+        json!({"code": "stale_ref", "reason": "node_gone", "tool": tool, "ref": format!("@{id}")}),
+    )
 }
 
-async fn tool_snapshot(browser: &Browser, mode: Option<&str>) -> Result<Value, String> {
+/// Structured `snapshot` payload (G2): the node table the text block was
+/// built from (`items`), trimmed to exactly the nodes whose lines survived
+/// the 8000-char cap, so `nodes` matches the text block's refs one-for-one
+/// (including on a truncated page). Zero new page evaluation - `items` is
+/// what the snapshot already computed.
+fn snapshot_nodes(
+    url: &str,
+    title: &str,
+    items: &[Value],
+    shown_lines: usize,
+    truncated: bool,
+) -> Value {
+    // lines[0] is the header; lines[1..] are one node each.
+    let n = shown_lines.saturating_sub(1).min(items.len());
+    let nodes: Vec<Value> = items
+        .iter()
+        .take(n)
+        .map(|it| {
+            json!({
+                "ref": it.get("ref").and_then(|x| x.as_str()).unwrap_or(""),
+                "role": it.get("role").and_then(|x| x.as_str()).unwrap_or(""),
+                "name": it.get("name").and_then(|x| x.as_str()).unwrap_or(""),
+                "tag": it.get("tag").and_then(|x| x.as_str()).unwrap_or(""),
+                "disabled": it.get("disabled").and_then(|x| x.as_bool()).unwrap_or(false),
+            })
+        })
+        .collect();
+    json!({"url": url, "title": title, "truncated": truncated, "nodes": nodes})
+}
+
+/// AX snapshot result: the human text block stays FIRST and byte-identical
+/// (cap, footer, and truncation behavior unchanged); the machine node table
+/// rides as the second block. `snapshot {"mode":"text"}` never gains one.
+fn ok_snapshot(text: String, structured: Value) -> Value {
+    json!({"content": [{"type": "text", "text": text},
+                       {"type": "text", "text": structured.to_string()}]})
+}
+
+async fn tool_snapshot(browser: &Browser, mode: Option<&str>) -> Result<Value, ToolErr> {
     if mode == Some("text") {
         return tool_snapshot_text(browser).await;
     }
@@ -431,6 +564,7 @@ async fn tool_snapshot(browser: &Browser, mode: Option<&str>) -> Result<Value, S
     let mut shown = total_lines;
     let mut out = lines.join("\n");
     let mut tail = if text.is_empty() { String::new() } else { format!("\ntext: {text}") };
+    let mut tail_cut = false;
     loop {
         let mut footer = format!("\n[snapshot: {total} nodes, refs @e1..@e{total}]");
         if shown < total_lines {
@@ -446,10 +580,15 @@ async fn tool_snapshot(browser: &Browser, mode: Option<&str>) -> Result<Value, S
         }
         let full = format!("{out}{tail}{footer}");
         if full.chars().count() <= cap {
-            return Ok(ok_text(full));
+            let truncated = shown < total_lines || tail_cut;
+            return Ok(ok_snapshot(
+                full,
+                snapshot_nodes(&url, &title, items, shown, truncated),
+            ));
         }
         // Shrink order: text tail first, then whole lines off the end.
         if !tail.is_empty() {
+            tail_cut = true;
             let excess = full.chars().count() - cap;
             let keep = tail.chars().count().saturating_sub(excess);
             tail = if keep == 0 {
@@ -464,12 +603,15 @@ async fn tool_snapshot(browser: &Browser, mode: Option<&str>) -> Result<Value, S
             // Degenerate: header alone plus footer still exceed the cap;
             // hard-cut (footer stays truthful about the node count).
             let cut: String = full.chars().take(cap).collect();
-            return Ok(ok_text(cut));
+            return Ok(ok_snapshot(
+                cut,
+                snapshot_nodes(&url, &title, items, shown, true),
+            ));
         }
     }
 }
 
-async fn tool_snapshot_text(browser: &Browser) -> Result<Value, String> {
+async fn tool_snapshot_text(browser: &Browser) -> Result<Value, ToolErr> {
     // Cap the transfer at the source: the page returns an already-sliced
     // string so huge pages never balloon memory on this side; the 8000-char
     // cap below still applies after whitespace collapsing.
@@ -491,7 +633,7 @@ async fn tool_snapshot_text(browser: &Browser) -> Result<Value, String> {
     Ok(ok_text(format!("{capped}{suffix}")))
 }
 
-async fn tool_screenshot(browser: &Browser, full_page: bool) -> Result<Value, String> {
+async fn tool_screenshot(browser: &Browser, full_page: bool) -> Result<Value, ToolErr> {
     // Capability gate: a dom-only backend has no rendering pipeline, so
     // there are no pixels to capture. Refuse with the backend and the
     // reason, never a fake or blank image. Checked before any browser
@@ -501,10 +643,13 @@ async fn tool_screenshot(browser: &Browser, full_page: bool) -> Result<Value, St
     // compositor/pixel path. Verified, not assumed.)
     match crate::browser::backend_caps() {
         Ok(crate::browser::BackendCaps::DomOnly) => {
-            return Err("screenshot: unavailable with GLADIUS_BACKEND_CAPS=dom-only backend (no rendering pipeline; refusing instead of returning a fake image)".to_string());
+            return Err(ToolErr::typed(
+                "screenshot: unavailable with GLADIUS_BACKEND_CAPS=dom-only backend (no rendering pipeline; refusing instead of returning a fake image)".to_string(),
+                json!({"code": "capability_gated", "reason": "dom_only", "tool": "screenshot"}),
+            ));
         }
         Ok(crate::browser::BackendCaps::Render) => {}
-        Err(e) => return Err(format!("screenshot: {e}")),
+        Err(e) => return Err(ToolErr::fallback(format!("screenshot: {e}"))),
     }
     let params = if full_page {
         json!({"format": "png", "captureBeyondViewport": true, "fromSurface": true})
@@ -522,7 +667,7 @@ async fn tool_screenshot(browser: &Browser, full_page: bool) -> Result<Value, St
     Ok(json!({"content": [{"type": "image", "data": data, "mimeType": "image/png"}]}))
 }
 
-async fn tool_click(browser: &Browser, element: &str) -> Result<Value, String> {
+async fn tool_click(browser: &Browser, element: &str) -> Result<Value, ToolErr> {
     // Drain any earlier dialog record so one found below belongs to THIS click.
     browser.take_dialog().await;
     if let Some(id) = parse_ref(element) {
@@ -542,8 +687,14 @@ async fn tool_click(browser: &Browser, element: &str) -> Result<Value, String> {
                 Ok(click_ok(browser).await)
             }
             Some("GLADIUS_NOTFOUND") => Err(stale_gone("click", element, &id)),
-            Some("GLADIUS_DISABLED") => Err(format!("click: {at_id} is disabled")),
-            _ => Err(format!("click: {at_id} not visible or not clickable")),
+            Some("GLADIUS_DISABLED") => Err(ToolErr::typed(
+                format!("click: {at_id} is disabled"),
+                json!({"code": "not_actionable", "reason": "disabled", "tool": "click", "ref": at_id}),
+            )),
+            _ => Err(ToolErr::typed(
+                format!("click: {at_id} not visible or not clickable"),
+                json!({"code": "not_actionable", "reason": "hidden", "tool": "click", "ref": at_id}),
+            )),
         };
     }
     let sel = serde_json::to_string(element).map_err(|e| e.to_string())?;
@@ -584,10 +735,17 @@ async fn tool_click(browser: &Browser, element: &str) -> Result<Value, String> {
             click_settle(browser, "").await;
             Ok(click_ok(browser).await)
         }
-        Some("GLADIUS_NOTFOUND") => Err(format!("click: element not found: {element}")),
-        Some("GLADIUS_DISABLED") => Err(format!("click: element is disabled: {element}")),
-        _ => Err(format!(
-            "click: element not visible or not clickable: {element}"
+        Some("GLADIUS_NOTFOUND") => Err(ToolErr::typed(
+            format!("click: element not found: {element}"),
+            json!({"code": "invalid_target", "reason": "not_found", "tool": "click", "element": element}),
+        )),
+        Some("GLADIUS_DISABLED") => Err(ToolErr::typed(
+            format!("click: element is disabled: {element}"),
+            json!({"code": "not_actionable", "reason": "disabled", "tool": "click", "element": element}),
+        )),
+        _ => Err(ToolErr::typed(
+            format!("click: element not visible or not clickable: {element}"),
+            json!({"code": "not_actionable", "reason": "hidden", "tool": "click", "element": element}),
         )),
     }
 }
@@ -665,7 +823,7 @@ async fn tool_type(
     element: &str,
     text: &str,
     submit: bool,
-) -> Result<Value, String> {
+) -> Result<Value, ToolErr> {
     if let Some(id) = parse_ref(element) {
         let at_id = guard_ref(browser, "type", element, &id).await?;
         let rid = serde_json::to_string(&id).map_err(|e| e.to_string())?;
@@ -677,8 +835,14 @@ async fn tool_type(
         match v.as_str() {
             Some("GLADIUS_OK") => {}
             Some("GLADIUS_NOTFOUND") => return Err(stale_gone("type", element, &id)),
-            Some("GLADIUS_DISABLED") => return Err(format!("type: {at_id} is disabled")),
-            Some("GLADIUS_READONLY") => return Err(format!("type: {at_id} is read-only")),
+            Some("GLADIUS_DISABLED") => return Err(ToolErr::typed(
+                format!("type: {at_id} is disabled"),
+                json!({"code": "not_actionable", "reason": "disabled", "tool": "type", "ref": at_id}),
+            )),
+            Some("GLADIUS_READONLY") => return Err(ToolErr::typed(
+                format!("type: {at_id} is read-only"),
+                json!({"code": "not_actionable", "reason": "readonly", "tool": "type", "ref": at_id}),
+            )),
             _ => return Err(stale_gone("type", element, &id)),
         }
         if submit {
@@ -695,12 +859,21 @@ async fn tool_type(
     match v.as_str() {
         Some("GLADIUS_OK") => {}
         Some("GLADIUS_DISABLED") => {
-            return Err(format!("type: element is disabled: {element}"));
+            return Err(ToolErr::typed(
+                format!("type: element is disabled: {element}"),
+                json!({"code": "not_actionable", "reason": "disabled", "tool": "type", "element": element}),
+            ));
         }
         Some("GLADIUS_READONLY") => {
-            return Err(format!("type: element is read-only: {element}"));
+            return Err(ToolErr::typed(
+                format!("type: element is read-only: {element}"),
+                json!({"code": "not_actionable", "reason": "readonly", "tool": "type", "element": element}),
+            ));
         }
-        _ => return Err(format!("type: element not found: {element}")),
+        _ => return Err(ToolErr::typed(
+            format!("type: element not found: {element}"),
+            json!({"code": "invalid_target", "reason": "not_found", "tool": "type", "element": element}),
+        )),
     }
     if submit {
         submit_enter(browser).await?;
@@ -730,7 +903,7 @@ async fn submit_enter(browser: &Browser) -> Result<(), String> {
     Ok(())
 }
 
-async fn tool_evaluate(browser: &Browser, expression: &str) -> Result<Value, String> {
+async fn tool_evaluate(browser: &Browser, expression: &str) -> Result<Value, ToolErr> {
     browser.take_dialog().await;
     let v = browser.eval(expression).await?;
     let mut obj = serde_json::Map::new();
@@ -751,7 +924,7 @@ async fn tool_console(
     browser: &Browser,
     action: &str,
     limit: Option<i64>,
-) -> Result<Value, String> {
+) -> Result<Value, ToolErr> {
     // Cap the RETURNED slice; the ring itself is CONSOLE_CAP (browser.rs).
     let lim = limit.unwrap_or(100).clamp(1, 200) as usize;
     match action {
@@ -765,7 +938,10 @@ async fn tool_console(
             let n = browser.console_clear().await;
             Ok(ok_text(json!({"cleared": n, "cap": crate::browser::CONSOLE_CAP}).to_string()))
         }
-        other => Err(format!("console: unknown action '{other}' (get|drain|clear)")),
+        other => Err(ToolErr::typed(
+            format!("console: unknown action '{other}' (get|drain|clear)"),
+            json!({"code": "invalid_args", "reason": "unknown_action", "tool": "console"}),
+        )),
     }
 }
 
@@ -773,13 +949,19 @@ async fn tool_upload(
     browser: &Browser,
     element: &str,
     paths: &[String],
-) -> Result<Value, String> {
+) -> Result<Value, ToolErr> {
     if paths.is_empty() {
-        return Err("upload: 'paths' is empty".to_string());
+        return Err(ToolErr::typed(
+            "upload: 'paths' is empty".to_string(),
+            json!({"code": "invalid_args", "reason": "missing_arg", "tool": "upload"}),
+        ));
     }
     for p in paths {
         if !std::path::Path::new(p).is_file() {
-            return Err(format!("upload: file not found: {p}"));
+            return Err(ToolErr::typed(
+                format!("upload: file not found: {p}"),
+                json!({"code": "file_not_found", "reason": "missing_path", "tool": "upload", "path": p}),
+            ));
         }
     }
     // AX refs resolve to their stamped selector so both paths share the
@@ -801,12 +983,35 @@ async fn tool_upload(
         Some("GLADIUS_OK") => {}
         Some("GLADIUS_NOTFOUND") => match rid {
             Some(id) => return Err(stale_gone("upload", element, &id)),
-            None => return Err(format!("upload: element not found: {element}")),
+            None => return Err(ToolErr::typed(
+                format!("upload: element not found: {element}"),
+                json!({"code": "invalid_target", "reason": "not_found", "tool": "upload", "element": element}),
+            )),
         },
         Some("GLADIUS_DISABLED") => {
-            return Err(format!("upload: element is disabled: {element}"));
+            return Err(match &rid {
+                Some(id) => ToolErr::typed(
+                    format!("upload: element is disabled: {element}"),
+                    json!({"code": "not_actionable", "reason": "disabled", "tool": "upload", "ref": format!("@{id}")}),
+                ),
+                None => ToolErr::typed(
+                    format!("upload: element is disabled: {element}"),
+                    json!({"code": "not_actionable", "reason": "disabled", "tool": "upload", "element": element}),
+                ),
+            });
         }
-        _ => return Err(format!("upload: element is not a file input: {element}")),
+        _ => {
+            return Err(match &rid {
+                Some(id) => ToolErr::typed(
+                    format!("upload: element is not a file input: {element}"),
+                    json!({"code": "invalid_target", "reason": "not_file", "tool": "upload", "ref": format!("@{id}")}),
+                ),
+                None => ToolErr::typed(
+                    format!("upload: element is not a file input: {element}"),
+                    json!({"code": "invalid_target", "reason": "not_file", "tool": "upload", "element": element}),
+                ),
+            });
+        }
     }
     // CDP file path: document node -> querySelector -> setFileInputFiles.
     // Works headless (no file-chooser dialog involved).
@@ -826,7 +1031,10 @@ async fn tool_upload(
     if node == 0 {
         return match rid {
             Some(id) => Err(stale_gone("upload", element, &id)),
-            None => Err(format!("upload: element not found: {element}")),
+            None => Err(ToolErr::typed(
+                format!("upload: element not found: {element}"),
+                json!({"code": "invalid_target", "reason": "not_found", "tool": "upload", "element": element}),
+            )),
         };
     }
     browser
@@ -843,7 +1051,7 @@ async fn tool_wait_for(
     ms: Option<i64>,
     network_idle: bool,
     idle_ms: Option<i64>,
-) -> Result<Value, String> {
+) -> Result<Value, ToolErr> {
     let budget_ms: i64 = ms.unwrap_or(5000).clamp(0, 15000);
     let budget = std::time::Duration::from_millis(budget_ms.max(0) as u64);
     // ms:0 is a no-op: return immediately without any CDP round-trip
@@ -868,7 +1076,7 @@ async fn tool_wait_for(
             let mut done = true;
             if let Some(ref e) = sel_expr {
                 if std::time::Instant::now() >= deadline {
-                    return Err("wait_for: timeout".to_string());
+                    return Err(wait_timeout());
                 }
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 match tokio::time::timeout(remaining, browser.eval(e)).await {
@@ -876,13 +1084,13 @@ async fn tool_wait_for(
                     _ => done = false,
                 }
                 if std::time::Instant::now() >= deadline {
-                    return Err("wait_for: timeout".to_string());
+                    return Err(wait_timeout());
                 }
             }
             if done {
                 if let Some(ref lit) = text_lit {
                     if std::time::Instant::now() >= deadline {
-                        return Err("wait_for: timeout".to_string());
+                        return Err(wait_timeout());
                     }
                     let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                     let e =
@@ -892,7 +1100,7 @@ async fn tool_wait_for(
                         _ => done = false,
                     }
                     if std::time::Instant::now() >= deadline {
-                        return Err("wait_for: timeout".to_string());
+                        return Err(wait_timeout());
                     }
                 }
             }
@@ -900,7 +1108,7 @@ async fn tool_wait_for(
                 break;
             }
             if std::time::Instant::now() >= deadline {
-                return Err("wait_for: timeout".to_string());
+                return Err(wait_timeout());
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             tokio::time::sleep(remaining.min(std::time::Duration::from_millis(100))).await;
@@ -920,13 +1128,22 @@ async fn tool_wait_for(
         browser.ensure_network().await?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if !browser.wait_network_idle(idle_win, remaining).await {
-            return Err("wait_for: timeout".to_string());
+            return Err(wait_timeout());
         }
     }
     Ok(ok_text(json!({"ok": true}).to_string()))
 }
 
-async fn tool_hover(browser: &Browser, element: &str) -> Result<Value, String> {
+/// Budget-exhaustion failure for `wait_for`: the site knows the budget ran
+/// out, so it mints the typed timeout (never a generic error).
+fn wait_timeout() -> ToolErr {
+    ToolErr::typed(
+        "wait_for: timeout".to_string(),
+        json!({"code": "timeout", "reason": "budget_exceeded", "tool": "wait_for"}),
+    )
+}
+
+async fn tool_hover(browser: &Browser, element: &str) -> Result<Value, ToolErr> {
     if let Some(id) = parse_ref(element) {
         let at_id = guard_ref(browser, "hover", element, &id).await?;
         let rid = serde_json::to_string(&id).map_err(|e| e.to_string())?;
@@ -938,7 +1155,10 @@ async fn tool_hover(browser: &Browser, element: &str) -> Result<Value, String> {
             return Err(stale_gone("hover", element, &id));
         }
         if v.as_str() == Some("GLADIUS_HIDDEN") {
-            return Err(format!("hover: {at_id} not visible or not hoverable"));
+            return Err(ToolErr::typed(
+                format!("hover: {at_id} not visible or not hoverable"),
+                json!({"code": "not_actionable", "reason": "hidden", "tool": "hover", "ref": at_id}),
+            ));
         }
         return hover_move(browser, &v).await;
     }
@@ -948,17 +1168,21 @@ async fn tool_hover(browser: &Browser, element: &str) -> Result<Value, String> {
     );
     let v = browser.eval(&expr).await?;
     if v.as_str() == Some("GLADIUS_NOTFOUND") {
-        return Err(format!("hover: element not found: {element}"));
+        return Err(ToolErr::typed(
+            format!("hover: element not found: {element}"),
+            json!({"code": "invalid_target", "reason": "not_found", "tool": "hover", "element": element}),
+        ));
     }
     if v.as_str() == Some("GLADIUS_HIDDEN") {
-        return Err(format!(
-            "hover: element not visible or not hoverable: {element}"
+        return Err(ToolErr::typed(
+            format!("hover: element not visible or not hoverable: {element}"),
+            json!({"code": "not_actionable", "reason": "hidden", "tool": "hover", "element": element}),
         ));
     }
     hover_move(browser, &v).await
 }
 
-async fn hover_move(browser: &Browser, v: &Value) -> Result<Value, String> {
+async fn hover_move(browser: &Browser, v: &Value) -> Result<Value, ToolErr> {
     let s = v.as_str().unwrap_or("").to_string();
     let pt: Value =
         serde_json::from_str(&s).map_err(|_| "hover: no layout box".to_string())?;
@@ -979,9 +1203,12 @@ async fn tool_select(
     element: &str,
     value: Option<&str>,
     text: Option<&str>,
-) -> Result<Value, String> {
+) -> Result<Value, ToolErr> {
     if value.is_none() && text.is_none() {
-        return Err("select: need 'value' or 'text'".to_string());
+        return Err(ToolErr::typed(
+            "select: need 'value' or 'text'".to_string(),
+            json!({"code": "invalid_args", "reason": "need_option", "tool": "select"}),
+        ));
     }
     if let Some(id) = parse_ref(element) {
         guard_ref(browser, "select", element, &id).await?;
@@ -1001,10 +1228,16 @@ async fn tool_select(
         return match v.as_str() {
             Some("GLADIUS_OK") => Ok(ok_text(json!({"ok": true}).to_string())),
             Some("GLADIUS_NOTFOUND") => Err(stale_gone("select", element, &id)),
-            Some("GLADIUS_NOTSELECT") => Err(format!("select: @{id} is not a <select>")),
+            Some("GLADIUS_NOTSELECT") => Err(ToolErr::typed(
+                format!("select: @{id} is not a <select>"),
+                json!({"code": "invalid_target", "reason": "not_select", "tool": "select", "ref": format!("@{id}")}),
+            )),
             _ => {
                 let want = value.or(text).unwrap_or("");
-                Err(format!("select: option not found: {want}"))
+                Err(ToolErr::typed(
+                    format!("select: option not found: {want}"),
+                    json!({"code": "option_not_found", "reason": "no_match", "tool": "select", "want": want}),
+                ))
             }
         };
     }
@@ -1024,13 +1257,22 @@ async fn tool_select(
     let v = browser.eval(&expr).await?;
     match v.as_str() {
         Some("GLADIUS_OK") => Ok(ok_text(json!({"ok": true}).to_string())),
-        Some("GLADIUS_NOTFOUND") => Err(format!("select: element not found: {element}")),
+        Some("GLADIUS_NOTFOUND") => Err(ToolErr::typed(
+            format!("select: element not found: {element}"),
+            json!({"code": "invalid_target", "reason": "not_found", "tool": "select", "element": element}),
+        )),
         Some("GLADIUS_NOTSELECT") => {
-            Err(format!("select: element is not a <select>: {element}"))
+            Err(ToolErr::typed(
+                format!("select: element is not a <select>: {element}"),
+                json!({"code": "invalid_target", "reason": "not_select", "tool": "select", "element": element}),
+            ))
         }
         _ => {
             let want = value.or(text).unwrap_or("");
-            Err(format!("select: option not found: {want}"))
+            Err(ToolErr::typed(
+                format!("select: option not found: {want}"),
+                json!({"code": "option_not_found", "reason": "no_match", "tool": "select", "want": want}),
+            ))
         }
     }
 }
@@ -1091,9 +1333,12 @@ fn key_map(key: &str) -> (String, String, u32, Option<String>) {
     }
 }
 
-async fn tool_key(browser: &Browser, key: &str) -> Result<Value, String> {
+async fn tool_key(browser: &Browser, key: &str) -> Result<Value, ToolErr> {
     if key.is_empty() {
-        return Err("key: missing required arg 'key'".to_string());
+        return Err(ToolErr::typed(
+            "key: missing required arg 'key'".to_string(),
+            json!({"code": "invalid_args", "reason": "missing_arg", "tool": "key"}),
+        ));
     }
     let (k, code, vk, text) = key_map(key);
     let mut down = serde_json::Map::new();
@@ -1133,20 +1378,44 @@ async fn tool_tabs(
     action: &str,
     url: Option<&str>,
     index: Option<i64>,
-) -> Result<Value, String> {
-    let to_usize = |i: Option<i64>| -> Result<usize, String> {
+) -> Result<Value, ToolErr> {
+    let to_usize = |i: Option<i64>| -> Result<usize, ToolErr> {
         match i {
             Some(n) if n >= 0 => Ok(n as usize),
-            Some(n) => Err(format!("tabs: bad index {n}")),
-            None => Err("tabs: missing required arg 'index'".to_string()),
+            Some(n) => Err(ToolErr::typed(
+                format!("tabs: bad index {n}"),
+                json!({"code": "invalid_args", "reason": "bad_index", "tool": "tabs"}),
+            )),
+            None => Err(ToolErr::typed(
+                "tabs: missing required arg 'index'".to_string(),
+                json!({"code": "invalid_args", "reason": "missing_arg", "tool": "tabs"}),
+            )),
         }
     };
     let inner = match action {
-        "list" => browser.tabs_list().await?,
-        "new" => browser.tabs_new(url).await?,
-        "select" => browser.tabs_select(to_usize(index)?).await?,
-        "close" => browser.tabs_close(to_usize(index)?).await?,
-        other => return Err(format!("tabs: unknown action '{other}'")),
+        "list" => browser.tabs_list().await.map_err(tabs_err)?,
+        "new" => browser.tabs_new(url).await.map_err(tabs_err)?,
+        "select" => browser.tabs_select(to_usize(index)?).await.map_err(tabs_err)?,
+        "close" => browser.tabs_close(to_usize(index)?).await.map_err(tabs_err)?,
+        other => return Err(ToolErr::typed(
+            format!("tabs: unknown action '{other}'"),
+            json!({"code": "invalid_args", "reason": "unknown_action", "tool": "tabs"}),
+        )),
     };
     Ok(ok_text(inner.to_string()))
+}
+
+/// Engine-originated `tabs: no tab at index N` (raised in browser.rs, where
+/// the tab index space lives and this file must not reach): the suffix is a
+/// plain integer, never caller prose, so re-attaching the site-known type
+/// here is exact. Anything else keeps the generic fallback.
+fn tabs_err(e: String) -> ToolErr {
+    if e.starts_with("tabs: no tab at index ") {
+        ToolErr::typed(
+            e,
+            json!({"code": "invalid_target", "reason": "not_found", "tool": "tabs"}),
+        )
+    } else {
+        ToolErr::fallback(e)
+    }
 }

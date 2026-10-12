@@ -69,9 +69,28 @@ async fn handle(req: &Value, browser: &Arc<Browser>) -> Option<Value> {
             if let Some(url) = info.get("cdpUrl") {
                 server_info.insert("cdpUrl".to_string(), url.clone());
             }
+            // Caps-aware capability manifest (G3): the tool count is derived
+            // from the real tool list (never hardcoded), and `gated` names
+            // the render-dependent tools refused on the CURRENT backend -
+            // empty on a `render` backend. Any non-`render` caps value
+            // (`dom-only`, and an invalid/unusable value alike) gates
+            // `screenshot`: with unusable caps there is no rendering
+            // pipeline to capture from, so declaring none gated would lie
+            // while `screenshot` refuses immediately. `serverInfo` is
+            // untouched.
+            let tool_count = crate::tools::list()
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .map(|a| a.len())
+                .unwrap_or(15);
+            let mut gated = serde_json::Map::new();
+            if info.get("caps").and_then(|c| c.as_str()) != Some("render") {
+                gated.insert("screenshot".to_string(), json!("requires caps: render"));
+            }
+            let capabilities = json!({"tools": {"count": tool_count, "gated": gated}});
             Some(json!({"jsonrpc": "2.0", "id": id, "result": {
                 "protocolVersion": ver,
-                "capabilities": {"tools": {}},
+                "capabilities": capabilities,
                 "serverInfo": server_info
             }}))
         }
