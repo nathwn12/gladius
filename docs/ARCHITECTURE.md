@@ -31,11 +31,9 @@ Rules: tools are **dumb primitives** - no planner, no LLM, no judgement-retries 
   `obscura serve --host 127.0.0.1 --port <free> --allow-private-network
   --allow-file-access`, readiness via `GET /json/version`. Full capability
   record: `docs/OBSCURA-COMPAT.md`. |
-| **Tier 1 (future)** | Lightpanda no-render | when Windows-viable | `lightpanda serve --protocol cdp` behind the *same* 9 tools
-  (https://github.com/lightpanda-io/browser). Renderless DOM/fetch at a fraction of the RAM.
-  Blocked today: no native Windows binary. |
-| **Tier 2 (opt-in)** | Full Chrome headed/headless | pixel-perfect only | Flag-gated (`--full-chrome`) for screenshots/canvas/WebGL
-  where Tier 0 fidelity is insufficient. Never the default. |
+| **Tier 1 (rejected)** | Lightpanda no-render | — | Rejected: no Windows target; AGPL-3.0 §13-only; text-only raster. |
+
+No full-Chrome tier: there is no `--full-chrome` flag and none is planned — a fallback can never be a relic or someone else's.
 
 Selection: `GLADIUS_CDP_URL` to **attach** to an existing endpoint instead of
 launching (RESEARCH rule 5) — BUILT 2026-10-11: `ws://`/`wss://` connects
@@ -92,7 +90,7 @@ running by design - no `kill_tree`, no pid kill, nothing deleted.
 | First-action latency (incl. spawn+CDP) | **< 2 s** on dev Windows | owned-engine spawn + CDP handshake dominates; asserted, not hoped |
 | Steady-state action p50 | **< 200 ms** (plus site/network) | CDP round-trip over `tokio-tungstenite`; `fastwebsockets` on standby if profiles implicate framing |
 | Server RSS (own process) | **< 10 MB** | no GC runtime, no Node/Python next to the browser child |
-| Browser child peak RSS | **< 250 MB** single page | owned engine, single page; full-Chrome tier exempt |
+| Browser child peak RSS | **< 250 MB** single page | owned engine, single page |
 
 **Measurement (Windows-local, CI-runnable):**
 - Cold start: `Measure-Command { Start-Process gladius.exe ... }` to first `initialize` response;
