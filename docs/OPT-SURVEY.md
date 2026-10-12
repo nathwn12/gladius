@@ -1,5 +1,11 @@
 # OPT-SURVEY - gladius optimization + feature survey
 
+> Archive note (2026-10-12): this recon measured the pre-self-containment
+> build, so it names the removed chrome launch path. Gladius is
+> self-contained since `96e73e3`: the owned `bin\obscura.exe` is the only
+> launchable engine, plus explicit attach via `GLADIUS_CDP_URL`. Timings and
+> hot-path structure below are historical evidence, not current instructions.
+
 > Recon artifact for session `ses_ed8bd551cffeHmdMpTecyGZT4W` (fleet ses_ed8bd551cffeHmdMpTecyGZT4W), 2026-10-11,
 > local Windows, headless only, no source edits (one new doc: this file).
 > Scratch evidence (driver, fixtures, logs, raw JSON): `%TEMP%\opencode\ses_ed8bd551cffeHmdMpTecyGZT4W\`

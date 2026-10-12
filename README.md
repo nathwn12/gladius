@@ -53,24 +53,71 @@ engine readiness) kills the process tree, so no survivors.
 
 ## Install
 
-1. Download the prebuilt Windows binary (`gladius.exe`) from the
-   [GitHub Releases](https://github.com/nathwn12/gladius/releases) page.
-2. Point your MCP client at it:
+**Supported platforms: Windows x64 only.** The owned Obscura engine ships as
+Windows binaries, so gladius runs on Windows today and nowhere else. Be
+honest about the requirement: you need `gladius.exe` **plus** the engine
+binaries (`obscura.exe`, `obscura-worker.exe`) beside it — a release zip
+already contains all three; a source build needs one provisioning step.
+
+**Requirements:** Windows x64. No Node.js, no Python, no Playwright at
+runtime — one static binary plus the two engine files. (Building from source
+needs a Rust toolchain; running does not.)
+
+1. **Release install (recommended):** download the
+   `gladius-<version>-windows-x86_64.zip` from the
+   [GitHub Releases](https://github.com/nathwn12/gladius/releases) page and
+   extract it anywhere. The zip contains `gladius.exe`, `obscura.exe`,
+   `obscura-worker.exe`, `LICENSE`, `THIRD-PARTY-NOTICES.md`, and `README.md`
+   — keep the three `.exe` files together in one directory. Verify with the
+   attached `.sha256` file:
+   ```powershell
+   (Get-FileHash -Algorithm SHA256 gladius-<version>-windows-x86_64.zip).Hash.ToLowerInvariant() -eq (Get-Content gladius-<version>-windows-x86_64.zip.sha256).Split()[0]
+   ```
+2. **Source install:** build (see
+   [Build from source](#build-from-source)), then provision the pinned engine
+   on the fresh machine — this downloads Obscura `v0.2.4` and verifies it by
+   sha256 before placing anything in `bin\`:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts/fetch-engine.ps1
+   ```
+   Copy `target\release\gladius.exe`, `bin\obscura.exe`, and
+   `bin\obscura-worker.exe` into one directory (or set `GLADIUS_OBSCURA` to
+   the engine path). A missing engine is a clear error naming that script —
+   gladius never downloads anything by itself and never falls back to another
+   browser.
+3. Point your MCP client at it.
+
+**OpenCode V2** (`opencode.json` — `mcp.servers.<name>`, `type: "local"`,
+`command` array):
 
 ```jsonc
 {
   "mcp": {
-    "gladius": {
-      "type": "local",
-      "command": ["<path-to>\\gladius.exe", "mcp"]
+    "servers": {
+      "gladius": {
+        "type": "local",
+        "command": ["C:\\tools\\gladius\\gladius.exe", "mcp"]
+      }
     }
   }
 }
 ```
 
-3. The alternative is building from source (see
-   [Build from source](#build-from-source)) and pointing the `command` at your
-   local `target\release\gladius.exe`.
+**Claude Desktop** (`claude_desktop_config.json` — `mcpServers`):
+
+```jsonc
+{
+  "mcpServers": {
+    "gladius": {
+      "command": "C:\\tools\\gladius\\gladius.exe",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+The bundled engine is third-party (Apache-2.0, upstream
+`h4ckf0r0day/obscura`) — see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## Usage
 
@@ -149,7 +196,8 @@ target\release\gladius.exe selftest
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). The shipped engine binaries are third-party —
+see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 <!-- nathwn12 house footer: identical in every repo. Do not edit. -->
 <p align="center">

@@ -1,9 +1,10 @@
 # Obscura capability record
 
-Owned Obscura engine as the gladius default. Shipped at HEAD `f9f3d6b`
-(on `43e35d2`): Obscura is the default launch, `chrome-headless-shell` is an
-explicit `GLADIUS_BACKEND=chrome` opt-in, and `GLADIUS_CDP_URL` still attaches
-to an external engine gladius never kills. `bin\obscura.exe` plus
+Owned Obscura engine as the gladius default and only launch. Shipped at HEAD
+`f9f3d6b` (on `43e35d2`) as the default alongside a chrome opt-in; that
+opt-in was removed on 2026-10-12 (self-containment: gladius launches nothing
+it does not own). What remains: the owned launch below, plus `GLADIUS_CDP_URL`
+attaching to an external engine gladius never kills. `bin\obscura.exe` plus
 `bin\obscura-worker.exe` are provisioned by `scripts/fetch-engine.ps1`
 (pinned v0.2.4, sha256-verified) and ship beside `gladius.exe`.
 
@@ -25,7 +26,7 @@ plus control arm `baseline-result.json` / `baseline-summary.json`.
 
 ## 1. Backend selection
 
-Strict three-way order:
+Strict two-way order:
 
 1. `GLADIUS_CDP_URL` set (non-blank) -> attach to the external engine instead
    of launching. A `ws://` (`wss://`) value connects directly; an `http://`
@@ -35,15 +36,10 @@ Strict three-way order:
    opened (`Target.detachFromTarget`) and never calls `kill_tree`, never kills
    a pid, never sweeps a profile. The external process stays alive; gladius
    launches nothing.
-2. `GLADIUS_BACKEND=chrome` (case-insensitive, surrounding whitespace ignored)
-   -> explicit opt-in to the `chrome-headless-shell` launch: `GLADIUS_CHROME`
-   wins when set, else the newest `chrome-headless-shell.exe` under
-   `%LOCALAPPDATA%\ms-playwright`; a missing shell is a clear error. No
-   system-Chrome fallback (the headless-shell-only rule is unchanged).
-3. Anything else (`GLADIUS_BACKEND` unset, blank, or any other value) -> the
-   owned Obscura engine, the default. Resolution: `GLADIUS_OBSCURA` wins when
-   set and non-blank, otherwise `obscura.exe` as a sibling of the running
-   `gladius.exe` (engine ships beside the binary).
+2. Anything else -> the owned Obscura engine, the only launchable engine.
+   Resolution: `GLADIUS_OBSCURA` wins when set and non-blank, otherwise
+   `obscura.exe` as a sibling of the running `gladius.exe` (engine ships
+   beside the binary).
 
 A missing Obscura engine is a clear error naming the provision script, never a
 silent fallback to Chrome:
@@ -90,8 +86,8 @@ DOM.setFileInputFiles is disabled. Restart with `obscura serve --allow-file-acce
 These gates apply at the NAVIGATION layer: the blocked request never leaves
 the engine (no marker-server hit, no `responseReceived`, an all-white
 1-color screenshot). Passing the flags re-opens the engine's SSRF protection
-and allows local-file reads. That is a deliberate trade for parity with
-`chrome-headless-shell` on a loopback-bound (`127.0.0.1`) CDP server, not an
+and allows local-file reads. That is a deliberate trade for parity with a
+loopback-bound (`127.0.0.1`) CDP engine, not an
 accidental hole: without the flags, local test fixtures over loopback and
 `file://` simply cannot load.
 
@@ -159,15 +155,17 @@ empty title).
 No retry magic exists in gladius: it reports the `warning` and stops there. Do
 not claim any automatic recovery.
 
-## 6. Head-to-head numbers vs the chrome-headless-shell control arm
+## 6. Head-to-head numbers vs the historical control arm
 
 Control arm: `baseline-result.json` / `baseline-summary.json` (spawn-to-ready
-via the stderr ready line, spawn-to-response navigate wall). Obscura arm:
+via the stderr ready line, spawn-to-response navigate wall; that engine path
+has been removed - numbers kept for provenance, never as a live option).
+Obscura arm:
 `obscura-result.json` (ready-file publish timing, warm-session round trips),
 `supp-result.json` (corrected console drain), `launch-flag-matrix.json`.
 Definitional mismatches are named per row, never suppressed.
 
-| metric | control (chrome-headless-shell) | Obscura | reading |
+| metric | control (historical arm, path removed) | Obscura | reading |
 |---|---|---|---|
 | process tree (WorkingSet sum) | 7 procs / 189,063,168 B | 2 procs (`obscura.exe` + its windowless `conhost.exe`) / 44,920,832 B | like-for-like, ~4.2x smaller |
 | profile+storage churn | 1,755,014 B across 47 files | 0 B / 0 files (explicit `--storage-dir` run wrote nothing; default runs show no profile bytes anywhere) | like-for-like |

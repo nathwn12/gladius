@@ -1,5 +1,11 @@
 # Gladius RESEARCH - browser-automation MCP landscape, by technology
 
+> Archive note (2026-10-12): landscape survey of third-party products
+> (their names are their own). Its gladius-side lessons predating
+> self-containment (`96e73e3`: owned `bin\obscura.exe` is the only
+> launchable engine, plus explicit attach via `GLADIUS_CDP_URL`) are
+> historical - follow `docs/ARCHITECTURE.md` for the live backend picture.
+
 > Policy: ranked by technical sophistication, not star counts. Stars are hype; architecture is king.
 > Method (2026-10-09): web-search was unavailable, so every repo URL below was verified live
 > with an HTTP HEAD check (200 OK), and the two most load-bearing READMEs
@@ -131,13 +137,18 @@
 - **What it technically does:** `chrome-headless-shell` is Google's official **no-UI Chromium
   build** (the old `--headless` split out as its own binary), distributed via the Chrome-for-Testing
   versioned endpoints. Background: https://developer.chrome.com/blog/chrome-headless-shell.
-  On this machine it ships via Playwright's cache
-  (`%LOCALAPPDATA%\ms-playwright\chromium_headless_shell-*\chrome-headless-shell-win64\chrome-headless-shell.exe`),
-  with full Chrome as fallback.
+  Measured 2026-10-09 on this machine, it resolved via Playwright's cache
+  (`%LOCALAPPDATA%\ms-playwright\chromium_headless_shell-*\chrome-headless-shell-win64\chrome-headless-shell.exe`).
+  Historical record only: gladius no longer launches this path (self-contained
+  on the owned engine since `96e73e3`).
 - **Cost profile:** full Blink/V8/JS fidelity at a fraction of headed Chrome's RAM (no compositor,
   no GPU process tree by default); still a ~100-200 MB child process - the thing gladius budgets.
-- **Transferable lesson:** default backend = `chrome-headless-shell` (fidelity without the headed
-  tax); full Chrome only opt-in for pixel-perfect screenshots.
+- **Transferable lesson:** historical (pre-self-containment `96e73e3`): the
+  default backend was `chrome-headless-shell` (fidelity without the headed
+  tax), full Chrome only opt-in for pixel-perfect screenshots. Since
+  self-containment the owned `bin\obscura.exe` is the only launchable engine
+  (plus explicit attach via `GLADIUS_CDP_URL`) - follow
+  `docs/ARCHITECTURE.md` for the live backend picture.
 
 ---
 
@@ -150,7 +161,8 @@
 3. **Lazy browser start:** first tool call launches the backend; process construction costs zero
    at MCP-server startup (from `@playwright/mcp`'s idle-timeout idea, made stricter).
 4. **Kill-tree on close:** `close` (and stdio EOF) reaps the whole browser process tree - no
-   orphaned `chrome-headless-shell` (the Playwright lingering-profile failure mode).
+   orphaned engine child processes (pre-self-containment the reaped name was
+   `chrome-headless-shell` - the Playwright lingering-profile failure mode).
 5. **Attach, don't always launch:** honour a `CDP_URL` env to attach to an existing endpoint
    (from extension-relay + `--cdp-endpoint`).
 6. **One session per agent:** independent browsing contexts per client connection (from
@@ -161,8 +173,9 @@
    no Playwright download step (the Lightpanda lesson applied to the server itself).
 9. **Budget in CI, on Windows:** cold-start latency + peak child RSS asserted by the gauntlet on
    every change (numbers in ARCHITECTURE.md).
-10. **Backend swap behind a frozen contract:** `chrome-headless-shell` today, Lightpanda
-    no-render tier tomorrow, full Chrome opt-in - the 9-tool surface never moves.
+10. **Backend swap behind a frozen contract:** owned Obscura engine today
+    (self-contained since `96e73e3` - the `chrome-headless-shell`/full-Chrome
+    paths are removed, not opt-ins), Lightpanda no-render tier tomorrow.
 
 ## Why Rust
 
