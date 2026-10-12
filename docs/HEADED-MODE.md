@@ -6,6 +6,10 @@ Owner requirement, stated 2026-10-10:
 > the one visible to the user push comes to shove.)"
 
 Status: **designed, not built.** Owner-facing contract is unchanged until it lands.
+Update 2026-10-12: gladius is self-contained (the chrome opt-in path is
+removed). Gladius itself never launches a headed-capable binary; the
+visible-when-needed fallback is an explicit external attach
+(`GLADIUS_CDP_URL`) to an engine the user started themselves.
 
 ## The rule
 
@@ -13,76 +17,60 @@ Status: **designed, not built.** Owner-facing contract is unchanged until it lan
   window appear. Zero behaviour change for existing users.
 - **Visible is an explicit opt-in** - armed for the whole process, never per call. An agent cannot
   pop a window mid-task by choosing different arguments.
-- **gladius never uses a browser profile it does not own.** The owner's default profile
-  (`Brave-Browser-Nightly\User Data`, Chrome's `User Data`) is never passed as `--user-data-dir`.
+- **Gladius never launches, selects, or profiles anyone else's browser.**
+  No auto-selected system browser, no owner-profile path, ever. A visible
+  engine is always one the user started and handed over by URL.
 
 ## Interface
 
 | Kind | Name | Meaning |
 |---|---|---|
-| env | `GLADIUS_HEADED=1` | run the backend as a visible window |
-| cli | `gladius mcp --headed` | same, for a client config entry |
-| env | `GLADIUS_CHROME=<path>` | explicit engine override (applies inside the `GLADIUS_BACKEND=chrome` opt-in path and headed mode) |
-| env | `GLADIUS_OBSCURA=<path>` | explicit engine override for the default (Obscura) path |
-| env | `GLADIUS_PROFILE_DIR=<path>` | override the headed profile location |
+| env | `GLADIUS_HEADED=1` | reserved: run as a visible window (not built) |
+| cli | `gladius mcp --headed` | reserved: same, for a client config entry (not built) |
+| env | `GLADIUS_OBSCURA=<path>` | explicit engine override for the owned headless launch |
+| env | `GLADIUS_CDP_URL=<url>` | BUILT: attach to an externally started engine instead of launching - this is the visible path today (start a headed engine with a debug port, hand gladius the URL) |
 
-Precedence: `GLADIUS_OBSCURA` (default path) / `GLADIUS_CHROME` (chrome opt-in
-path) > mode default. Helm only - no MCP tool argument exposes it.
+Helm only - no MCP tool argument exposes any of it.
 
 ## Engine resolution
 
-`chrome-headless-shell` **cannot display a window** (it is headless-only), and the full Playwright
-chromium build was deliberately reclaimed, so headed mode needs a real browser binary.
-
-- **Headless (default is now Obscura):** `GLADIUS_OBSCURA` -> `obscura.exe`
-  beside `gladius.exe` -> error naming `scripts/fetch-engine.ps1`. The
-  chrome opt-in inside headless mode: `GLADIUS_BACKEND=chrome`, then
-  `GLADIUS_CHROME` -> newest `chrome-headless-shell-*` under
-  `%LOCALAPPDATA%\ms-playwright` -> error. The chrome path is always
-  launched with `--headless`.
-- **Headed:** `GLADIUS_CHROME` -> `C:\Program Files\Google\Chrome\Application\chrome.exe` ->
-  `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe` -> error naming what was searched.
-- Measured on this machine: Chrome **155.0.8059.39** present, Edge **154.0.4258.62** present.
-- **Brave is never auto-selected.** It is the owner's own browser; picking it up by accident is the
-  exact failure this design exists to prevent.
+- **Headless (the only launch gladius performs):** `GLADIUS_OBSCURA` ->
+  `obscura.exe` beside `gladius.exe` -> error naming
+  `scripts/fetch-engine.ps1`. The owned engine is always launched windowless
+  (`CREATE_NO_WINDOW`).
+- **Visible (no gladius launch at all):** `GLADIUS_CDP_URL` attaches to an
+  engine the user already started (headed or not). Gladius launches nothing,
+  kills nothing, sweeps nothing: `close` only detaches the CDP session it
+  opened. Driving an already-running visible browser still needs it to have
+  been started with a debug port, which cannot be retrofitted.
+- Gladius auto-selects no browser, headed or otherwise. There is no
+  resolution chain ending in a system install.
 
 ## Profile
 
-- **Headless:** throwaway `tempfile::TempDir` (unchanged) - destroyed with the process.
-- **Headed:** persistent, gladius-owned: `%LOCALAPPDATA%\gladius\profile-headed`.
-  Rationale: if a human has to sign in or clear a captcha once inside the visible window, that
-  session must survive the next run; a throwaway profile would make headed mode useless.
-- Startup writes the resolved engine path and profile dir to stderr in both modes.
-
-## Launch args (headed)
-
-Drop `--headless`, keep the memory and hygiene flags, add a real window:
-
-```
---disable-gpu --no-first-run --no-default-browser-check --remote-debugging-port=0
---process-per-site --renderer-process-limit=1 --disable-background-networking --disable-sync
---disable-default-apps --mute-audio --window-size=1280,900
---user-data-dir=%LOCALAPPDATA%\gladius\profile-headed
-```
+- **Headless:** the owned engine creates no profile.
+- **Visible (attach):** gladius launches nothing, so there is no profile to
+  own. Sign-in/captcha state lives in the user's own engine, outside gladius.
+- Startup writes the resolved engine path to stderr in both modes.
 
 ## Non-goals
 
-- **Attach mode is BUILT (2026-10-11):** `GLADIUS_CDP_URL` attaches to an
-  externally started engine instead of launching (ws:// connects directly,
-  http:// resolves via `/json/version`). Ownership rule: the attached engine
-  is NOT ours — `close` detaches the session gladius opened and never kills,
-  never sweeps. Driving the owner's already-running browser still needs it to
-  have been started with a debug port, which cannot be retrofitted.
 - No per-call "show me this one page" argument.
-- No change to the 13 tool schemas.
+- No change to the tool schemas.
+- No gladius-launched headed window: a headed launch would need a
+  headed-capable binary gladius does not ship, and reaching for someone
+  else's browser violates self-containment. If the owned engine ever gains a
+  headed mode, this record gets a launch-args section; until then, attach is
+  the whole visible story.
 
 ## Validation gate
 
 1. **No regression in default mode:** `cargo test --release`, `gladius selftest` ALL PASS, and the
-   full `real-world\driver.py` suite re-run **headless** - identical pass set, 0 hangs.
+    visible fallback re-verified via attach (below) - identical pass set, 0 hangs.
 2. **Headless really stays headless:** with no `GLADIUS_HEADED`, assert no visible window exists
-   after navigate (Windows: the backend process owns no visible top-level window).
-3. **Headed smoke:** `GLADIUS_HEADED=1` -> a visible window appears; `navigate`/`snapshot`/
-   `screenshot` work; a value written into a form persists across a restart of the same profile.
-4. **Isolation:** in headed mode the process command line contains gladius's own
-   `--user-data-dir`, and no launch ever names the owner's default profile path.
+   after navigate (Windows: the owned-engine process owns no visible top-level window).
+3. **Visible smoke via attach:** start a headed engine with a debug port by hand,
+   `GLADIUS_CDP_URL=<url>` -> `navigate`/`snapshot`/`screenshot` work against the visible page;
+   `close` detaches and the external engine keeps running.
+4. **Isolation:** gladius never names the owner's default profile path, and no launch ever
+   resolves to a binary gladius does not own.
