@@ -1,0 +1,38 @@
+# nathwn12 house release — stack: rust (copy to .github/workflows/release.yml)
+name: release
+on:
+  push:
+    tags:
+      - "v*"
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    # The suite drives the owned Obscura engine only: provision the pinned
+    # engine with the repo's own script (sha-verified) and run against it.
+    # A release must never point at a runner-provided browser.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: powershell -ExecutionPolicy Bypass -File scripts/fetch-engine.ps1
+      - run: cargo build --release --locked
+      - run: cargo test --release --locked
+      - name: assemble release zip + sha256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $stage = "dist\gladius-$tag-windows-x86_64"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item target\release\gladius.exe, bin\obscura.exe, bin\obscura-worker.exe, LICENSE, THIRD-PARTY-NOTICES.md, README.md -Destination $stage
+          $zip = "$stage.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+          "$hash  $(Split-Path $zip -Leaf)" | Out-File "$zip.sha256" -Encoding ascii
+          Write-Host "sha256: $hash"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.zip.sha256
