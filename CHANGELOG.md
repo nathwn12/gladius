@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+- Machine-readable error contract: every tool error now carries a stable
+  `structuredContent` object alongside the existing prose, which is
+  byte-for-byte unchanged in `content[0].text`. Each error site mints its
+  own `code`/`reason` plus the real offending value (`ref` for an AX ref,
+  `element` for a selector, `path` for a local file, `want` for a wanted
+  option, `name` for an unknown tool) — the code is never derived by
+  re-reading the prose, so caller-controlled payload (a selector, path, or
+  option name containing e.g. `readonly` or `@e42`) cannot misclassify it.
+  Closed code set: `stale_ref` (`unknown`/`navigated`/`node_gone`),
+  `not_actionable` (`hidden`/`disabled`/`readonly`), `invalid_target`
+  (`not_select`/`not_found`/`not_file`), `option_not_found` (`no_match`),
+  `capability_gated` (`dom_only`, e.g. the `dom-only` `screenshot` refusal),
+  `timeout` (`budget_exceeded`), `invalid_args`
+  (`missing_arg`/`bad_index`/`unknown_action`/`unknown_tool`/`need_option`),
+  `file_not_found` (`missing_path`), and an `error` fallback that carries a
+  `code` only (CDP/js-engine failures and anything the site cannot type —
+  no reason is invented for those). No tool name, argument, or message
+  changed.
+- Structured snapshot refs: the AX `snapshot` return gains a second content
+  block `{"url","title","truncated","nodes":[{ref,role,name,tag,disabled}]}`,
+  built from the node table the snapshot already computed (zero new page
+  evaluation; on a truncated page `nodes` holds exactly the shown refs and
+  `truncated` is true). The human text block stays `content[0]` and is
+  byte-identical (8000-char cap and truncation footer unchanged);
+  `snapshot {"mode":"text"}` keeps its single block.
+- Caps-aware capability manifest: `initialize` `capabilities` now reports
+  `{"tools":{"count":15,"gated":{...}}}` derived from the real tool list and
+  `backend_info()` — on `GLADIUS_BACKEND_CAPS=dom-only` it names
+  `screenshot: requires caps: render`, and an invalid/unusable caps value
+  gates `screenshot` the same way (no rendering pipeline to capture from);
+  on a `render` backend `gated` is empty. `serverInfo` is unchanged.
 - REMOVED the `chrome-headless-shell` fallback/opt-in entirely: `find_chrome`,
   `GLADIUS_BACKEND`, `GLADIUS_CHROME`, the `%LOCALAPPDATA%\ms-playwright`
   resolution, and the chrome launch/profile/sweep machinery are gone.
