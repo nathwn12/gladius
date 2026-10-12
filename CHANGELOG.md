@@ -6,8 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-- Obscura is now the DEFAULT engine: unless `GLADIUS_CDP_URL` attaches or
-  `GLADIUS_BACKEND=chrome` opts in, gladius launches the owned Obscura engine
+- REMOVED the `chrome-headless-shell` fallback/opt-in entirely: `find_chrome`,
+  `GLADIUS_BACKEND`, `GLADIUS_CHROME`, the `%LOCALAPPDATA%\ms-playwright`
+  resolution, and the chrome launch/profile/sweep machinery are gone.
+  Gladius is self-contained: the owned Obscura engine in `bin\` is the only
+  launchable engine, plus an explicit external attach via `GLADIUS_CDP_URL`.
+  Enforced by the `self_containment_no_foreign_engine_in_src` guard test,
+  which fails the build if any chrome/ms-playwright/playwright reference
+  reappears in `src/`.
+- Obscura is the ONLY engine: unless `GLADIUS_CDP_URL` attaches, gladius
   (`obscura.exe serve --host 127.0.0.1 --port <free> --allow-private-network
   --allow-file-access` beside `gladius.exe`, `CREATE_NO_WINDOW`, readiness by
   polling `GET /json/version`). Provisioned by `scripts/fetch-engine.ps1`
@@ -15,11 +22,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `bin\obscura-worker.exe`); a missing engine is a clear error naming that
   script, never a silent fallback. `GLADIUS_OBSCURA` overrides the engine
   path. `initialize` reports `serverInfo.backend` `obscura` on this path.
-- Chrome-headless-shell is now an explicit opt-in (`GLADIUS_BACKEND=chrome`,
-  case-insensitive): `GLADIUS_CHROME` wins inside that path, else the newest
-  shell under `%LOCALAPPDATA%\ms-playwright`; the no-system-Chrome-fallback
-  rule is unchanged. Full capability record (gate flags, per-tool matrix,
-  quirks, numbers): `docs/OBSCURA-COMPAT.md`.
 - Capability exceptions on the Obscura path: JS dialogs are inert
   (`Page.javascriptDialogOpening` never fires, `Page.handleJavaScriptDialog`
   is unknown, `alert`/`confirm`/`prompt` silent no-ops); the `console` tool's
@@ -47,11 +49,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Console-flash hardening: the `taskkill` reaper now spawns with
   `CREATE_NO_WINDOW`, so closing never flashes a console window even for
   launchers that give gladius no console of its own.
-- Headless-shell-only backend: engine resolution is `GLADIUS_CHROME`, then
-  the newest `chrome-headless-shell.exe` under `%LOCALAPPDATA%\ms-playwright`;
-  the system-Chrome fallback is gone, a missing shell is a clear error.
-- New `no_console_flash` guard test: every process-spawn site must carry the
-  windowless flag, and no system-browser fallback may regress into `src/`.
+- Self-contained engine resolution: the owned Obscura engine only
+  (`GLADIUS_OBSCURA` override, else `bin\obscura.exe` beside `gladius.exe`);
+  a missing engine is a clear error naming `scripts/fetch-engine.ps1`.
+- New `self_containment_no_foreign_engine_in_src` guard test: fails the build
+  if any chrome/ms-playwright/playwright reference reappears in `src/`,
+  alongside the `no_console_flash` windowless-spawn guard.
 
 ## [0.1.0] - 2026-10-11
 

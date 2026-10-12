@@ -1,9 +1,6 @@
 //! Review-findings proof tests: each drives the release binary in `mcp`
 //! mode over real stdio and proves one hardened behavior.
 //!
-//! - `startup_timeout_kills_stub_tree` (P1): forces the startup-timeout path
-//!   via the `GLADIUS_TEST_STUB_SLEEP_SECS` / `GLADIUS_STARTUP_TIMEOUT_SECS`
-//!   hooks and asserts no stub process survives.
 //! - `notifications_get_no_reply` (P2): id-less requests get NO response.
 //! - `evaluate_distinguishes_null_from_undefined` (P2): `null` yields
 //!   `{"value":null}`; `undefined` is an explicit `no value` tool error.
@@ -11,6 +8,9 @@
 //!   <=8000 chars.
 //! - `wait_for_hard_deadline` (P2): `ms:0` is an immediate no-op success;
 //!   missing selectors fail at the budget; over-max budgets clamp to 15s.
+//!
+//! Every test drives the owned Obscura engine (`bin\obscura.exe`): there is
+//! no other launchable engine.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -71,7 +71,6 @@ impl Client {
     fn spawn() -> Self {
         // Default-engine location pin (see e2e_mcp.rs): cargo tree has no
         // obscura sibling, so point at the repo-pinned bin/obscura.exe.
-        // (The stub-timeout test below overrides with GLADIUS_BACKEND=chrome.)
         Self::spawn_with_env(&[(
             "GLADIUS_OBSCURA",
             &format!("{}/bin/obscura.exe", env!("CARGO_MANIFEST_DIR")),
@@ -147,98 +146,6 @@ fn shutdown(c: Client) {
         child.kill().ok();
         panic!("server did not exit after stdin EOF");
     }
-}
-
-/// PIDs of live stub-sleeper processes (command line carries the
-/// `GLADIUS_STARTUP_STUB` marker). Excludes our own query process, whose
-/// command line also contains the marker string.
-fn stub_pids() -> Vec<u32> {
-    let mut q = Command::new("powershell");
-    q.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe' OR Name='pwsh.exe'\" | Where-Object { $_.CommandLine -like '*GLADIUS_STARTUP_STUB*' } | ForEach-Object { $_.ProcessId }",
-    ])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        q.creation_flags(0x08000000);
-    }
-    let me = q.spawn().expect("spawn stub query");
-    let me_pid = me.id();
-    let out = me.wait_with_output().expect("stub query output");
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.split_whitespace()
-        .filter_map(|t| t.parse::<u32>().ok())
-        .filter(|p| *p != me_pid)
-        .collect()
-}
-
-#[test]
-fn startup_timeout_kills_stub_tree() {
-    // Force the startup-timeout path: silent stub + 2s deadline. Chrome
-    // opt-in: the GLADIUS_TEST_STUB_SLEEP_SECS hook lives in the
-    // chrome-headless-shell launch path.
-    let mut c = Client::spawn_with_env(&[
-        ("GLADIUS_BACKEND", "chrome"),
-        ("GLADIUS_TEST_STUB_SLEEP_SECS", "90"),
-        ("GLADIUS_STARTUP_TIMEOUT_SECS", "2"),
-    ]);
-    let init = c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
-    assert_eq!(
-        init.get("serverInfo").and_then(|s| s.get("name")),
-        Some(&json!("gladius")),
-        "serverInfo"
-    );
-
-    // Any browser tool triggers launch; it must fail with the timeout error
-    // (proves we exercised the timeout path, not some other failure).
-    let t0 = Instant::now();
-    let snap = c.call("snapshot", json!({}));
-    let dt = t0.elapsed();
-    assert!(
-        snap.get("isError").is_some(),
-        "stub launch must fail as a tool error: {snap}"
-    );
-    let msg = content_text(&snap);
-    assert!(
-        msg.contains("timeout"),
-        "timeout-path error message, got: {msg}"
-    );
-    assert!(
-        dt < Duration::from_secs(30),
-        "injected deadline respected, took {dt:?}"
-    );
-
-    // No stub process may survive: poll for the tree kill to land.
-    let mut survivors = stub_pids();
-    for _ in 0..30 {
-        if survivors.is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-        survivors = stub_pids();
-    }
-    assert!(
-        survivors.is_empty(),
-        "ORPHAN: stub processes survived startup timeout: {survivors:?}"
-    );
-
-    // Server itself is still alive and serving.
-    let pong = c.result("ping", json!({}));
-    assert_eq!(pong, json!({}), "ping replies {{}}");
-    shutdown(c);
-
-    // End state: still zero survivors after server exit.
-    assert!(
-        stub_pids().is_empty(),
-        "ORPHAN after server exit: {:?}",
-        stub_pids()
-    );
 }
 
 #[test]

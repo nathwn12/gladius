@@ -1,8 +1,9 @@
-//! dlg-01 + tab-02 regressions: JS dialogs never hang (bounded wait,
-//! auto-accept, typed report) and a freshly opened tab settles so the next
-//! tool observes its committed URL. Each test owns one server process and
-//! reaps its browser. Both FAIL on the pre-fix binary (alert click HANGS -
-//! the 15s bench timeout; new-tab select reports url "" / about:blank).
+//! dlg-01 + tab-02 regressions on the owned Obscura engine: JS dialogs never
+//! hang (bounded wait; `alert()`/`confirm()` are silent no-ops on this
+//! engine, so clicks return plain `{"ok":true}` with no dialog report while
+//! the page keeps running) and a freshly opened tab settles so the next tool
+//! observes its committed URL. Each test owns one server process and reaps
+//! its engine.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -33,11 +34,12 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // Chrome opt-in: these tests need REAL JS dialogs (alert/confirm
-        // auto-accept + typed reports). Obscura never fires
-        // Page.javascriptDialogOpening (its alert() is a silent no-op), so
-        // the dialog faces must run on the chrome backend.
-        cmd.env("GLADIUS_BACKEND", "chrome");
+        // Owned-engine pin (see e2e_mcp.rs): cargo tree has no obscura
+        // sibling, so point at the repo-pinned bin/obscura.exe.
+        cmd.env(
+            "GLADIUS_OBSCURA",
+            format!("{}/bin/obscura.exe", env!("CARGO_MANIFEST_DIR")),
+        );
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -150,8 +152,8 @@ fn boot() -> Client {
 
 /// dlg-01 slow-page face: the alert button is injected 3s AFTER load (cold
 /// page outlasts navigate's load poll). The click must WAIT (bounded) for
-/// it, fire the dialog, and report - never miss it instantly. Pre-fix:
-/// instant "element not found", dialog never fires.
+/// it and fire it - never miss it instantly. On the owned engine the alert
+/// is a silent no-op, so there is no dialog report: plain `{"ok":true}`.
 #[test]
 fn dialog_click_waits_for_late_button() {
     let mut c = boot();
@@ -186,17 +188,18 @@ fn dialog_click_waits_for_late_button() {
     );
     let t = content_text(&clk);
     assert!(
-        t.contains("dialog") && t.contains("DLG_PROBE_late-xyz"),
-        "typed late-dialog report, got: {t}"
+        !t.contains("dialog"),
+        "owned engine fires no dialog (silent no-op), got: {t}"
     );
     finish(c);
 }
 
 /// dlg-01: clicking a button that fires `alert()` must return BOUNDED (well
-/// under the 15s bench ceiling) with a typed dialog report carrying the
-/// dialog's own message - never a hang. Pre-fix: HANG (no frame at all).
+/// under the 15s bench ceiling) with plain `{"ok":true}` - the owned engine
+/// never opens a dialog (`alert()` is a silent no-op), so there is no typed
+/// dialog report, only the page's own handler effect. Never a hang.
 #[test]
-fn dialog_alert_never_hangs_and_reports() {
+fn dialog_alert_never_hangs_and_is_inert() {
     let mut c = boot();
     let nav = c.call(
         "navigate",
@@ -222,10 +225,10 @@ fn dialog_alert_never_hangs_and_reports() {
     );
     let t = content_text(&clk);
     assert!(
-        t.contains("dialog") && t.contains("alert") && t.contains("DLG_PROBE_alert-xyz"),
-        "typed dialog report with the dialog message, got: {t}"
+        !t.contains("dialog"),
+        "no dialog report on the owned engine (alert is a silent no-op), got: {t}"
     );
-    // The page kept running after auto-accept: the click's own handler ran.
+    // The page kept running: the click's own handler ran.
     let res = content_text(&c.call(
         "evaluate",
         json!({"expression": "document.getElementById('result').textContent"}),
@@ -238,9 +241,10 @@ fn dialog_alert_never_hangs_and_reports() {
     finish(c);
 }
 
-/// dlg-01 second face: `confirm()` is auto-accepted (OK) and reported.
+/// dlg-01 second face: `confirm()` returns true on the owned engine (silent,
+/// no dialog opens) and the page keeps running. Bounded, never a hang.
 #[test]
-fn dialog_confirm_auto_accepts_and_reports() {
+fn dialog_confirm_never_hangs_and_is_inert() {
     let mut c = boot();
     let nav = c.call(
         "navigate",
@@ -257,8 +261,8 @@ fn dialog_confirm_auto_accepts_and_reports() {
     assert!(clk.get("isError").is_none(), "confirm click ok: {clk}");
     let t = content_text(&clk);
     assert!(
-        t.contains("confirm") && t.contains("DLG_PROBE_confirm-xyz"),
-        "typed confirm report, got: {t}"
+        !t.contains("dialog"),
+        "no dialog report on the owned engine (confirm is silent), got: {t}"
     );
     let res = content_text(&c.call(
         "evaluate",
@@ -267,15 +271,17 @@ fn dialog_confirm_auto_accepts_and_reports() {
     ));
     assert!(
         res.contains("CONFIRM:true"),
-        "confirm accepted (OK side): {res}"
+        "confirm answered true and the page kept running: {res}"
     );
     finish(c);
 }
 
 /// tab-02 slow-commit face: the new tab's navigation takes ~4s to answer.
-/// select must WAIT through the blank phase (bounded) and then observe the
-/// committed URL - never strand the next tool on about:blank. Pre-fix:
-/// select returns at once with url "" / about:blank.
+/// `tabs new` must WAIT through the blank phase (bounded) and then observe
+/// the committed URL - never strand the next tool on about:blank. New tabs
+/// open via the `tabs new` tool (engine-level target creation): synthetic
+/// clicks on `target=_blank` links are popup-blocked on the owned engine, so
+/// they are not the opener here.
 #[test]
 fn new_tab_waits_for_slow_commit() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind localhost");
@@ -313,46 +319,28 @@ fn new_tab_waits_for_slow_commit() {
         }
     });
 
-    // Opener with the (dynamic) slow URL baked in.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let opener = dir.path().join("slow-opener.html");
-    std::fs::write(
-        &opener,
-        format!(
-            "<!doctype html><html><head><title>opener</title></head><body>\
-             <a id=\"slowlink\" href=\"http://127.0.0.1:{port}/slow\" target=\"_blank\">SLOW_OPEN</a>\
-             </body></html>"
-        ),
-    )
-    .expect("write opener");
-    #[cfg(windows)]
-    let opener_str = opener.to_string_lossy().replace('\\', "/");
-    #[cfg(not(windows))]
-    let opener_str = opener.to_string_lossy().into_owned();
-    let opener_url = format!("file:///{opener_str}");
-
     let mut c = boot();
     let nav = c.call(
         "navigate",
-        json!({"url": opener_url}),
+        json!({"url": fixture("fixture.html")}),
         Duration::from_secs(60),
     );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
-    let clk = c.call(
-        "click",
-        json!({"element": "#slowlink"}),
-        Duration::from_secs(30),
-    );
-    assert!(clk.get("isError").is_none(), "open click ok: {clk}");
 
-    let sel = c.call(
+    let t0 = Instant::now();
+    let new = c.call(
         "tabs",
-        json!({"action": "select", "index": 1}),
+        json!({"action": "new", "url": format!("http://127.0.0.1:{port}/slow")}),
         Duration::from_secs(40),
     );
-    assert!(sel.get("isError").is_none(), "tabs select ok: {sel}");
-    let st = content_text(&sel);
-    assert!(st.contains("/slow"), "select waited for commit, got: {st}");
+    let dt = t0.elapsed();
+    assert!(new.get("isError").is_none(), "tabs new ok: {new}");
+    assert!(
+        dt >= Duration::from_secs(3),
+        "tabs new waited for the slow commit: {dt:?}"
+    );
+    let st = content_text(&new);
+    assert!(st.contains("/slow"), "new tab waited for commit, got: {st}");
     let href = content_text(&c.call(
         "evaluate",
         json!({"expression": "location.href"}),
@@ -365,36 +353,30 @@ fn new_tab_waits_for_slow_commit() {
     finish(c);
 }
 
-/// tab-02: click a target=_blank link, select the new tab, and IMMEDIATELY
-/// read its URL - it must be the committed page, not "" / about:blank.
-/// Pre-fix: select reported url "" and evaluate read about:blank.
+/// tab-02: open a new tab via `tabs new` and IMMEDIATELY read its URL - it
+/// must be the committed page, not "" / about:blank. (New tabs open via the
+/// `tabs new` tool: synthetic clicks on `target=_blank` links are
+/// popup-blocked on the owned engine.)
 #[test]
 fn new_tab_settles_to_committed_url() {
     let mut c = boot();
     let nav = c.call(
         "navigate",
-        json!({"url": fixture("tab-opener.html")}),
+        json!({"url": fixture("fixture.html")}),
         Duration::from_secs(60),
     );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    let clk = c.call(
-        "click",
-        json!({"element": "#newtab"}),
-        Duration::from_secs(30),
-    );
-    assert!(clk.get("isError").is_none(), "open-link click ok: {clk}");
-
-    let sel = c.call(
+    let new = c.call(
         "tabs",
-        json!({"action": "select", "index": 1}),
+        json!({"action": "new", "url": fixture("tab-target.html")}),
         Duration::from_secs(30),
     );
-    assert!(sel.get("isError").is_none(), "tabs select ok: {sel}");
-    let st = content_text(&sel);
+    assert!(new.get("isError").is_none(), "tabs new ok: {new}");
+    let st = content_text(&new);
     assert!(
         st.contains("tab-target.html"),
-        "select report already shows the committed URL, got: {st}"
+        "new-tab report already shows the committed URL, got: {st}"
     );
 
     let href = content_text(&c.call(
@@ -435,7 +417,7 @@ fn new_tab_settles_to_committed_url() {
         Duration::from_secs(30),
     ));
     assert!(
-        href0.contains("tab-opener.html"),
+        href0.contains("fixture.html"),
         "returned to opener: {href0}"
     );
     finish(c);

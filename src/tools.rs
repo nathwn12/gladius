@@ -256,9 +256,9 @@ async fn tool_navigate(browser: &Browser, url: &str) -> Result<Value, String> {
     if !title.is_empty() || cur.is_empty() || cur == "about:blank" {
         return Ok(ok_text(json!({"url": cur, "title": title}).to_string()));
     }
-    // NOTE: `.length` arrives as an int on chrome-headless-shell but as a
-    // float on Obscura (`42` vs `42.0` number shape), so compare as f64 -
-    // `as_i64` would miss the empty case on Obscura entirely.
+    // NOTE: `.length` arrives as an int on some engines but as a float on
+    // Obscura (`42` vs `42.0` number shape), so compare as f64 - `as_i64`
+    // would miss the empty case on Obscura entirely.
     let body_len = browser
         .eval("(((document.body && document.body.innerText) || '') + '').length")
         .await

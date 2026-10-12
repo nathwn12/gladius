@@ -1,8 +1,9 @@
 # Gladius ARCHITECTURE
 
-> Gladius: headless, ultra-lightweight browser-use MCP server in Rust. Drives headless Chrome
-> **directly over CDP** - no Node.js, no Playwright in the runtime path. One static binary,
-> MCP over stdio, lazy browser lifecycle. Research grounding: `docs/RESEARCH.md`.
+> Gladius: headless, ultra-lightweight browser-use MCP server in Rust. Drives
+> the owned Obscura engine **directly over CDP** - no Node.js, no Playwright
+> in the runtime path. One static binary, MCP over stdio, lazy browser
+> lifecycle. Research grounding: `docs/RESEARCH.md`.
 
 ## 1. Frozen tool contract (v1 - the surface never moves for backend swaps)
 
@@ -21,19 +22,15 @@
 Rules: tools are **dumb primitives** - no planner, no LLM, no judgement-retries in the server
 (RESEARCH rule 7). Selector grammar is deliberately tiny; anything fancier goes through `evaluate`.
 
-## 2. Tiered backend plan (swap the engine, keep the contract)
+## 2. Backend: one owned engine, plus explicit attach (swap the engine, keep the contract)
 
 | Tier | Backend | When | Notes |
 |---|---|---|---|
-| **Tier 0 (default)** | owned Obscura engine | now | `bin\obscura.exe` beside `gladius.exe`, provisioned by
+| **Tier 0 (only launch)** | owned Obscura engine | now | `bin\obscura.exe` beside `gladius.exe`, provisioned by
   `scripts/fetch-engine.ps1` (pinned v0.2.4, sha256-verified). Launched as
   `obscura serve --host 127.0.0.1 --port <free> --allow-private-network
   --allow-file-access`, readiness via `GET /json/version`. Full capability
   record: `docs/OBSCURA-COMPAT.md`. |
-| **Tier 0b (opt-in)** | `chrome-headless-shell` | now | Explicit opt-in via `GLADIUS_BACKEND=chrome`.
-  Resolved at runtime: `GLADIUS_CHROME`, else newest
-  `%LOCALAPPDATA%\ms-playwright\chromium_headless_shell-*\chrome-headless-shell-win64\chrome-headless-shell.exe`;
-  no system-Chrome fallback. Full JS/DOM fidelity, no compositor/GPU-process tax. |
 | **Tier 1 (future)** | Lightpanda no-render | when Windows-viable | `lightpanda serve --protocol cdp` behind the *same* 9 tools
   (https://github.com/lightpanda-io/browser). Renderless DOM/fetch at a fraction of the RAM.
   Blocked today: no native Windows binary. |
@@ -43,11 +40,10 @@ Rules: tools are **dumb primitives** - no planner, no LLM, no judgement-retries 
 Selection: `GLADIUS_CDP_URL` to **attach** to an existing endpoint instead of
 launching (RESEARCH rule 5) — BUILT 2026-10-11: `ws://`/`wss://` connects
 directly, `http://`/`https://` resolves via `GET <base>/json/version`; the
-session/target flow after the connect is shared with the launch path — then
-`GLADIUS_BACKEND=chrome` (case-insensitive) for the explicit
-chrome-headless-shell opt-in, otherwise the owned Obscura launch (the
-default; `GLADIUS_OBSCURA` overrides the engine path, `GLADIUS_CHROME` only
-applies inside the chrome path). Ownership: an attached engine is NOT ours — `close` detaches the session
+session/target flow after the connect is shared with the launch path —
+otherwise the owned Obscura launch (the only launchable engine;
+`GLADIUS_OBSCURA` overrides the engine path). Ownership: an attached engine
+is NOT ours — `close` detaches the session
 gladius opened and never kills, never sweeps. `GLADIUS_BACKEND_CAPS` declares `render`
 (default) or `dom-only` (no rendering pipeline: `screenshot` refuses, never fakes).
 
@@ -61,32 +57,30 @@ gladius opened and never kills, never sweeps. `GLADIUS_BACKEND_CAPS` declares `r
   convention; `screenshot` returns an `image` part (base64 PNG), everything else `text`.
 - Server answers `initialize` with **no browser running** (lazy start, §4) - cold MCP handshake
   must never pay browser-launch cost. The response carries `serverInfo.backend`
-  (`obscura`, `chrome-headless-shell`, or `external-cdp`) and `serverInfo.caps` (`render` or
+  (`obscura` or `external-cdp`) and `serverInfo.caps` (`render` or
   `dom-only`) so a client can see which engine and which caps it is talking to.
 
 ## 4. Browser lifecycle (lazy start, kill-tree on close)
 
 ```
-tools/call (first, non-close) --► resolve backend binary --► spawn child
-      (default: obscura serve on a free loopback port, both gate flags;
-       chrome opt-in: chrome-headless-shell --headless --remote-debugging-port=0 --about:blank)
+tools/call (first, non-close) --► resolve owned engine binary --► spawn child
+      (obscura serve on a free loopback port, both gate flags)
       --► CDP connect --► new target/page --► execute --► keep warm for session
 tools/call close  --OR--  stdio EOF / SIGTERM --► CDP Browser.close --► kill-tree (job object) --► reap
 ```
 
 Attach variant (same flow after the connect, §2): `GLADIUS_CDP_URL` set --► resolve ws
-endpoint (http:// via `/json/version`) --► CDP connect (no spawn, no profile, no sweep)
---► shared target/session flow --► execute --► keep warm for session.
+endpoint (http:// via `/json/version`) --► CDP connect (no spawn, engine not
+owned) --► shared target/session flow --► execute --► keep warm for session.
 `close`/EOF on an attached engine detaches the session gladius opened
 (`Target.detachFromTarget`) and drops the connection; the external process is left
-running by design - no `kill_tree`, no pid kill, no profile sweep.
+running by design - no `kill_tree`, no pid kill, nothing deleted.
 
 - **Lazy start:** no child process exists until the first browser-touching tool call.
 - **One session per agent connection:** each stdio client gets its own browser context/page;
   contexts never leak across connections (RESEARCH rule 6).
 - **Kill-tree on close:** the child is spawned in a Windows **job object**; `close`/EOF kills the
-  job (whole `chrome-headless-shell` tree incl. renderers), then reaps. No orphans, no lingering
-  profiles (the `@playwright/mcp` failure mode we refuse to copy).
+  job (whole owned-engine tree), then reaps. No orphans.
 - **Crash recovery:** a dead child surfaces as a tool error; the *next* call re-spawns lazily.
   No watchdog threads, no pre-warming.
 
@@ -95,10 +89,10 @@ running by design - no `kill_tree`, no pid kill, no profile sweep.
 | Budget | Target | Rationale |
 |---|---|---|
 | MCP `initialize` (no browser) | **< 100 ms** cold | proves the server itself is free; browser cost is never on this path |
-| First-action latency (incl. spawn+CDP) | **< 2 s** on dev Windows | `chrome-headless-shell` spawn + CDP handshake dominates; asserted, not hoped |
+| First-action latency (incl. spawn+CDP) | **< 2 s** on dev Windows | owned-engine spawn + CDP handshake dominates; asserted, not hoped |
 | Steady-state action p50 | **< 200 ms** (plus site/network) | CDP round-trip over `tokio-tungstenite`; `fastwebsockets` on standby if profiles implicate framing |
 | Server RSS (own process) | **< 10 MB** | no GC runtime, no Node/Python next to the browser child |
-| Browser child peak RSS | **< 250 MB** single page | `chrome-headless-shell` without compositor/GPU; full-Chrome tier exempt |
+| Browser child peak RSS | **< 250 MB** single page | owned engine, single page; full-Chrome tier exempt |
 
 **Measurement (Windows-local, CI-runnable):**
 - Cold start: `Measure-Command { Start-Process gladius.exe ... }` to first `initialize` response;

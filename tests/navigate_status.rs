@@ -1,7 +1,7 @@
 //! F1 proof: `navigate` must not fabricate `"status": 200`.
 //! A loopback server answers 404; the navigate envelope must NOT carry a
 //! `status` field at all (a wrong field is worse than no field).
-//! Headless only (real browser via GLADIUS_CHROME).
+//! Owned engine only (pinned `bin\obscura.exe`).
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};

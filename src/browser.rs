@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio_tungstenite::{
@@ -100,16 +99,15 @@ struct Shared {
 
 /// Ownership of the engine behind an `Inner` connection.
 ///
-/// - `Owned`: gladius launched the engine itself (child handle, job cover;
-///   the chrome path additionally owns a throwaway `gladius-<pid>-*`
-///   profile, the obscura path owns none). `close()` reaps the whole tree.
+/// - `Owned`: gladius launched the owned Obscura engine itself (child
+///   handle, job cover; the owned path creates no profile). `close()` reaps
+///   the whole tree.
 /// - `Attached`: gladius connected to an externally started engine via
 ///   `GLADIUS_CDP_URL` (the stub-engine interface: the real replacement
 ///   engine plugs in here). The engine is NOT ours: `close()` only detaches
 ///   the CDP session we opened and never kills, never sweeps a profile.
 enum Engine {
     Owned {
-        _profile: Option<ProfileDir>,
         #[cfg(windows)]
         _job: Option<std::os::windows::io::OwnedHandle>,
         child: tokio::process::Child,
@@ -167,37 +165,14 @@ pub fn cdp_url_override() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Selected launch backend, in strict order: an explicit `GLADIUS_CDP_URL`
-/// attaches to an external engine; `GLADIUS_BACKEND=chrome`
-/// (case-insensitive, surrounding whitespace ignored) opts into the
-/// chrome-headless-shell launch; anything else (unset, blank, or any other
-/// value) launches the owned Obscura engine, the default.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BackendSel {
-    Attach,
-    Chrome,
-    Obscura,
-}
-
-/// Raw backend selection without connecting (safe on cold paths and in tests).
-pub fn selected_backend() -> BackendSel {
-    if cdp_url_override().is_some() {
-        return BackendSel::Attach;
-    }
-    match std::env::var("GLADIUS_BACKEND") {
-        Ok(v) if v.trim().eq_ignore_ascii_case("chrome") => BackendSel::Chrome,
-        _ => BackendSel::Obscura,
-    }
-}
-
-/// Engine name for the initialize response: `external-cdp` when attached,
-/// `chrome-headless-shell` on the explicit chrome opt-in, otherwise the
-/// owned `obscura` default launch.
+/// Engine name for the initialize response: `external-cdp` when an explicit
+/// `GLADIUS_CDP_URL` attaches to an external engine, otherwise the owned
+/// `obscura` launch (the default and the only launchable engine).
 pub fn backend_name() -> String {
-    match selected_backend() {
-        BackendSel::Attach => "external-cdp".to_string(),
-        BackendSel::Chrome => "chrome-headless-shell".to_string(),
-        BackendSel::Obscura => "obscura".to_string(),
+    if cdp_url_override().is_some() {
+        "external-cdp".to_string()
+    } else {
+        "obscura".to_string()
     }
 }
 
@@ -474,9 +449,9 @@ impl Browser {
         let shared = self.shared().await?;
         // Ensure an active page exists so the index space is well-defined.
         ensure_session(&shared).await?;
-        // A click that opens a tab returns before Chrome lists the new
-        // target (measured: system Chrome still showed 1 target ~120ms
-        // after click_settle; headless-shell already showed 2). Bounded
+        // A click that opens a tab returns before the engine lists the new
+        // target (measured: one target still listed ~120ms after
+        // click_settle on a slow engine, two already on a fast one). Bounded
         // wait for the index to appear so select is deterministic.
         let deadline = Instant::now() + Duration::from_secs(10);
         let infos = loop {
@@ -1362,46 +1337,7 @@ async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
     }
 }
 
-/// Headless-shell-only engine resolution: `GLADIUS_CHROME` wins, else the
-/// newest `chrome-headless-shell.exe` under `%LOCALAPPDATA%\ms-playwright`.
-/// There is deliberately NO system-Chrome fallback: only the headless shell
-/// backend is supported, so a missing shell is a clear error, never a
-/// silent switch to a headed-capable binary.
-fn find_chrome() -> Result<std::path::PathBuf, String> {
-    if let Ok(p) = std::env::var("GLADIUS_CHROME") {
-        if !p.trim().is_empty() {
-            return Ok(std::path::PathBuf::from(p));
-        }
-    }
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        let base = std::path::PathBuf::from(local).join("ms-playwright");
-        if let Ok(rd) = std::fs::read_dir(&base) {
-            let mut cands: Vec<std::path::PathBuf> = Vec::new();
-            for e in rd.flatten() {
-                let p = e
-                    .path()
-                    .join("chrome-headless-shell-win64")
-                    .join("chrome-headless-shell.exe");
-                if p.is_file() {
-                    cands.push(p);
-                }
-            }
-            cands.sort();
-            if let Some(newest) = cands.pop() {
-                return Ok(newest);
-            }
-        }
-    }
-    Err(format!(
-        "chrome backend not found: no chrome-headless-shell.exe under \
-         %LOCALAPPDATA%\\ms-playwright\\*\\chrome-headless-shell-win64\\ \
-         (e.g. %LOCALAPPDATA%\\ms-playwright\\chromium_headless_shell-*/\
-         chrome-headless-shell-win64\\chrome-headless-shell.exe); \
-         set GLADIUS_CHROME to an explicit browser binary path"
-    ))
-}
-
-/// Startup deadline for the DevTools listening line (default 30s).
+/// Startup deadline for the owned-engine readiness poll (default 30s).
 /// `GLADIUS_STARTUP_TIMEOUT_SECS` overrides it (tests use it to force the
 /// timeout path quickly).
 fn startup_timeout() -> Duration {
@@ -1410,16 +1346,6 @@ fn startup_timeout() -> Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(30))
-}
-
-/// Test hook: when `GLADIUS_TEST_STUB_SLEEP_SECS=N` is set, spawn a silent
-/// sleeper instead of Chrome. It never prints the DevTools line, so the
-/// IDENTICAL startup-wait path below is exercised; its command line carries
-/// the `GLADIUS_STARTUP_STUB` marker so tests can assert no stub survives.
-fn stub_sleep_secs() -> Option<u64> {
-    std::env::var("GLADIUS_TEST_STUB_SLEEP_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
 }
 
 /// RAII guard over the freshly spawned backend: dropping it with the child
@@ -1440,11 +1366,10 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Launch dispatcher, in strict order: `GLADIUS_CDP_URL` set means attach
-/// to the external engine (the stub-engine interface) instead of launching;
-/// `GLADIUS_BACKEND=chrome` means the chrome-headless-shell launch
-/// (`launch_owned_chrome`); anything else launches the owned Obscura engine
-/// (`launch_owned_obscura`, the default).
+/// Launch dispatcher: `GLADIUS_CDP_URL` set means attach to the external
+/// engine (the stub-engine interface) instead of launching; anything else
+/// launches the owned Obscura engine (`launch_owned_obscura`, the default
+/// and only launch path).
 async fn launch() -> Result<Inner, String> {
     // A bad caps value is a config error: fail fast on either path.
     if let Err(e) = backend_caps() {
@@ -1453,116 +1378,7 @@ async fn launch() -> Result<Inner, String> {
     if let Some(raw) = cdp_url_override() {
         return attach(&raw).await;
     }
-    match selected_backend() {
-        BackendSel::Chrome => launch_owned_chrome().await,
-        _ => launch_owned_obscura().await,
-    }
-}
-
-/// Explicit chrome opt-in launch (`GLADIUS_BACKEND=chrome`). Byte-for-byte
-/// the former default path: throwaway `gladius-<pid>-*` profile, DevTools
-/// listening line parsed from engine stderr, whole tree reaped on close.
-async fn launch_owned_chrome() -> Result<Inner, String> {
-    let deadline = startup_timeout();
-    sweep_stale_profiles();
-    let profile = ProfileDir::create()?;
-    let mut std_cmd: std::process::Command;
-    if let Some(secs) = stub_sleep_secs() {
-        eprintln!("[gladius] backend: test stub-sleeper ({secs}s)");
-        std_cmd = std::process::Command::new("powershell");
-        std_cmd.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &format!("Start-Sleep -Seconds {secs} # GLADIUS_STARTUP_STUB"),
-        ]);
-    } else {
-        let chrome = find_chrome()?;
-        eprintln!("[gladius] backend: {}", chrome.display());
-        eprintln!("[gladius] profile: {}", profile.path().display());
-        std_cmd = std::process::Command::new(&chrome);
-        std_cmd.args(headless_argv(profile.path()));
-    }
-    std_cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        std_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    }
-    let spawned = Command::from(std_cmd)
-        .spawn()
-        .map_err(|e| format!("spawn chrome: {e}"))?;
-    // Guard is armed from here on: any `?`/early-return kills the tree.
-    let mut guard = ChildGuard {
-        pid: spawned.id().unwrap_or(u32::MAX),
-        child: Some(spawned),
-    };
-    if guard.pid == u32::MAX {
-        return Err("chrome child has no pid".to_string());
-    }
-    // Hard-kill cover (G-4): the OS reaps the tree when gladius dies by ANY
-    // means. Degrades to None (graceful kill_tree still applies) where the
-    // host forbids job nesting; never fails the launch.
-    #[cfg(windows)]
-    let job = job::arm(guard.child.as_ref().expect("guard holds child"));
-    let pid = guard.pid;
-    let stderr = guard
-        .child
-        .as_mut()
-        .and_then(|c| c.stderr.take())
-        .ok_or("chrome child has no stderr".to_string())?;
-
-    let mut lines = BufReader::new(stderr).lines();
-    let start = Instant::now();
-    let ws_url = loop {
-        let elapsed = start.elapsed();
-        if elapsed >= deadline {
-            return Err("timeout waiting for DevTools listening line".to_string());
-        }
-        let remain = deadline - elapsed;
-        let next = tokio::time::timeout(remain, lines.next_line())
-            .await
-            .map_err(|_| "stderr read timeout".to_string())?
-            .map_err(|e| format!("stderr read: {e}"))?;
-        match next {
-            None => {
-                return Err("chrome stderr closed before DevTools line".to_string());
-            }
-            Some(l) => {
-                if l.trim().is_empty() {
-                    continue;
-                }
-                eprintln!("[gladius] chrome: {l}");
-                if let Some(i) = l.find("ws://") {
-                    break l[i..].trim().to_string();
-                }
-            }
-        }
-    };
-
-    let (ws, _) = connect_async(&ws_url)
-        .await
-        .map_err(|e| format!("ws connect {ws_url}: {e}"))?;
-    let (sink, stream) = ws.split();
-    let shared = new_shared(sink);
-    let reader = tokio::spawn(reader_loop(stream, shared.clone()));
-    eprintln!("[gladius] browser ready pid={pid}");
-    let child = guard.child.take().expect("guard holds child");
-    drop(guard); // disarmed: child moved out, Drop is a no-op
-    Ok(Inner {
-        engine: Engine::Owned {
-            _profile: Some(profile),
-            #[cfg(windows)]
-            _job: job,
-            child,
-            pid,
-        },
-        shared,
-        reader,
-    })
+    launch_owned_obscura().await
 }
 
 #[cfg(windows)]
@@ -1570,13 +1386,11 @@ const OBSCURA_FILE: &str = "obscura.exe";
 #[cfg(not(windows))]
 const OBSCURA_FILE: &str = "obscura";
 
-/// Obscura (default engine) resolution: `GLADIUS_OBSCURA` wins when set and
-/// non-blank, otherwise `obscura.exe` as a sibling of the running executable
-/// (`std::env::current_exe()` parent dir - the engine ships beside
+/// Obscura (only launchable engine) resolution: `GLADIUS_OBSCURA` wins when
+/// set and non-blank, otherwise `obscura.exe` as a sibling of the running
+/// executable (`std::env::current_exe()` parent dir - the engine ships beside
 /// `gladius.exe`). A missing engine is a CLEAR error naming
-/// `scripts/fetch-engine.ps1`: never a silent fallback to Chrome, and never
-/// a system-browser path (there is deliberately no headed-capable fallback,
-/// same rule as `find_chrome`).
+/// `scripts/fetch-engine.ps1`: never a silent fallback to another browser.
 fn find_obscura() -> Result<std::path::PathBuf, String> {
     if let Ok(p) = std::env::var("GLADIUS_OBSCURA") {
         if !p.trim().is_empty() {
@@ -1619,7 +1433,8 @@ fn find_obscura() -> Result<std::path::PathBuf, String> {
 /// `--allow-file-access`, `file://` navigate fails `-32601 Page.navigate to
 /// file:// is disabled` and `DOM.setFileInputFiles` is refused. That
 /// re-opens the engine's SSRF gate and allows local-file reads; the trade is
-/// deliberate (parity with chrome-headless-shell, loopback-bound CDP).
+/// deliberate (automation needs loopback and file URLs on a loopback-bound
+/// CDP server).
 fn obscura_argv(port: u16) -> Vec<String> {
     vec![
         "serve".to_string(),
@@ -1741,8 +1556,7 @@ async fn launch_owned_obscura() -> Result<Inner, String> {
     let deadline = startup_timeout();
     // No profile here: the engine's argv never receives one (measured: the
     // engine writes 0 profile bytes), so a failed temp-dir creation must not
-    // abort a profile-free launch. The chrome path keeps its own sweep and
-    // profile above, untouched.
+    // abort a profile-free launch.
     let obscura = find_obscura()?;
     // Free loopback port: bind :0, read the port, drop it.
     let port = {
@@ -1783,7 +1597,7 @@ async fn launch_owned_obscura() -> Result<Inner, String> {
     if guard.pid == u32::MAX {
         return Err("obscura child has no pid".to_string());
     }
-    // Hard-kill cover (G-4), same as the chrome path: the OS reaps the tree
+    // Hard-kill cover (G-4): the OS reaps the tree
     // when gladius dies by ANY means.
     #[cfg(windows)]
     let job = job::arm(guard.child.as_ref().expect("guard holds child"));
@@ -1891,7 +1705,6 @@ async fn launch_owned_obscura() -> Result<Inner, String> {
     drop(guard); // disarmed: child moved out, Drop is a no-op
     Ok(Inner {
         engine: Engine::Owned {
-            _profile: None,
             #[cfg(windows)]
             _job: job,
             child,
@@ -1900,120 +1713,6 @@ async fn launch_owned_obscura() -> Result<Inner, String> {
         shared,
         reader,
     })
-}
-
-/// Headless engine argv for `profile_dir`. Kept separate from the
-/// spawn/cleanup plumbing so a future headed opt-in mode can reuse engine
-/// resolution (`find_chrome`) with its own argv without touching the rest
-/// of `launch`.
-fn headless_argv(profile_dir: &std::path::Path) -> Vec<String> {
-    vec![
-        "--headless".to_string(),
-        "--disable-gpu".to_string(),
-        "--no-first-run".to_string(),
-        "--no-default-browser-check".to_string(),
-        "--remote-debugging-port=0".to_string(),
-        // Memory tuning (measured): one renderer, no background services.
-        "--process-per-site".to_string(),
-        "--renderer-process-limit=1".to_string(),
-        "--disable-background-networking".to_string(),
-        "--disable-sync".to_string(),
-        "--disable-default-apps".to_string(),
-        "--disable-features=Translate,BackForwardCache,MediaRouter,OptimizationHints,AcceptCHFrame"
-            .to_string(),
-        "--mute-audio".to_string(),
-        "--disable-software-rasterizer".to_string(),
-        // Tab-opening clicks are synthetic (no trusted gesture), so a
-        // stock Chrome popup blocker swallows target=_blank opens
-        // (measured: window.open -> null on system Chrome, new target on
-        // headless-shell). Automation backends must not depend on which
-        // binary enforces the blocker.
-        "--disable-popup-blocking".to_string(),
-        format!("--user-data-dir={}", profile_dir.display()),
-        "about:blank".to_string(),
-    ]
-}
-
-/// Owned browser profile dir. The name carries our own pid
-/// (`gladius-<gladius-pid>-<millis>-<n>`) so a later launch can sweep it
-/// after a hard kill; graceful exit removes it via this Drop (as before).
-struct ProfileDir {
-    path: std::path::PathBuf,
-}
-
-impl ProfileDir {
-    fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-
-    fn create() -> Result<Self, String> {
-        static CTR: AtomicU64 = AtomicU64::new(0);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        for _ in 0..100 {
-            let n = CTR.fetch_add(1, Ordering::SeqCst);
-            let path =
-                std::env::temp_dir().join(format!("gladius-{}-{now}-{n}", std::process::id()));
-            match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(ProfileDir { path }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(format!("profile dir: {e}")),
-            }
-        }
-        Err("profile dir: too many collisions".to_string())
-    }
-}
-
-impl Drop for ProfileDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-/// Delete `gladius-<pid>-*` profile dirs whose owner gladius pid is dead.
-/// Runs at every launch: the recovery path for hard-killed servers whose
-/// graceful cleanup never ran. Conservative: our prefix only, never our own
-/// pid, and only provably-dead owners (any doubt keeps the dir, so a live
-/// server's profile is never swept).
-fn sweep_stale_profiles() {
-    let rd = match std::fs::read_dir(std::env::temp_dir()) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let pid: u32 = match name
-            .strip_prefix("gladius-")
-            .and_then(|r| r.split('-').next())
-            .and_then(|p| p.parse().ok())
-        {
-            Some(p) => p,
-            None => continue,
-        };
-        if pid == std::process::id() {
-            continue;
-        }
-        if owner_alive(pid) {
-            continue;
-        }
-        eprintln!(
-            "[gladius] sweep: removing stale profile {}",
-            e.path().display()
-        );
-        let _ = std::fs::remove_dir_all(e.path());
-    }
-}
-
-#[cfg(windows)]
-fn owner_alive(pid: u32) -> bool {
-    job::process_alive(pid)
-}
-
-#[cfg(not(windows))]
-fn owner_alive(_pid: u32) -> bool {
-    true // conservative: never sweep where liveness is unchecked
 }
 
 #[cfg(windows)]
@@ -2046,8 +1745,6 @@ mod job {
 
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
     const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    const ERROR_INVALID_PARAMETER: u32 = 87;
 
     #[repr(C)]
     #[derive(Default)]
@@ -2095,8 +1792,6 @@ mod job {
         ) -> i32;
         fn AssignProcessToJobObject(job: RawHandle, process: RawHandle) -> i32;
         fn CloseHandle(handle: RawHandle) -> i32;
-        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> RawHandle;
-        fn GetLastError() -> u32;
     }
 
     /// Assign `child` to a fresh kill-on-close job, returning the handle
@@ -2141,19 +1836,6 @@ mod job {
             }
             eprintln!("[gladius] job: browser armed with KILL_ON_JOB_CLOSE");
             Some(OwnedHandle::from_raw_handle(job))
-        }
-    }
-
-    /// True unless the pid is provably dead (conservative: any doubt keeps
-    /// the profile dir, so a live server's profile is never swept).
-    pub(super) fn process_alive(pid: u32) -> bool {
-        unsafe {
-            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if !h.is_null() {
-                CloseHandle(h);
-                return true;
-            }
-            GetLastError() != ERROR_INVALID_PARAMETER
         }
     }
 }
@@ -2206,10 +1888,8 @@ mod tests {
         }
         let child = Command::from(std_cmd).spawn().expect("spawn sleeper");
         let pid = child.id().expect("sleeper pid");
-        let profile = ProfileDir::create().expect("profile");
         let inner = Inner {
             engine: Engine::Owned {
-                _profile: Some(profile),
                 #[cfg(windows)]
                 _job: None,
                 child,
@@ -2559,16 +2239,16 @@ mod tests {
 
     /// Ownership on close: an attached close detaches (server sees
     /// detachFromTarget) and leaves the external process alive; it never
-    /// sweeps a profile it did not create (a canary stale dir planted
-    /// before attach must survive the close), and the attached variant
-    /// owns no pid by construction.
+    /// deletes anything it did not create (a canary dir planted before
+    /// attach must survive the close), and the attached variant owns no pid
+    /// by construction.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn attached_close_leaves_external_process_alive() {
         let fake = fake_cdp().await;
         let (ext_pid, mut ext_child) = external_sleeper().await;
-        // Canary: a stale `gladius-<deadpid>-*` dir that only a sweep would
-        // remove. No unit test ever calls the owned launch (the sole sweep
-        // site), so survival proves the attach+close path never sweeps.
+        // Canary: a dir only a sweep would remove. Nothing in the
+        // attach+close path deletes anything, so survival proves the
+        // ownership rule.
         let canary =
             std::env::temp_dir().join(format!("gladius-2147483646-canary-{}", ext_pid));
         std::fs::create_dir_all(&canary).expect("plant canary");
@@ -2584,19 +2264,14 @@ mod tests {
             fake.detach_seen.load(Ordering::SeqCst),
             "attached close must detach the session we opened"
         );
-        // External process still alive: no wait exit, pid answers.
+        // External process still alive: no wait exit.
         match ext_child.try_wait().expect("try_wait external") {
             None => {}
             Some(status) => panic!("external process died on detach: {status}"),
         }
-        #[cfg(windows)]
-        assert!(
-            job::process_alive(ext_pid),
-            "external pid {ext_pid} must still be alive after detach"
-        );
         assert!(
             canary.is_dir(),
-            "attached close must never sweep a profile it did not create"
+            "attached close must never delete anything it did not create"
         );
         std::fs::remove_dir_all(&canary).ok();
         // Test cleanup owns the sleeper: kill it here, never via gladius.
@@ -2628,13 +2303,8 @@ mod tests {
     /// owned Obscura launch with render caps.
     #[test]
     fn default_path_is_obscura_render_when_no_env() {
-        let (_lock, _env) = EnvGuard::hold(&[
-            "GLADIUS_CDP_URL",
-            "GLADIUS_BACKEND",
-            "GLADIUS_BACKEND_CAPS",
-        ]);
+        let (_lock, _env) = EnvGuard::hold(&["GLADIUS_CDP_URL", "GLADIUS_BACKEND_CAPS"]);
         assert_eq!(cdp_url_override(), None);
-        assert_eq!(selected_backend(), BackendSel::Obscura);
         assert_eq!(backend_caps().unwrap(), BackendCaps::Render);
         assert_eq!(backend_name(), "obscura");
         let info = backend_info();
@@ -2643,27 +2313,17 @@ mod tests {
         assert!(info.get("cdpUrl").is_none());
     }
 
-    /// Backend selection order: unset -> obscura (default),
-    /// `GLADIUS_BACKEND=chrome` (case-insensitive) -> chrome,
-    /// `GLADIUS_CDP_URL` set -> attach (wins over both).
+    /// Backend selection: unset -> obscura (the default and only launchable
+    /// engine); `GLADIUS_CDP_URL` set -> attach. There is no other knob.
     #[test]
-    fn backend_selection_prefers_attach_then_chrome_then_obscura() {
-        let (_lock, _env) = EnvGuard::hold(&["GLADIUS_CDP_URL", "GLADIUS_BACKEND"]);
-        assert_eq!(selected_backend(), BackendSel::Obscura);
+    fn backend_selection_prefers_attach_then_obscura() {
+        let (_lock, _env) = EnvGuard::hold(&["GLADIUS_CDP_URL"]);
         assert_eq!(backend_name(), "obscura");
-        std::env::set_var("GLADIUS_BACKEND", "chrome");
-        assert_eq!(selected_backend(), BackendSel::Chrome);
-        assert_eq!(backend_name(), "chrome-headless-shell");
-        std::env::set_var("GLADIUS_BACKEND", "  CHROME  ");
-        assert_eq!(selected_backend(), BackendSel::Chrome);
-        std::env::set_var("GLADIUS_BACKEND", "bogus");
-        assert_eq!(selected_backend(), BackendSel::Obscura);
-        assert_eq!(backend_name(), "obscura");
-        std::env::set_var("GLADIUS_BACKEND", "");
-        assert_eq!(selected_backend(), BackendSel::Obscura);
         std::env::set_var("GLADIUS_CDP_URL", "ws://127.0.0.1:9/");
-        assert_eq!(selected_backend(), BackendSel::Attach);
         assert_eq!(backend_name(), "external-cdp");
+        let info = backend_info();
+        assert_eq!(info.get("backend"), Some(&json!("external-cdp")));
+        assert_eq!(info.get("cdpUrl"), Some(&json!("ws://127.0.0.1:9/")));
     }
 
     /// Obscura argv: the serve subcommand, loopback host/port, and BOTH gate

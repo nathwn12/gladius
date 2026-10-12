@@ -132,89 +132,42 @@ fn shutdown(c: Client) {
     }
 }
 
-/// Resolve the headless-shell binary exactly like the server does:
-/// `GLADIUS_CHROME` wins, else the newest `chrome-headless-shell.exe` under
-/// `%LOCALAPPDATA%\ms-playwright`. No system-browser fallback, ever.
-fn find_shell() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("GLADIUS_CHROME") {
-        if !p.trim().is_empty() {
-            return std::path::PathBuf::from(p);
-        }
-    }
-    let local = std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA");
-    let base = std::path::PathBuf::from(local).join("ms-playwright");
-    let mut cands: Vec<std::path::PathBuf> = Vec::new();
-    for e in std::fs::read_dir(&base)
-        .expect("read ms-playwright")
-        .flatten()
-    {
-        let p = e
-            .path()
-            .join("chrome-headless-shell-win64")
-            .join("chrome-headless-shell.exe");
-        if p.is_file() {
-            cands.push(p);
-        }
-    }
-    cands.sort();
-    cands
-        .pop()
-        .expect("no chrome-headless-shell under ms-playwright")
-}
-
-/// Externally started engine. Owned by the TEST (Drop kills it); gladius
-/// must never touch it.
+/// Externally started engine: the repo-pinned `bin\obscura.exe`, launched
+/// by the TEST as an independent process (not via gladius). Owned by the
+/// TEST (Drop kills it); gladius must never touch it.
 struct External {
     child: Child,
     pid: u32,
     port: u16,
-    dir: std::path::PathBuf,
 }
 
 impl External {
     fn start() -> Self {
-        let shell = find_shell();
+        let engine = format!("{}/bin/obscura.exe", env!("CARGO_MANIFEST_DIR"));
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
         let port = listener.local_addr().expect("local addr").port();
         drop(listener);
-        let dir = std::env::temp_dir().join(format!(
-            "gladius-ext-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        ));
-        std::fs::create_dir_all(&dir).expect("external profile dir");
-        let mut cmd = Command::new(&shell);
-        let err_log = dir.join("chrome-stderr.log");
-        let err_file = std::fs::File::create(&err_log).expect("stderr log");
+        let mut cmd = Command::new(&engine);
         cmd.args([
-            "--headless",
-            "--disable-gpu",
-            "--no-first-run",
-            "--no-default-browser-check",
-            &format!("--remote-debugging-port={port}"),
-            "--disable-popup-blocking",
-            &format!("--user-data-dir={}", dir.display()),
-            "about:blank",
+            "serve",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--allow-private-network",
+            "--allow-file-access",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(err_file);
+        .stderr(Stdio::null());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
-        let child = cmd.spawn().expect("spawn external chrome-headless-shell");
+        let child = cmd.spawn().expect("spawn external obscura engine");
         let pid = child.id();
-        let mut ext = External {
-            child,
-            pid,
-            port,
-            dir,
-        };
+        let mut ext = External { child, pid, port };
         ext.wait_ready();
         ext
     }
@@ -233,7 +186,7 @@ impl External {
             match version_ws_dbg(&self.base_url()) {
                 Ok(_) => return,
                 Err(e) => {
-                    // Chrome is usually up in <2s; log only when a wait
+                    // The engine is usually up in <2s; log only when a wait
                     // drags, so happy runs stay quiet.
                     if t0.elapsed() > Duration::from_secs(5) && n % 20 == 1 {
                         eprintln!(
@@ -264,7 +217,6 @@ impl Drop for External {
     fn drop(&mut self) {
         self.child.kill().ok();
         let _ = self.child.wait();
-        std::fs::remove_dir_all(&self.dir).ok();
     }
 }
 
@@ -279,7 +231,7 @@ fn version_ws_dbg(base: &str) -> Result<String, String> {
         .strip_prefix("http://")
         .unwrap_or(base)
         .trim_end_matches('/');
-    // Chrome builds `webSocketDebuggerUrl` from the Host header: it must
+    // The engine builds `webSocketDebuggerUrl` from the Host header: it must
     // carry the port, or the returned ws url has none (measured).
     let req = format!("GET /json/version HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     let mut s = std::net::TcpStream::connect(host).map_err(|e| format!("connect {host}: {e}"))?;
@@ -287,11 +239,9 @@ fn version_ws_dbg(base: &str) -> Result<String, String> {
         .map_err(|e| format!("read timeout: {e}"))?;
     s.set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| format!("write timeout: {e}"))?;
-    // NOTE: chrome-headless-shell's DevTools server ignores HTTP/1.0 (it
-    // closes with zero bytes; measured on 155) - HTTP/1.1 is required. And
-    // it keeps HTTP/1.1 connections open past the reply despite
-    // `Connection: close`, so the body MUST be framed by Content-Length -
-    // read-to-end would wait for a close that never comes.
+    // NOTE: the engine's DevTools server speaks HTTP/1.1: send HTTP/1.1,
+    // and frame the body by Content-Length (read-to-end would wait for a
+    // close that never comes).
     s.write_all(req.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
     let mut raw = Vec::new();
@@ -358,15 +308,15 @@ fn profile_dirs(owner_pid: u32) -> Vec<std::path::PathBuf> {
         .unwrap_or_default()
 }
 
-/// `(pid, ppid)` for every live chrome-headless-shell process (read-only WMI
+/// `(pid, ppid)` for every live owned-engine process (read-only WMI
 /// query; never kills anything).
-fn shell_parentage() -> Vec<(u32, u32)> {
+fn engine_parentage() -> Vec<(u32, u32)> {
     let mut q = Command::new("powershell");
     q.args([
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "Get-CimInstance Win32_Process -Filter \"Name='chrome-headless-shell.exe'\" | ForEach-Object { \"$($_.ProcessId):$($_.ParentProcessId)\" }",
+        "Get-CimInstance Win32_Process -Filter \"Name='obscura.exe'\" | ForEach-Object { \"$($_.ProcessId):$($_.ParentProcessId)\" }",
     ])
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
@@ -447,16 +397,16 @@ fn attach_over_ws_drives_and_leaves_external_alive() {
     assert!(data.starts_with("iVBORw0KGgo"), "real png bytes");
 
     // gladius created no engine of its own: no owned profile, and no
-    // chrome-headless-shell process parented under the gladius pid.
+    // obscura.exe process parented under the gladius pid.
     assert!(
         profile_dirs(gpid).is_empty(),
         "attached gladius owns no profile: {:?}",
         profile_dirs(gpid)
     );
-    for (pid, ppid) in shell_parentage() {
+    for (pid, ppid) in engine_parentage() {
         assert!(
             ppid != gpid,
-            "gladius (pid {gpid}) launched chrome pid {pid}: ancestry violation"
+            "gladius (pid {gpid}) launched engine pid {pid}: ancestry violation"
         );
     }
 
