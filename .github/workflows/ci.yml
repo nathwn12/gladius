@@ -5,14 +5,12 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    # The test suites drive a headless Chrome over CDP. The suite probes the
-    # ms-playwright headless-shell path first and falls back to a system
-    # Chrome; the code honours GLADIUS_CHROME, so point it at the runner's
-    # preinstalled Chrome explicitly.
-    env:
-      GLADIUS_CHROME: 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+    # The suite drives the owned Obscura engine only: provision the pinned
+    # engine with the repo's own script (sha-verified) and run against it.
+    # CI must never point at a runner-provided browser.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - run: powershell -ExecutionPolicy Bypass -File scripts/fetch-engine.ps1
       - run: cargo build --locked
       - run: cargo test --locked

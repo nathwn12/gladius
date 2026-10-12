@@ -1,7 +1,8 @@
-//! Hard-kill reaping (G-4): when the MCP server process dies hard
-//! (`TerminateProcess`, no `Drop`/`kill_tree`), the OS job object must reap
-//! the browser tree, and the next launch must sweep the orphaned profile
-//! dir. Only processes spawned by this test are ever killed.
+//! Hard-kill reaping (G-4) on the owned Obscura engine: when the MCP server
+//! process dies hard (`TerminateProcess`, no `Drop`/`kill_tree`), the OS job
+//! object must reap the engine tree. The owned engine creates no profile
+//! dir, so the test asserts none ever appears. Only processes spawned by
+//! this test are ever killed.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -32,10 +33,12 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        // Chrome opt-in: this test observes chrome-named processes and the
-        // profile token in the engine command line (chrome-only shape), so
-        // the reaping/sweep machinery is proved via the chrome backend.
-        cmd.env("GLADIUS_BACKEND", "chrome");
+        // Owned-engine pin (see e2e_mcp.rs): cargo tree has no obscura
+        // sibling, so point at the repo-pinned bin/obscura.exe.
+        cmd.env(
+            "GLADIUS_OBSCURA",
+            format!("{}/bin/obscura.exe", env!("CARGO_MANIFEST_DIR")),
+        );
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -109,7 +112,9 @@ fn content_text(v: &Value) -> String {
         .to_string()
 }
 
-/// Profile dirs owned by one gladius pid: `%TEMP%/gladius-<pid>-*`.
+/// Profile dirs that would belong to one gladius pid: `%TEMP%/gladius-<pid>-*`.
+/// The owned engine creates none; this helper exists so the test can assert
+/// that invariant (empty, always).
 fn profile_dirs(owner_pid: u32) -> Vec<std::path::PathBuf> {
     let prefix = format!("gladius-{owner_pid}-");
     std::fs::read_dir(std::env::temp_dir())
@@ -122,17 +127,48 @@ fn profile_dirs(owner_pid: u32) -> Vec<std::path::PathBuf> {
         .unwrap_or_default()
 }
 
-/// PIDs of live browser processes (chrome-headless-shell.exe or chrome.exe) whose command line mentions
-/// `token` (read-only WMI query; never kills anything). Excludes the query
-/// process itself by construction (powershell.exe, not chrome).
-fn chrome_pids_with(token: &str) -> Vec<u32> {
+/// `(pid, ppid)` for every live owned-engine process (`obscura.exe`;
+/// read-only WMI query; never kills anything).
+fn engine_parentage() -> Vec<(u32, u32)> {
+    let mut q = Command::new("powershell");
+    q.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Get-CimInstance Win32_Process -Filter \"Name='obscura.exe'\" | ForEach-Object { \"$($_.ProcessId):$($_.ParentProcessId)\" }",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        q.creation_flags(0x08000000);
+    }
+    let out = q.spawn().expect("spawn engine query").wait_with_output();
+    let out = match out {
+        Ok(o) => o,
+        Err(_) => return vec![],
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .filter_map(|t| {
+            let (a, b) = t.split_once(':')?;
+            Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?))
+        })
+        .collect()
+}
+
+/// True while a process with this pid exists (read-only WMI probe; never
+/// kills anything).
+fn process_alive(pid: u32) -> bool {
     let mut q = Command::new("powershell");
     q.args([
         "-NoProfile",
         "-NonInteractive",
         "-Command",
         &format!(
-            "Get-CimInstance Win32_Process -Filter \"(Name='chrome-headless-shell.exe' OR Name='chrome.exe')\" | Where-Object {{ $_.CommandLine -like '*{token}*' }} | ForEach-Object {{ $_.ProcessId }}"
+            "Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\" | ForEach-Object {{ $_.ProcessId }}"
         ),
     ])
     .stdin(Stdio::null())
@@ -143,15 +179,11 @@ fn chrome_pids_with(token: &str) -> Vec<u32> {
         use std::os::windows::process::CommandExt;
         q.creation_flags(0x08000000);
     }
-    let out = q.spawn().expect("spawn chrome query").wait_with_output();
-    let out = match out {
-        Ok(o) => o,
-        Err(_) => return vec![],
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .filter_map(|t| t.parse::<u32>().ok())
-        .collect()
+    let out = q.spawn().expect("spawn liveness query").wait_with_output();
+    match out {
+        Ok(o) => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+        Err(_) => true, // any doubt keeps waiting, never declares dead
+    }
 }
 
 /// EOF the server and require a clean exit (proves no hang, no orphan hold).
@@ -177,74 +209,64 @@ fn shutdown(c: Client) {
 }
 
 #[test]
-fn hard_kill_reaps_browser_tree_and_next_launch_sweeps_profile() {
-    // --- server A: launch a real browser via one navigate ---
+fn hard_kill_reaps_owned_engine_tree_and_creates_no_profile() {
+    // --- server A: launch the owned engine via one navigate ---
     let mut a = Client::spawn();
     let apid = a.child.id();
     a.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     let nav = a.call("navigate", json!({"url": fixture_url()}));
     assert!(nav.get("isError").is_none(), "A navigate ok: {nav}");
 
-    let dirs = profile_dirs(apid);
-    assert_eq!(
-        dirs.len(),
-        1,
-        "exactly one profile dir for server A (pid {apid}): {dirs:?}"
-    );
-    let token = dirs[0]
-        .file_name()
-        .expect("profile dir name")
-        .to_string_lossy()
-        .into_owned();
+    // The owned engine creates no profile dir, by design.
     assert!(
-        dirs[0].is_dir(),
-        "A profile dir exists before the kill: {dirs:?}"
+        profile_dirs(apid).is_empty(),
+        "owned engine owns no profile dir: {:?}",
+        profile_dirs(apid)
     );
 
-    // The browser tree is up and carries our profile token.
-    let mut chrome = chrome_pids_with(&token);
+    // The engine tree is up: an obscura.exe process parented under A.
+    let mut kids: Vec<u32> = engine_parentage()
+        .iter()
+        .filter(|(_, ppid)| *ppid == apid)
+        .map(|(pid, _)| *pid)
+        .collect();
     for _ in 0..20 {
-        if !chrome.is_empty() {
+        if !kids.is_empty() {
             break;
         }
         std::thread::sleep(Duration::from_millis(500));
-        chrome = chrome_pids_with(&token);
+        kids = engine_parentage()
+            .iter()
+            .filter(|(_, ppid)| *ppid == apid)
+            .map(|(pid, _)| *pid)
+            .collect();
     }
     assert!(
-        !chrome.is_empty(),
-        "browser tree running under A's profile before kill"
+        !kids.is_empty(),
+        "owned engine running under server A (pid {apid}) before kill"
     );
 
     // --- hard kill ONLY server A: TerminateProcess, no /T, no Drop ---
     // Then release EVERY handle to A (including the process handle
-    // itself): a dead-but-unreaped pid still answers OpenProcess, and the
-    // sweep conservatively treats that as alive. Real orphans (parent
-    // gone, handles closed) read as dead.
+    // itself): the job object reaps the tree once the last handle closes.
     a.child.kill().expect("hard-kill server A");
     let _ = a.child.wait();
     drop(a);
 
-    // --- (a) the job object reaps the tree: no chrome with our token ---
-    let mut survivors = chrome_pids_with(&token);
-    for _ in 0..30 {
-        if survivors.is_empty() {
-            break;
-        }
+    // --- the job object reaps the tree: A's engine pids die ---
+    let mut deadline = 30;
+    while deadline > 0 && kids.iter().any(|p| process_alive(*p)) {
         std::thread::sleep(Duration::from_millis(500));
-        survivors = chrome_pids_with(&token);
+        deadline -= 1;
     }
+    let survivors: Vec<u32> = kids.into_iter().filter(|p| process_alive(*p)).collect();
     assert!(
         survivors.is_empty(),
-        "ORPHAN: chrome survived the hard kill of server A: {survivors:?}"
+        "ORPHAN: owned engine survived the hard kill of server A: {survivors:?}"
     );
 
-    // Nothing was swept yet (sweep runs at next launch): honest checkpoint.
-    assert!(
-        dirs[0].is_dir(),
-        "orphaned profile dir still on disk until next launch"
-    );
-
-    // --- server B: happy path works AND its launch sweeps A's profile ---
+    // Still no profile debris after the kill (there was never a profile).
+    // Server B: happy path works on a fresh owned launch.
     let mut b = Client::spawn();
     b.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     let navb = b.call("navigate", json!({"url": fixture_url()}));
@@ -255,37 +277,31 @@ fn hard_kill_reaps_browser_tree_and_next_launch_sweeps_profile() {
         "happy path on B: {}",
         content_text(&snap).chars().take(200).collect::<String>()
     );
+    let bpid = b.child.id();
     assert!(
-        !dirs[0].exists(),
-        "B's launch swept A's orphaned profile dir: {dirs:?}"
+        profile_dirs(bpid).is_empty(),
+        "B created no profile dir either: {:?}",
+        profile_dirs(bpid)
     );
 
-    // Graceful close still removes B's own profile dir.
-    let bpid = b.child.id();
-    let bdirs = profile_dirs(bpid);
-    assert_eq!(bdirs.len(), 1, "one profile dir for B: {bdirs:?}");
+    // Graceful close kills B's engine tree.
+    let bkids: Vec<u32> = engine_parentage()
+        .iter()
+        .filter(|(_, ppid)| *ppid == bpid)
+        .map(|(pid, _)| *pid)
+        .collect();
+    assert!(!bkids.is_empty(), "B owns an engine before close");
     let closed = b.call("close", json!({}));
     assert!(closed.get("isError").is_none(), "close ok: {closed}");
     shutdown(b);
-    for _ in 0..20 {
-        if !bdirs[0].exists() {
-            break;
-        }
+    let mut deadline = 20;
+    while deadline > 0 && bkids.iter().any(|p| process_alive(*p)) {
         std::thread::sleep(Duration::from_millis(500));
+        deadline -= 1;
     }
+    let left: Vec<u32> = bkids.into_iter().filter(|p| process_alive(*p)).collect();
     assert!(
-        !bdirs[0].exists(),
-        "graceful close removed B's profile dir: {bdirs:?}"
-    );
-    assert!(
-        chrome_pids_with(
-            &bdirs[0]
-                .file_name()
-                .expect("name")
-                .to_string_lossy()
-                .into_owned()
-        )
-        .is_empty(),
-        "no chrome left for B's profile after close"
+        left.is_empty(),
+        "graceful close reaped B's engine tree: {left:?}"
     );
 }

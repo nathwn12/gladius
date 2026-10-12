@@ -46,9 +46,8 @@ each flag exactly once (the engine's clap parser hard-fails on a repeated
 flag), spawned with `CREATE_NO_WINDOW`, with readiness discovered by polling
 `GET http://127.0.0.1:<port>/json/version` for `webSocketDebuggerUrl` (the
 `--ready-file` publish is not trusted - it was measured flaking). Backend
-selection is `GLADIUS_CDP_URL` (attach, never owned) first, then
-`GLADIUS_BACKEND=chrome` (explicit chrome-headless-shell opt-in), otherwise
-this Obscura launch is the default; `GLADIUS_OBSCURA` overrides the engine
+selection is `GLADIUS_CDP_URL` (attach, never owned) first, otherwise
+this Obscura launch is the only engine; `GLADIUS_OBSCURA` overrides the engine
 path. Both gate flags are MANDATORY and measured: without
 `--allow-private-network`, loopback/LAN navigation fails; without
 `--allow-file-access`, `file://` navigation and `DOM.setFileInputFiles` are
