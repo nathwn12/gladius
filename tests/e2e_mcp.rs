@@ -212,7 +212,7 @@ fn e2e_mcp_fixture_flow() {
     assert!(
         snap_text.contains("GLADIUS_MARKER_hello-12345"),
         "snapshot has marker: {}",
-        &snap_text.chars().take(200).collect::<String>()
+        snap_text.chars().take(200).collect::<String>()
     );
 
     // evaluate returns known value
@@ -267,7 +267,7 @@ fn e2e_mcp_fixture_flow() {
     assert!(
         data.starts_with("iVBORw0KGgo"),
         "png magic (base64): {}",
-        &data.chars().take(24).collect::<String>()
+        data.chars().take(24).collect::<String>()
     );
 
     // type into the input, value lands via JS property path

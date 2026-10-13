@@ -29,63 +29,70 @@ inside the binary.
 
 ## Tools
 
-15 tools over the active page (plus a browser-free fast path):
+15 tools over the active page, listed here in the order `tools/list` emits
+them (`src/tools.rs`). `fetch_text` is the browser-free fast path and is one
+of these 15 — not an extra:
 
-- `navigate` — load a URL in the active tab.
-- `snapshot` — AX snapshot: one line per actionable node with a stable ref (`@e1`, `@e2`, …) plus page text; pass `{"mode":"text"}` for the legacy text-only output; slices page text in-page before transfer, then caps at 8000 chars.
-- `screenshot` — viewport PNG of the active page; `fullPage` for the full page.
-- `fetch_text` — plain HTTP fetch with no browser (the fast path).
-- `click` — click by CSS selector or AX ref.
-- `type` — type text, with optional submit.
-- `hover` — hover over a CSS selector or AX ref.
-- `select` — choose an option by `value` or visible `text`.
-- `key` — send named keys to the focused element.
-- `upload` — set files on an `<input type=file>`.
-- `evaluate` — run JS in the page, awaiting promises; evaluating `undefined` is a tool error (`no value`), distinct from explicit `null` which yields `{"value":null}`.
-- `wait_for` — wait for a selector/text, a delay, or network idle; never exceeds its budget, clamped to 15s max; `ms: 0` is an immediate no-op success.
-- `console` — buffered console messages plus uncaught exceptions (ring buffer, cap 200).
-- `tabs` — `list`, `new`, `close`, and `select` browser tabs.
-- `close` — shut down the browser process tree.
+- `navigate` — navigate the active page to a URL.
+- `snapshot` — AX snapshot: one line per actionable node with a stable ref (`@e1`, `@e2`, …), role/name/value, plus page text. Pass `{"mode":"text"}` for the legacy text-only output; slices page text in-page before transfer, then caps at 8000 chars.
+- `screenshot` — PNG screenshot of the active page; `fullPage` for the full page.
+- `click` — click an element by CSS selector or AX ref (@eN from snapshot; exact, never first-match).
+- `type` — type text into an element by CSS selector or AX ref, with optional submit.
+- `evaluate` — evaluate a JS expression in the page, awaiting promises; evaluating `undefined` is a tool error (`no value`), distinct from explicit `null` which yields `{"value":null}`.
+- `wait_for` — wait for a selector/text, a delay, or network idle; never exceeds its budget, clamped to 15s max; `ms: 0` is an immediate no-op success; `networkIdle:true` waits for a quiet window of `idleMs` (default 500).
+- `console` — buffered console messages plus uncaught exceptions (ring buffer, cap 200); `action` get (default) | drain | clear, `limit` caps the returned count (default 100).
+- `upload` — set files on an `<input type=file>` by CSS selector or AX ref; `paths[]` must exist locally.
+- `fetch_text` — the fast path: a plain HTTP GET with no browser, HTML stripped to text.
+- `hover` — hover over an element by CSS selector or AX ref.
+- `select` — choose a `<select>` option by `value` (preferred) or visible `text`.
+- `key` — press a named key (Enter, Tab, Escape, Backspace, ArrowDown, …) on the focused element.
+- `tabs` — list, open, close, or select browser tabs.
+- `close` — shut down the owned browser process tree, or detach from an attached external engine (which is left running).
 
 JSON-RPC notifications (requests with no `id`) get no reply. Every owned
 spawn is RAII-guarded: any startup failure (including a timeout waiting for
 engine readiness) kills the process tree, so no survivors.
 
-## Install
+## Quick start
 
 **Supported platforms: Windows x64 only.** The owned Obscura engine ships as
 Windows binaries, so gladius runs on Windows today and nowhere else. Be
 honest about the requirement: you need `gladius.exe` **plus** the engine
-binaries (`obscura.exe`, `obscura-worker.exe`) beside it — a release zip
-already contains all three; a source build needs one provisioning step.
+binaries (`obscura.exe`, `obscura-worker.exe`) beside it.
 
-**Requirements:** Windows x64. No Node.js, no Python, no Playwright at
-runtime — one static binary plus the two engine files. (Building from source
-needs a Rust toolchain; running does not.)
+**Install from source (the current route).** Build the binary, then provision
+the pinned engine on the fresh machine — this downloads Obscura `v0.2.4` and
+verifies it by sha256 before placing anything in `bin\`:
 
-1. **Release install (recommended):** download the
-   `gladius-<version>-windows-x86_64.zip` from the
-   [GitHub Releases](https://github.com/nathwn12/gladius/releases) page and
-   extract it anywhere. The zip contains `gladius.exe`, `obscura.exe`,
-   `obscura-worker.exe`, `LICENSE`, `THIRD-PARTY-NOTICES.md`, and `README.md`
-   — keep the three `.exe` files together in one directory. Verify with the
-   attached `.sha256` file:
-   ```powershell
-   (Get-FileHash -Algorithm SHA256 gladius-<version>-windows-x86_64.zip).Hash.ToLowerInvariant() -eq (Get-Content gladius-<version>-windows-x86_64.zip.sha256).Split()[0]
-   ```
-2. **Source install:** build (see
-   [Build from source](#build-from-source)), then provision the pinned engine
-   on the fresh machine — this downloads Obscura `v0.2.4` and verifies it by
-   sha256 before placing anything in `bin\`:
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File scripts/fetch-engine.ps1
-   ```
-   Copy `target\release\gladius.exe`, `bin\obscura.exe`, and
-   `bin\obscura-worker.exe` into one directory (or set `GLADIUS_OBSCURA` to
-   the engine path). A missing engine is a clear error naming that script —
-   gladius never downloads anything by itself and never falls back to another
-   browser.
-3. Point your MCP client at it.
+```powershell
+cargo build --release
+powershell -ExecutionPolicy Bypass -File scripts/fetch-engine.ps1
+```
+
+Then get the engine beside the running executable. Engine resolution is
+exactly the rule in `src/browser.rs` `find_obscura`: `GLADIUS_OBSCURA` wins
+when set and non-blank, otherwise `obscura.exe` as a sibling of the running
+executable (`std::env::current_exe()` parent dir). A repo run therefore needs
+one of:
+
+```powershell
+# copy the engine + binary into one directory and run from there
+Copy-Item target\release\gladius.exe, bin\obscura.exe, bin\obscura-worker.exe -Destination C:\tools\gladius
+C:\tools\gladius\gladius.exe mcp
+
+# or keep the repo layout and point GLADIUS_OBSCURA at the provisioned engine
+$env:GLADIUS_OBSCURA = "bin\obscura.exe"
+target\release\gladius.exe mcp
+```
+
+A missing engine is a clear error naming `scripts/fetch-engine.ps1` — gladius
+never downloads anything by itself and never falls back to another browser.
+
+**Requirements:** Windows x64, a stable Rust toolchain to build (running needs
+none). No Node.js, no Python, no Playwright at runtime — one static binary
+plus the two engine files.
+
+Point your MCP client at it.
 
 **OpenCode V2** (`opencode.json` — `mcp.servers.<name>`, `type: "local"`,
 `command` array):
@@ -133,37 +140,29 @@ Self-check without a client:
 gladius.exe selftest # internal end-to-end check, exits 0 on pass
 ```
 
+## Configure
+
 One owned engine (Obscura, pinned in `bin\`), plus an explicit external
-attach by URL.
+attach by URL. The owned engine is spawned with `CREATE_NO_WINDOW` and killed
+as a whole process tree on `close`; an attached engine is only detached,
+never killed. Environment:
 
-Backend: gladius launches the owned Obscura engine (`GLADIUS_OBSCURA` path
-override, else `bin\obscura.exe` beside `gladius.exe`, provisioned by
-`scripts/fetch-engine.ps1`; a missing engine is a clear error naming that
-script), or attaches to an external engine when `GLADIUS_CDP_URL` is set
-(never owned: `close` only detaches). The owned engine is spawned with
-`CREATE_NO_WINDOW` and killed as a whole process tree on `close` (an
-attached engine is only detached, never killed).
+| Variable | Meaning |
+| --- | --- |
+| `GLADIUS_OBSCURA` | Explicit Obscura engine binary path; overrides the sibling-of-exe default lookup. |
+| `GLADIUS_STARTUP_TIMEOUT_SECS` | Owned-engine readiness deadline (default 30). |
+| `GLADIUS_CDP_URL` | Attach instead of launching: a `ws://` or `wss://` endpoint, or an `http://`/`https://` base resolved via `GET <base>/json/version`. The attached engine is NOT owned: `close` detaches the CDP session gladius opened and leaves the external process running. |
+| `GLADIUS_BACKEND_CAPS` | `render` (default) or `dom-only`. With `dom-only` there is no rendering pipeline: `screenshot` refuses with a typed error instead of a fake image (`upload` needs no rendering — DOM CDP only — so it keeps working). `initialize` reports `serverInfo.backend` (`obscura` or `external-cdp`) and `serverInfo.caps` (`render` or `dom-only`). |
 
-Environment:
-
-- `GLADIUS_OBSCURA` — explicit Obscura engine binary path (overrides the
-  default sibling lookup).
-- `GLADIUS_STARTUP_TIMEOUT_SECS` — owned-engine readiness deadline (default 30).
-- `GLADIUS_CDP_URL` — attach instead of launching: a `ws://`/`wss://` endpoint
-  to connect to, or an `http://`/`https://` base resolved via
-  `GET <base>/json/version`. The attached engine is NOT owned: `close`
-  detaches the CDP session gladius opened and leaves the external process
-  running; gladius creates no profile and kills nothing.
-- `GLADIUS_BACKEND_CAPS` — `render` (default) or `dom-only`. With `dom-only`
-  there is no rendering pipeline: `screenshot` refuses with a typed error
-  instead of returning a fake image (`upload` needs no rendering — DOM CDP
-  only — so it keeps working). `initialize` reports
-  `serverInfo.backend` (`obscura` or `external-cdp`) and
-  `serverInfo.caps` (`render` or `dom-only`).
+On `wss://`: the client TLS stack is compiled in (rustls) so a `wss://`
+endpoint is accepted. A live `ws://` attach is proven end-to-end; `wss://` is
+verified only to the TLS-handshake stage against loopback — a full trusted
+`wss://` session is not yet proven.
 
 ## Build from source
 
-Prerequisite: a stable Rust toolchain (`rustup`).
+Prerequisite: a stable Rust toolchain (`rustup`). MSRV is **1.88**
+(`Cargo.toml`, the lockfile-coherent floor).
 
 ```powershell
 cargo build --release
@@ -179,8 +178,29 @@ target\release\gladius.exe selftest # internal end-to-end check, exits 0 on pass
 Verify:
 
 ```powershell
-cargo test --release -- --nocapture
+cargo test
+cargo clippy --all-targets
 target\release\gladius.exe selftest
+```
+
+## Releases
+
+No release is published yet — the repository owns no tag and no GitHub
+release. When one is deliberately cut from a `v*` tag, the release workflow
+(`.github/workflows/release.yml`) will build the binaries, run the suite
+against the provisioned engine, assemble
+`gladius-<tag>-windows-x86_64.zip`, and attach a matching `.sha256`. The zip
+is a 7-file bundle:
+
+- `gladius.exe`, `obscura.exe`, `obscura-worker.exe`
+- `LICENSE`, `THIRD-PARTY-NOTICES.md`, `README.md`
+- `THIRD-PARTY-LICENSES/Apache-2.0.txt`
+
+Keep the three `.exe` files together in one directory. Verify a downloaded zip
+with its `.sha256`:
+
+```powershell
+(Get-FileHash -Algorithm SHA256 gladius-<tag>-windows-x86_64.zip).Hash.ToLowerInvariant() -eq (Get-Content gladius-<tag>-windows-x86_64.zip.sha256).Split()[0]
 ```
 
 ## Docs
@@ -192,7 +212,14 @@ target\release\gladius.exe selftest
 
 ## Status
 
-**Unverified** — as-is, use at your own risk.
+**Verified 2026-10-13** at `4e9b92d` (working tree):
+
+- `cargo test` — 59 passed, 0 failed (exit 0)
+- `cargo build --release` — finished (exit 0)
+- release `gladius.exe selftest` from a temp dir with the engines beside the exe — `SELFTEST: ALL PASS` (exit 0)
+- `cargo clippy --all-targets` — 0 warnings (exit 0)
+
+Windows x64 only. Use at your own risk beyond the checks above.
 
 ## License
 

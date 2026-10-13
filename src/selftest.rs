@@ -31,21 +31,19 @@ pub async fn run() -> i32 {
     let b = Browser::new();
 
     // navigate
-    let nav_text = match crate::tools::call(
+    let v = crate::tools::call(
         "navigate",
         &serde_json::json!({"url": url}),
         &b,
     )
-    .await
-    {
-        v => v
-            .get("content")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("text"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .to_string(),
-    };
+    .await;
+    let nav_text = v
+        .get("content")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
     check("navigate", nav_text.contains("Gladius Fixture"), &nav_text);
 
     // snapshot contains marker

@@ -110,7 +110,7 @@ impl From<String> for ToolErr {
 ///   timeout          reason budget_exceeded                   (+ tool)
 ///   invalid_args     reason missing_arg|bad_index|unknown_action|unknown_tool|need_option
 ///   error            fallback, code only (cdp/js-engine failures and anything untyped)
-
+///
 /// Dispatch a tool call. Always returns the MCP result object
 /// (`{"content": [...]}` with optional `isError`); tool failures are NOT
 /// protocol errors.
@@ -712,9 +712,10 @@ async fn tool_click(browser: &Browser, element: &str) -> Result<Value, ToolErr> 
             // this 3s presence cap into a 30s `send_raw` timeout.
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let probe = format!("(!!document.querySelector({sel}))");
-            match tokio::time::timeout(remaining, browser.eval(&probe)).await {
-                Ok(Ok(Value::Bool(true))) => break,
-                _ => {}
+            if let Ok(Ok(Value::Bool(true))) =
+                tokio::time::timeout(remaining, browser.eval(&probe)).await
+            {
+                break;
             }
             if std::time::Instant::now() >= deadline {
                 break;
@@ -785,16 +786,13 @@ async fn click_settle(browser: &Browser, state: &str) {
             browser.wait_for_load(std::time::Duration::from_secs(10)).await;
             return;
         }
-        match browser.eval("[location.href, document.readyState]").await {
-            Ok(v) => {
-                let href = v.get(0).and_then(|x| x.as_str()).unwrap_or(h0);
-                let cur = v.get(1).and_then(|x| x.as_str()).unwrap_or("complete");
-                if href != h0 || cur != "complete" {
-                    browser.wait_for_load(std::time::Duration::from_secs(10)).await;
-                    return;
-                }
+        if let Ok(v) = browser.eval("[location.href, document.readyState]").await {
+            let href = v.get(0).and_then(|x| x.as_str()).unwrap_or(h0);
+            let cur = v.get(1).and_then(|x| x.as_str()).unwrap_or("complete");
+            if href != h0 || cur != "complete" {
+                browser.wait_for_load(std::time::Duration::from_secs(10)).await;
+                return;
             }
-            _ => {}
         }
         if std::time::Instant::now() >= deadline {
             return;

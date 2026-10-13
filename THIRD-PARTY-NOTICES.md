@@ -14,4 +14,4 @@ bundles the following third-party component beside `gladius.exe`:
   [`scripts/fetch-engine.ps1`](scripts/fetch-engine.ps1) (zip, binary, and
   size pins live in that script).
 - **License:** Apache-2.0, per the upstream project. The full license text is
-  not reproduced here — see the upstream repository.
+  bundled at [`THIRD-PARTY-LICENSES/Apache-2.0.txt`](THIRD-PARTY-LICENSES/Apache-2.0.txt).

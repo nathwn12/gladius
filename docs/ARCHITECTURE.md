@@ -9,15 +9,22 @@
 
 | name | args | returns |
 |---|---|---|
-| `navigate` | `url: string` | `{ ok: true, url }` after load event (timeout -> error) |
-| `snapshot` | `compact?: bool` (default true) | accessibility/DOM-tree text of the current page |
-| `screenshot` | `full_page?: bool` (default false) | PNG bytes (base64 in JSON-RPC) of viewport / full page |
-| `click` | `selector: string` (css, xpath:, or text:) | `{ ok: true }` after click dispatches |
-| `type` | `selector: string, text: string, submit?: bool` | `{ ok: true }` after keystrokes (+Enter if submit) |
-| `evaluate` | `expression: string` | JSON-serialised JS result |
-| `wait_for` | `text?: string, timeout_ms?: number` | `{ ok: true }` when text appears or timeout elapses |
-| `fetch_text` | `url?: string` (default: current page) | rendered text content (readability-style, no tags) |
-| `close` | - | `{ ok: true }`; reaps the browser process tree (or detaches from an attached external engine, leaving it running) |
+| `navigate` | `url: string` | text after load event (timeout -> error) |
+| `snapshot` | `mode?: string` (default AX) | AX tree: one line per actionable node with a stable ref (`@e1`, `@e2`, ...), role/name/value, plus page text (capped 8000 chars); `mode:"text"` = legacy text-only output |
+| `screenshot` | `fullPage?: bool` (default false) | PNG bytes (base64 `image` part) of viewport / full page; refuses under `dom-only` |
+| `click` | `element: string` (CSS, or AX ref `@eN`) | `{ ok: true }` after click dispatches |
+| `type` | `element: string, text: string, submit?: bool` | `{ ok: true }` after keystrokes (+Enter if submit) |
+| `evaluate` | `expression: string` | JSON-serialised JS result (`undefined` -> tool error, distinct from explicit `null`) |
+| `wait_for` | `selector?, text?, ms?, networkIdle?: bool, idleMs?: number` | `{ ok: true }` when the condition holds or timeout elapses (max 15s) |
+| `console` | `action?: get\|drain\|clear, limit?: number` | buffered console messages + uncaught exceptions (ring buffer, cap 200) |
+| `upload` | `element: string, paths: string[]` | `{ ok: true }` after setting files on an `<input type=file>` |
+| `fetch_text` | `url: string` | fast path: plain HTTP GET with NO browser; HTML stripped to text (readability-style, no tags) |
+| `hover` | `element: string` (CSS, or AX ref `@eN`) | `{ ok: true }` after hover |
+| `select` | `element: string, value?: string, text?: string` | `{ ok: true }` after choosing a `<select>` option by value (preferred) or visible text |
+| `key` | `key: string` (Enter, Tab, Escape, ...) | `{ ok: true }` after the named key press on the focused element |
+| `tabs` | `action: string, url?: string, index?: number` | tab list / mutation result (list, new, close, select) |
+| `close` | - | `{ ok: true }`; reaps the owned browser process tree (or detaches from an attached external engine, leaving it running) |
+
 
 Rules: tools are **dumb primitives** - no planner, no LLM, no judgement-retries in the server
 (RESEARCH rule 7). Selector grammar is deliberately tiny; anything fancier goes through `evaluate`.
@@ -47,9 +54,10 @@ gladius opened and never kills, never sweeps. `GLADIUS_BACKEND_CAPS` declares `r
 
 ## 3. MCP stdio frame shape
 
-- Transport: **JSON-RPC 2.0 over stdio, newline-delimited** (one message per line), via the
-  official Rust SDK `rmcp` (https://github.com/modelcontextprotocol/rust-sdk) - no hand-rolled framing.
-- Lifecycle: `initialize` -> `tools/list` (exactly the 9 tools above) -> `tools/call` ->
+- Transport: **JSON-RPC 2.0 over stdio, newline-delimited** (one message per line) -
+  **hand-rolled** in `src/mcp.rs` over `tokio` stdio and `serde_json`: no `rmcp` SDK, no
+  external framing crate. STDOUT carries only protocol frames; all logs go to STDERR.
+- Lifecycle: `initialize` -> `tools/list` (exactly the 15 tools above) -> `tools/call` ->
   stdio EOF / `close` -> shutdown.
 - Each `tools/call` response is `{ content: [{ type: "text"|"image", ... }] }` per MCP content
   convention; `screenshot` returns an `image` part (base64 PNG), everything else `text`.
