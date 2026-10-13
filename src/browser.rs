@@ -799,6 +799,23 @@ impl Drop for Browser {
     }
 }
 
+/// Owns one pending-map slot for the lifetime of the call that inserted it.
+/// A dropped call future (a caller's `tokio::time::timeout` clipping it, a
+/// cancelled task, an aborted wait) removes its own entry here, so a `tx`
+/// can never outlive the call that created it: `send_raw_with_timeout`'s
+/// timeout path is NOT the only exit. A late response finds no entry - the
+/// reader removed it first and a second removal is a no-op.
+struct PendingGuard {
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    id: u64,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
 async fn send_raw(
     shared: &Arc<Shared>,
     method: &str,
@@ -828,10 +845,15 @@ async fn send_raw_with_timeout(
     let text = Value::Object(envelope).to_string();
     let (tx, rx) = oneshot::channel();
     shared.pending.lock().unwrap().insert(id, tx);
+    // Every exit from here on - including a dropped future - clears the entry
+    // (the old explicit removals below covered only two of the exits).
+    let _guard = PendingGuard {
+        pending: shared.pending.clone(),
+        id,
+    };
     {
         let mut sink = shared.sink.lock().await;
         if let Err(e) = sink.send(Message::Text(text.into())).await {
-            shared.pending.lock().unwrap().remove(&id);
             return Err(format!("ws send: {e}"));
         }
     }
@@ -843,14 +865,10 @@ async fn send_raw_with_timeout(
             Ok(resp.get("result").cloned().unwrap_or(Value::Null))
         }
         Ok(Err(_)) => Err("cdp: response channel closed".to_string()),
-        Err(_) => {
-            // Timeout path: drop the pending entry, mirroring the send-error
-            // path above. Without this, one `tx` leaks per unanswered call
-            // (a late response is the only other removal, and a dead peer
-            // never sends one).
-            shared.pending.lock().unwrap().remove(&id);
-            Err("cdp: response timeout".to_string())
-        }
+        // Timeout path: the entry is removed by `_guard`'s drop, so one
+        // unanswered call never leaves a `tx` behind (a late response is the
+        // only other exit, and a dead peer never sends one).
+        Err(_) => Err("cdp: response timeout".to_string()),
     }
 }
 
@@ -1994,6 +2012,32 @@ mod tests {
         rig.shutdown().await;
     }
 
+    /// Clipping a call from OUTSIDE (`tokio::time::timeout` around it) drops
+    /// the call future mid-await, which the call's own timeout path never
+    /// sees: the pending slot must still be cleared, or every clipped call
+    /// leaks one `tx` that a peer holding the response never answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clipped_call_leaves_no_pending_entry() {
+        let rig = rig().await;
+        let clipped = tokio::time::timeout(
+            Duration::from_millis(50),
+            send_raw_with_timeout(
+                &rig.shared,
+                "Page.enable",
+                json!({}),
+                None,
+                Duration::from_secs(30),
+            ),
+        )
+        .await;
+        assert!(clipped.is_err(), "the outer clip must fire: {clipped:?}");
+        assert!(
+            rig.shared.pending.lock().unwrap().is_empty(),
+            "a dropped call leaked its pending entry"
+        );
+        rig.shutdown().await;
+    }
+
     /// F5 proof: `wait_for_load(100ms)` against a never-answering peer must
     /// return in ~100ms, not after `send_raw`'s 30s per-call timeout. Pre-fix
     /// the eval is unwrapped, so this blocks ~30s and fails the bound below.
@@ -2010,6 +2054,55 @@ mod tests {
             "soft cap bypassed by unwrapped eval: took {dt:?}"
         );
         rig.shutdown().await;
+    }
+
+    /// P2 regression: `wait_for` honors its OWN budget while the lazy
+    /// `Network.enable` enable is still outstanding. The peer answers the
+    /// attach flow (so the CDP session is established) and then holds the
+    /// `Network.enable` response forever: pre-fix the unwrapped await paid
+    /// `send_raw`'s 30s per-call timeout, so a 100ms wait answered ~300x
+    /// late, with a raw CDP error instead of the typed timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_network_idle_honors_budget_when_enable_is_held() {
+        let fake = fake_cdp_withholding(&["Network.enable"]).await;
+        let inner = attach(&fake.ws_url).await.expect("attach over ws");
+        let b = wrap_attached(inner);
+        assert!(
+            b.eval("1+1").await.is_ok(),
+            "session established before the wait"
+        );
+        let t0 = Instant::now();
+        let r = crate::tools::call("wait_for", &json!({"networkIdle": true, "ms": 100}), &b).await;
+        let dt = t0.elapsed();
+        assert!(r.get("isError").is_some(), "a held enable is not idle: {r}");
+        assert_eq!(
+            r.get("structuredContent")
+                .and_then(|s| s.get("code"))
+                .and_then(|c| c.as_str()),
+            Some("timeout"),
+            "budget exhaustion must be the typed timeout: {r}"
+        );
+        assert!(
+            dt >= Duration::from_millis(90),
+            "budget honored, took {dt:?}"
+        );
+        assert!(dt < Duration::from_secs(3), "budget honored, took {dt:?}");
+        // The clip DROPS the enable future: its pending slot must not outlive
+        // it (a peer that never answers would otherwise grow the map per call).
+        assert!(
+            b.shared()
+                .await
+                .expect("shared")
+                .pending
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "clipped enable left a pending entry behind"
+        );
+        b.close().await.expect("detach close");
+        for t in fake.tasks {
+            t.abort();
+        }
     }
 
     /// F4 proof: `console_drain` (single-lock take-and-return) against a
@@ -2105,6 +2198,15 @@ mod tests {
     }
 
     async fn fake_cdp() -> FakeCdp {
+        fake_cdp_withholding(&[]).await
+    }
+
+    /// Same fake engine, except every method in `withheld` is answered with
+    /// silence (no response frame at all): the caller's per-call timeout is
+    /// the only thing that can end that call. Used to hold one specific CDP
+    /// call open without breaking the rest of the flow.
+    async fn fake_cdp_withholding(withheld: &[&str]) -> FakeCdp {
+        let withheld: Vec<String> = withheld.iter().map(|m| m.to_string()).collect();
         let detach_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ln = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2114,6 +2216,7 @@ mod tests {
         let srv = tokio::spawn(async move {
             while let Ok((s, _)) = ln.accept().await {
                 let flag = flag.clone();
+                let withheld = withheld.clone();
                 tokio::spawn(async move {
                     let mut ws = match tokio_tungstenite::accept_async(s).await {
                         Ok(w) => w,
@@ -2134,6 +2237,9 @@ mod tests {
                             None => continue,
                         };
                         let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        if withheld.iter().any(|w| w == method) {
+                            continue; // held open: never answer
+                        }
                         if method == "Target.detachFromTarget" {
                             flag.store(true, Ordering::SeqCst);
                         }

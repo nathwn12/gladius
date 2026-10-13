@@ -86,6 +86,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - New `self_containment_no_foreign_engine_in_src` guard test: fails the build
   if any chrome/ms-playwright/playwright reference reappears in `src/`,
   alongside the `no_console_flash` windowless-spawn guard.
+- `wait_for` hard deadline holds across the lazy network snapshot: the
+  `Network.enable` / `Fetch.enable` enable was awaited OUTSIDE the deadline,
+  so a peer holding the `Network.enable` response made a 100 ms
+  `networkIdle` wait answer after `send_raw`'s 30 s per-call timeout, with a
+  raw CDP error instead of the typed `timeout`/`budget_exceeded`. The enable
+  now sits inside the remaining budget; a genuine CDP failure still reports
+  its own message.
+- No leaked CDP response slots on a dropped call: a pending-map entry is now
+  owned by a guard whose drop removes it, so clipping a call (that enable, a
+  caller's timeout, a cancelled task) can no longer leave one stale entry per
+  call behind.
+- README copy block: the destination directory is created as part of the
+  example (`Copy-Item` creates the files, never the destination directory),
+  and the example no longer names an absolute machine path.
 
 ## [0.1.0] - 2026-10-11
 

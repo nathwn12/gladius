@@ -76,8 +76,10 @@ one of:
 
 ```powershell
 # copy the engine + binary into one directory and run from there
-Copy-Item target\release\gladius.exe, bin\obscura.exe, bin\obscura-worker.exe -Destination C:\tools\gladius
-C:\tools\gladius\gladius.exe mcp
+# (Copy-Item creates the files, not the destination directory)
+New-Item -ItemType Directory -Force -Path gladius-dist | Out-Null
+Copy-Item target\release\gladius.exe, bin\obscura.exe, bin\obscura-worker.exe -Destination gladius-dist
+gladius-dist\gladius.exe mcp
 
 # or keep the repo layout and point GLADIUS_OBSCURA at the provisioned engine
 $env:GLADIUS_OBSCURA = "bin\obscura.exe"
