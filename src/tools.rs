@@ -1052,9 +1052,9 @@ async fn tool_wait_for(
 ) -> Result<Value, ToolErr> {
     let budget_ms: i64 = ms.unwrap_or(5000).clamp(0, 15000);
     let budget = std::time::Duration::from_millis(budget_ms.max(0) as u64);
-    // ms:0 is a no-op: return immediately without any CDP round-trip
-    // (unchanged legacy path; a zero-budget network-idle wait below still
-    // runs its one immediate quiet check).
+    // ms:0 is a no-op: return immediately without any CDP round-trip. The
+    // network-idle path keeps its own zero-budget behavior below, where the
+    // lazy enable is inside the deadline like every other await.
     if budget_ms == 0 && !network_idle {
         return Ok(ok_text(json!({"ok": true}).to_string()));
     }
@@ -1123,7 +1123,21 @@ async fn tool_wait_for(
         // continuous quiet. Never hangs - expiry is the typed timeout.
         let idle_win =
             std::time::Duration::from_millis(idle_ms.unwrap_or(500).clamp(0, 5000).max(0) as u64);
-        browser.ensure_network().await?;
+        // The lazy `Network.enable` / `Fetch.enable` enable is INSIDE the
+        // deadline as well. Each of its CDP calls allows `send_raw`'s 30s
+        // per-call timeout - double the largest budget this tool accepts
+        // (15s) - so with an established session and a peer holding the
+        // `Network.enable` response the unwrapped await answered a 100ms
+        // wait ~300x late (as a raw CDP error) instead of the typed timeout.
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match tokio::time::timeout(remaining, browser.ensure_network()).await {
+            Ok(Ok(())) => {}
+            // Budget spent while the enable was still outstanding: no quiet
+            // window can be observed inside `ms`, so the budget IS the answer.
+            Err(_) => return Err(wait_timeout()),
+            // A real CDP failure keeps its own message (the pre-fix `?`).
+            Ok(Err(e)) => return Err(e.into()),
+        }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if !browser.wait_network_idle(idle_win, remaining).await {
             return Err(wait_timeout());
