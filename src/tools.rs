@@ -40,6 +40,12 @@ pub fn list() -> Value {
              "required": ["element"]}},
         {"name": "key", "description": "Press a named key (Enter, Tab, Escape, Backspace, ArrowDown, ...) on the focused element",
          "inputSchema": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}},
+        {"name": "viewport", "description": "Set the page viewport in CSS pixels (Emulation.setDeviceMetricsOverride) and return the applied metrics plus a live read-back of window.innerWidth/innerHeight/devicePixelRatio, so an override the engine ignored cannot read as success. reset:true clears the override and restores the engine default (width/height are then ignored). The override is replayed on every new tab.",
+         "inputSchema": {"type": "object", "properties": {
+             "width": {"type": "integer"}, "height": {"type": "integer"},
+             "deviceScaleFactor": {"type": "number"}, "mobile": {"type": "boolean"},
+             "reset": {"type": "boolean"}},
+             "required": ["width", "height"]}},
         {"name": "tabs", "description": "List, open, close, or select browser tabs (pages)",
          "inputSchema": {"type": "object", "properties": {
              "action": {"type": "string"}, "url": {"type": "string"}, "index": {"type": "integer"}},
@@ -108,7 +114,7 @@ impl From<String> for ToolErr {
 ///   option_not_found reason no_match                         (+ tool, want)
 ///   capability_gated reason dom_only                         (+ tool)
 ///   timeout          reason budget_exceeded                   (+ tool)
-///   invalid_args     reason missing_arg|bad_index|unknown_action|unknown_tool|need_option
+///   invalid_args     reason missing_arg|bad_value|bad_index|unknown_action|unknown_tool|need_option
 ///   error            fallback, code only (cdp/js-engine failures and anything untyped)
 ///
 /// Dispatch a tool call. Always returns the MCP result object
@@ -275,6 +281,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
             };
             tool_key(browser, &key).await
         }
+        "viewport" => tool_viewport(browser, args).await,
         "tabs" => {
             let action = match args.get("action").and_then(|v| v.as_str()) {
                 Some(a) => a.to_string(),
@@ -1383,6 +1390,98 @@ async fn tool_key(browser: &Browser, key: &str) -> Result<Value, ToolErr> {
         .command("Input.dispatchKeyEvent", Value::Object(up), true)
         .await?;
     Ok(ok_text(json!({"ok": true}).to_string()))
+}
+
+/// `viewport`: set (or clear) the CDP device-metrics override on the active
+/// page. The reply always carries the LIVE read-back of
+/// `window.innerWidth` / `window.innerHeight` / `window.devicePixelRatio`
+/// next to what was requested, so an override the engine accepted but
+/// ignored shows up as `"matched": false` instead of a false success.
+async fn tool_viewport(browser: &Browser, args: &Value) -> Result<Value, ToolErr> {
+    if args.get("reset").and_then(|v| v.as_bool()).unwrap_or(false) {
+        browser.viewport_reset().await?;
+        let (w, h, dpr) = browser.viewport_readback().await?;
+        return Ok(ok_text(
+            json!({
+                "reset": true,
+                "applied": Value::Null,
+                "readback": {"innerWidth": w, "innerHeight": h, "devicePixelRatio": dpr},
+                "note": "override cleared; the read-back above is the engine default for this page",
+            })
+            .to_string(),
+        ));
+    }
+    // Positive integers only: a zero/negative viewport is not a smaller
+    // page, it is a silent no-op (or an engine error) - refuse it instead
+    // of reporting a size that will never be honoured.
+    let dim = |name: &str| -> Result<i64, ToolErr> {
+        let v = args.get(name).ok_or_else(|| {
+            ToolErr::typed(
+                format!("viewport: missing required arg '{name}'"),
+                json!({"code": "invalid_args", "reason": "missing_arg", "tool": "viewport"}),
+            )
+        })?;
+        // JSON numbers arrive as int or float depending on the client
+        // (1440 vs 1440.0); accept an integral float, reject the rest.
+        let n = match v.as_i64() {
+            Some(n) => n,
+            None => match v.as_f64() {
+                Some(f) if f.fract() == 0.0 => f as i64,
+                _ => {
+                    return Err(ToolErr::typed(
+                        format!("viewport: '{name}' must be an integer, got {v}"),
+                        json!({"code": "invalid_args", "reason": "bad_value", "tool": "viewport"}),
+                    ));
+                }
+            },
+        };
+        if n < 1 {
+            return Err(ToolErr::typed(
+                format!("viewport: '{name}' must be >= 1, got {n}"),
+                json!({"code": "invalid_args", "reason": "bad_value", "tool": "viewport"}),
+            ));
+        }
+        Ok(n)
+    };
+    let width = dim("width")?;
+    let height = dim("height")?;
+    let dsf = match args.get("deviceScaleFactor") {
+        None | Some(Value::Null) => 1.0,
+        Some(v) => match v.as_f64() {
+            Some(f) if f > 0.0 => f,
+            _ => {
+                return Err(ToolErr::typed(
+                    format!("viewport: 'deviceScaleFactor' must be a number > 0, got {v}"),
+                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "viewport"}),
+                ));
+            }
+        },
+    };
+    let mobile = args
+        .get("mobile")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let params = json!({
+        "width": width,
+        "height": height,
+        "deviceScaleFactor": dsf,
+        "mobile": mobile,
+    });
+    browser.viewport_set(params).await?;
+    let (w, h, dpr) = browser.viewport_readback().await?;
+    Ok(ok_text(
+        json!({
+            "applied": {
+                "width": width,
+                "height": height,
+                "deviceScaleFactor": dsf,
+                "mobile": mobile,
+            },
+            "readback": {"innerWidth": w, "innerHeight": h, "devicePixelRatio": dpr},
+            "matched": w == width && h == height,
+        })
+        .to_string(),
+    ))
 }
 
 async fn tool_tabs(
