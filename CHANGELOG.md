@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+- New `viewport` tool: the page viewport is now settable in CSS pixels
+  (`width`, `height` required; `deviceScaleFactor` default 1; `mobile`
+  default false) over CDP `Emulation.setDeviceMetricsOverride`, with
+  `reset:true` clearing it via `Emulation.clearDeviceMetricsOverride` and
+  restoring the engine default. Every call returns the LIVE read-back of
+  `window.innerWidth`/`window.innerHeight`/`window.devicePixelRatio` beside
+  the requested metrics (`matched:false` when the engine did not honour the
+  request), so a silently ignored override can never read as success. The
+  override is session-scoped in CDP, so it is REPLAYED on every new session
+  (`attach_to`): a later `navigate` or a new tab keeps it. Measured engine
+  default (obscura v0.2.4): **1280x720** — the "fixed 800x600-ish default"
+  claim in `docs/OPT-SURVEY.md` was wrong. Tool count 15 -> 16.
+
 - Machine-readable error contract: every tool error now carries a stable
   `structuredContent` object alongside the existing prose, which is
   byte-for-byte unchanged in `content[0].text`. Each error site mints its

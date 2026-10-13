@@ -95,6 +95,13 @@ struct Shared {
     net_inflight: AsyncMutex<HashSet<String>>,
     net_notify: tokio::sync::Notify,
     net_enabled: AsyncMutex<bool>,
+    /// Active device-metrics override (`Emulation.setDeviceMetricsOverride`
+    /// params), or None when the engine default applies. The override is a
+    /// property of the CDP SESSION, not of the connection, so it is
+    /// replayed by `attach_to` on every new session (new tab, re-attach):
+    /// without the replay a fresh tab would silently revert to the engine
+    /// default while the caller still believed the viewport was set.
+    viewport: AsyncMutex<Option<Value>>,
 }
 
 /// Ownership of the engine behind an `Inner` connection.
@@ -209,6 +216,7 @@ fn new_shared(sink: WsSink) -> Arc<Shared> {
         net_inflight: AsyncMutex::new(HashSet::new()),
         net_notify: tokio::sync::Notify::new(),
         net_enabled: AsyncMutex::new(false),
+        viewport: AsyncMutex::new(None),
     })
 }
 
@@ -411,6 +419,60 @@ impl Browser {
     pub async fn tabs_list(&self) -> Result<Value, String> {
         let shared = self.shared().await?;
         tabs_object(&shared).await
+    }
+
+    /// Apply a device-metrics override to the ACTIVE page
+    /// (`Emulation.setDeviceMetricsOverride`) and remember it, so every
+    /// later session on this connection (new tab, re-attach) replays it.
+    /// Returns the raw CDP result (kept so a caller can see what the engine
+    /// acknowledged, though the tool reports the live read-back instead).
+    pub async fn viewport_set(&self, params: Value) -> Result<Value, String> {
+        let shared = self.shared().await?;
+        let session = ensure_session(&shared).await?;
+        let r = send_raw(
+            &shared,
+            "Emulation.setDeviceMetricsOverride",
+            params.clone(),
+            Some(session),
+        )
+        .await?;
+        *shared.viewport.lock().await = Some(params);
+        Ok(r)
+    }
+
+    /// Clear the override on the active page
+    /// (`Emulation.clearDeviceMetricsOverride`) and forget it, so a later
+    /// new tab also gets the engine default.
+    pub async fn viewport_reset(&self) -> Result<Value, String> {
+        let shared = self.shared().await?;
+        let session = ensure_session(&shared).await?;
+        *shared.viewport.lock().await = None;
+        send_raw(
+            &shared,
+            "Emulation.clearDeviceMetricsOverride",
+            json!({}),
+            Some(session),
+        )
+        .await
+    }
+
+    /// Live `(innerWidth, innerHeight, devicePixelRatio)` from the active
+    /// page. Every viewport call returns this read-back, so an override the
+    /// engine silently ignored can never read as success.
+    pub async fn viewport_readback(&self) -> Result<(i64, i64, f64), String> {
+        let v = self
+            .eval("[window.innerWidth, window.innerHeight, window.devicePixelRatio]")
+            .await?;
+        let arr = v
+            .as_array()
+            .ok_or("viewport: read-back was not an array".to_string())?;
+        let num = |i: usize| arr.get(i).and_then(|x| x.as_f64());
+        let w = num(0).ok_or("viewport: no window.innerWidth in read-back".to_string())?;
+        let h = num(1).ok_or("viewport: no window.innerHeight in read-back".to_string())?;
+        // devicePixelRatio is reported, never asserted: an engine that does
+        // not emulate the scale still reports a usable size.
+        let dpr = num(2).unwrap_or(1.0);
+        Ok((w as i64, h as i64, dpr))
     }
 
     pub async fn tabs_new(&self, url: Option<&str>) -> Result<Value, String> {
@@ -923,6 +985,21 @@ async fn attach_to(shared: &Arc<Shared>, target_id: &str) -> Result<String, Stri
     // two string compares per event, i.e. no steady-state cost.
     let _ = send_raw(shared, "Runtime.enable", json!({}), Some(sid.clone())).await;
     let _ = send_raw(shared, "Log.enable", json!({}), Some(sid.clone())).await;
+    // Replay an active device-metrics override onto THIS session. The
+    // override is session-scoped, so a new tab / re-attach would otherwise
+    // observe (and report) the engine default while the caller still holds
+    // the numbers it set. Best-effort like the enables above: a replay
+    // failure is NOT silent - the next read-back reports the real size.
+    let pending_viewport = shared.viewport.lock().await.clone();
+    if let Some(params) = pending_viewport {
+        let _ = send_raw(
+            shared,
+            "Emulation.setDeviceMetricsOverride",
+            params,
+            Some(sid.clone()),
+        )
+        .await;
+    }
     Ok(sid)
 }
 

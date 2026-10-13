@@ -28,9 +28,9 @@ inside the binary.
 
 ## Tools
 
-15 tools over the active page, listed here in the order `tools/list` emits
+16 tools over the active page, listed here in the order `tools/list` emits
 them (`src/tools.rs`). `fetch_text` is the browser-free fast path and is one
-of these 15 — not an extra:
+of these 16 — not an extra:
 
 - `navigate` — navigate the active page to a URL.
 - `snapshot` — AX snapshot: one line per actionable node with a stable ref (`@e1`, `@e2`, …), role/name/value, plus page text. Pass `{"mode":"text"}` for the legacy text-only output; slices page text in-page before transfer, then caps at 8000 chars.
@@ -45,6 +45,7 @@ of these 15 — not an extra:
 - `hover` — hover over an element by CSS selector or AX ref.
 - `select` — choose a `<select>` option by `value` (preferred) or visible `text`.
 - `key` — press a named key (Enter, Tab, Escape, Backspace, ArrowDown, …) on the focused element.
+- `viewport` — set the page viewport in CSS pixels (`width`, `height`, optional `deviceScaleFactor` default 1 and `mobile` default false) over `Emulation.setDeviceMetricsOverride`, and return the applied metrics next to a live read-back of `window.innerWidth`/`innerHeight`/`devicePixelRatio` (`matched` is false when the engine did not honour the request). `reset:true` clears the override and restores the engine default. The override is replayed on every new tab.
 - `tabs` — list, open, close, or select browser tabs.
 - `close` — shut down the owned browser process tree, or detach from an attached external engine (which is left running).
 
