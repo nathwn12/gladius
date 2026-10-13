@@ -26,6 +26,10 @@ jobs:
           $stage = "dist\gladius-$tag-windows-x86_64"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
           Copy-Item target\release\gladius.exe, bin\obscura.exe, bin\obscura-worker.exe, LICENSE, THIRD-PARTY-NOTICES.md, README.md -Destination $stage
+          # Preserve the documented layout: the engine license must land under
+          # THIRD-PARTY-LICENSES/ in the zip, not flattened to the root.
+          New-Item -ItemType Directory -Path "$stage\THIRD-PARTY-LICENSES" -Force | Out-Null
+          Copy-Item THIRD-PARTY-LICENSES\Apache-2.0.txt -Destination "$stage\THIRD-PARTY-LICENSES"
           $zip = "$stage.zip"
           Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
           $hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()

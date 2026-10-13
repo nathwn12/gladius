@@ -54,8 +54,7 @@ fn html_to_text(html: &str) -> String {
     let mut in_tag = false;
     let mut tag_buf = String::new();
     let mut skip: Option<&str> = None; // "script" | "style"
-    let mut chars = html.chars();
-    while let Some(c) = chars.next() {
+    for c in html.chars() {
         if in_tag {
             if c == '>' {
                 in_tag = false;

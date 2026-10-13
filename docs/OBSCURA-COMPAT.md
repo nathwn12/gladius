@@ -179,3 +179,15 @@ Definitional mismatches are named per row, never suppressed.
 The navigate row is an explicit refusal: presenting those two columns as a
 speedup would compare cold spawn against a warm socket. They are reported here
 only so nobody else makes that comparison.
+
+## 7. Network-idle emission via Fetch interception (2026-10-13)
+
+Network-idle waits enable CDP `Fetch` interception (wildcard `urlPattern:
+"*"`) beside `Network.enable`; gladius auto-continues every
+`Fetch.requestPaused` immediately, transparent to page behavior. Reason: on
+this engine a JS request's Network event triple stays buffered until the
+response is received, so a held response never surfaces a start-time
+`requestWillBeSent` and a network-idle wait would false-idle - Fetch routing
+is the engine's only start-time emission path. Paths that never call a
+network-idle wait are untouched; once enabled, each request pays one extra
+`Fetch.continueRequest` round-trip.

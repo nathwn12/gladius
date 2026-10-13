@@ -110,7 +110,7 @@ enum Engine {
     Owned {
         #[cfg(windows)]
         _job: Option<std::os::windows::io::OwnedHandle>,
-        child: tokio::process::Child,
+        child: Box<tokio::process::Child>,
         pid: u32,
     },
     Attached {
@@ -728,7 +728,24 @@ impl Browser {
             return Ok(());
         }
         let session = ensure_session(&shared).await?;
-        send_raw(&shared, "Network.enable", json!({}), Some(session)).await?;
+        send_raw(&shared, "Network.enable", json!({}), Some(session.clone())).await?;
+        // This engine only emits `Network.requestWillBeSent` at request START
+        // when the request passes through CDP Fetch interception: without it
+        // (measured on Obscura) a JS `fetch` buffers its whole Network event
+        // triple in engine state and releases it only once the response is
+        // received, so a request whose server holds the response open is
+        // invisible and `wait_network_idle` sees an empty set. Enable Fetch
+        // interception for all URLs so the request id lands in `net_inflight`
+        // at start; the reader auto-continues every paused request, so this is
+        // transparent to page behavior and only pays a bounded extra
+        // round-trip while a network-idle wait is live.
+        send_raw(
+            &shared,
+            "Fetch.enable",
+            json!({"patterns": [{"urlPattern": "*"}]}),
+            Some(session),
+        )
+        .await?;
         *shared.net_enabled.lock().await = true;
         Ok(())
     }
@@ -1211,6 +1228,36 @@ async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
             }
             continue;
         }
+        // Fetch interception (enabled lazily with the Network domain so the
+        // engine reports `Network.requestWillBeSent` at request START, not at
+        // response). The engine waits for a resolution per paused request;
+        // continue immediately, fire-and-forget, so page behavior is
+        // unchanged. The matching `requestWillBeSent` still lands the id in
+        // `net_inflight` while the request is genuinely live.
+        if v.get("method").and_then(|m| m.as_str()) == Some("Fetch.requestPaused") {
+            if let Some(rid) = v
+                .get("params")
+                .and_then(|p| p.get("requestId"))
+                .and_then(|r| r.as_str())
+            {
+                let hid = shared.next_id.fetch_add(1, Ordering::SeqCst);
+                let mut envelope = serde_json::Map::new();
+                envelope.insert("id".to_string(), json!(hid));
+                envelope.insert("method".to_string(), json!("Fetch.continueRequest"));
+                envelope.insert("params".to_string(), json!({"requestId": rid}));
+                if let Some(s) = v.get("sessionId").and_then(|s| s.as_str()) {
+                    envelope.insert("sessionId".to_string(), json!(s));
+                }
+                let text = Value::Object(envelope).to_string();
+                let (tx, _rx) = oneshot::channel();
+                shared.pending.lock().unwrap().insert(hid, tx);
+                let mut sink = shared.sink.lock().await;
+                if sink.send(Message::Text(text.into())).await.is_err() {
+                    shared.pending.lock().unwrap().remove(&hid);
+                }
+            }
+            continue;
+        }
         // Event-driven wait signal: wake any `wait_for_load` waiter. The
         // `readyState` poll there is the fallback, so a missed or
         // session-scoped event can only cost one 10 ms cadence, never a
@@ -1372,9 +1419,7 @@ impl Drop for ChildGuard {
 /// and only launch path).
 async fn launch() -> Result<Inner, String> {
     // A bad caps value is a config error: fail fast on either path.
-    if let Err(e) = backend_caps() {
-        return Err(e);
-    }
+    backend_caps()?;
     if let Some(raw) = cdp_url_override() {
         return attach(&raw).await;
     }
@@ -1551,7 +1596,6 @@ fn check_obscura_child(guard: &mut ChildGuard) -> Result<(), String> {
 /// forked. Every wait here is bounded (the engine also drops idle browser
 /// WS connections at ~60-70 s, so clients connect lazily on first tool use
 /// and bound every wait).
-
 async fn launch_owned_obscura() -> Result<Inner, String> {
     let deadline = startup_timeout();
     // No profile here: the engine's argv never receives one (measured: the
@@ -1707,7 +1751,7 @@ async fn launch_owned_obscura() -> Result<Inner, String> {
         engine: Engine::Owned {
             #[cfg(windows)]
             _job: job,
-            child,
+            child: Box::new(child),
             pid,
         },
         shared,
@@ -1861,11 +1905,8 @@ mod tests {
         let srv = tokio::spawn(async move {
             while let Ok((s, _)) = ln.accept().await {
                 tokio::spawn(async move {
-                    match tokio_tungstenite::accept_async(s).await {
-                        Ok(mut ws) => {
-                            while ws.next().await.is_some() {}
-                        }
-                        Err(_) => {}
+                    if let Ok(mut ws) = tokio_tungstenite::accept_async(s).await {
+                        while ws.next().await.is_some() {}
                     }
                 });
             }
@@ -1892,7 +1933,7 @@ mod tests {
             engine: Engine::Owned {
                 #[cfg(windows)]
                 _job: None,
-                child,
+                child: Box::new(child),
                 pid,
             },
             shared: shared.clone(),
@@ -2391,6 +2432,7 @@ mod tests {
     /// dom-only refusal: screenshot errors naming the backend and the
     /// reason, before any engine launch (no browser needed to prove it).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
     async fn dom_only_screenshot_refuses_without_image() {
         let (_lock, _env) = EnvGuard::hold(&["GLADIUS_BACKEND_CAPS"]);
         std::env::set_var("GLADIUS_BACKEND_CAPS", "dom-only");

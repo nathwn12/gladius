@@ -83,3 +83,15 @@ terms remain traceable.
    clean checkout) and re-run `scripts\fetch-engine.ps1`.
 3. Update this document with the new release, URL, hashes, and sizes.
 4. Commit the script and this document. Never commit `bin\`.
+
+## Network-idle waits and Fetch interception (2026-10-13)
+
+`ensure_network` enables CDP `Fetch` (wildcard `urlPattern: "*"`) beside
+`Network.enable`, and the reader auto-continues every `Fetch.requestPaused`
+immediately. Reason: this engine emits `Network.requestWillBeSent` at request
+START only when a request passes through Fetch interception - otherwise a JS
+`fetch` buffers its Network triple until the response arrives, so a held
+response is invisible and a network-idle wait would false-idle. The
+auto-continue is transparent to page behavior. Paths that never call a
+network-idle wait are untouched; once enabled, each request pays one extra
+`Fetch.continueRequest` round-trip.

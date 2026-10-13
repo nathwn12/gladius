@@ -44,9 +44,7 @@ pub async fn serve() -> Result<(), String> {
 async fn handle(req: &Value, browser: &Arc<Browser>) -> Option<Value> {
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     // JSON-RPC notifications (no `id`) get NO response, whatever the method.
-    if req.get("id").is_none() {
-        return None;
-    }
+    req.get("id")?;
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     match method {
         "initialize" => {
