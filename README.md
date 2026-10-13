@@ -175,6 +175,7 @@ Then run from the repo:
 ```powershell
 target\release\gladius.exe mcp      # serve MCP over stdio (default, no args also works)
 target\release\gladius.exe selftest # internal end-to-end check, exits 0 on pass
+target\release\gladius.exe --version # crate version + the commit it was built from
 ```
 
 Verify:
