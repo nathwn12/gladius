@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+- Build provenance: `gladius --version` (also `version`) now reports the crate
+  version **and** the exact commit the binary was built from, stamped at build
+  time by `build.rs` (`git rev-parse HEAD`, `-dirty` when the tree held
+  uncommitted changes, `unknown` with no `.git` or no `git` on PATH). A
+  deployed `gladius.exe` can be compared against `git rev-parse HEAD` instead
+  of being judged by its mtime. The unknown-subcommand usage line now names
+  `--version`.
+
 - New `viewport` tool: the page viewport is now settable in CSS pixels
   (`width`, `height` required; `deviceScaleFactor` default 1; `mobile`
   default false) over CDP `Emulation.setDeviceMetricsOverride`, with
