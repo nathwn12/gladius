@@ -156,7 +156,7 @@ never killed. Environment:
 On `wss://`: the client TLS stack is compiled in (rustls) so a `wss://`
 endpoint is accepted. A live `ws://` attach is proven end-to-end; `wss://` is
 verified only to the TLS-handshake stage against loopback — a full trusted
-`wss://` session is not yet proven.
+`wss://` session against a public endpoint remains unexercised.
 
 ## Build from source
 

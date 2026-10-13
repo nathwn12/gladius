@@ -103,8 +103,8 @@ struct Shared {
 ///   handle, job cover; the owned path creates no profile). `close()` reaps
 ///   the whole tree.
 /// - `Attached`: gladius connected to an externally started engine via
-///   `GLADIUS_CDP_URL` (the stub-engine interface: the real replacement
-///   engine plugs in here). The engine is NOT ours: `close()` only detaches
+///   `GLADIUS_CDP_URL` (the external-CDP seam: any compatible engine plugs in
+///   here). The engine is NOT ours: `close()` only detaches
 ///   the CDP session we opened and never kills, never sweeps a profile.
 enum Engine {
     Owned {
@@ -128,8 +128,8 @@ struct Inner {
 ///
 /// - `Render` (default): a real rendering pipeline exists; `screenshot`
 ///   returns pixels.
-/// - `DomOnly`: no rendering pipeline (the stub-engine contract: DOM/CDP
-///   only). Pixel tools must refuse, never fake an image.
+/// - `DomOnly`: no rendering pipeline (DOM/CDP only). Pixel tools must refuse,
+///   never fake an image.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BackendCaps {
     Render,
@@ -261,7 +261,7 @@ async fn resolve_ws_url(raw: &str) -> Result<String, String> {
     Err("GLADIUS_CDP_URL must be a ws://, wss://, http:// or https:// endpoint".to_string())
 }
 
-/// Attach to an externally started engine (the stub-engine interface).
+/// Attach to an externally started engine.
 /// Connects to the resolved ws endpoint, then reuses the EXISTING
 /// session/target flow. Creates no profile, sweeps nothing, owns no pid.
 async fn attach(raw: &str) -> Result<Inner, String> {
@@ -1414,7 +1414,7 @@ impl Drop for ChildGuard {
 }
 
 /// Launch dispatcher: `GLADIUS_CDP_URL` set means attach to the external
-/// engine (the stub-engine interface) instead of launching; anything else
+/// engine instead of launching; anything else
 /// launches the owned Obscura engine (`launch_owned_obscura`, the default
 /// and only launch path).
 async fn launch() -> Result<Inner, String> {
