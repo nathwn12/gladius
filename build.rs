@@ -18,6 +18,17 @@ fn main() {
     // refreshes the marker instead of leaving the previous stamp in place.
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
+    // `.git/HEAD` holds only the ref *name* (`ref: refs/heads/<branch>`), so a
+    // commit that advances the branch moves the ref file and leaves HEAD's
+    // mtime untouched. Without this watch an empty commit (or any commit that
+    // changes no source path cargo already tracks) kept the previous stamp,
+    // shipping a binary labelled for a commit that is no longer HEAD. Watch the
+    // resolved ref - and `packed-refs` for the packed case - so any move of the
+    // commit we stamp is seen.
+    if let Some(reference) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        println!("cargo:rerun-if-changed=.git/{reference}");
+    }
+    println!("cargo:rerun-if-changed=.git/packed-refs");
     println!("cargo:rerun-if-changed=src");
 
     let sha = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
