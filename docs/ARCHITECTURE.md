@@ -58,7 +58,7 @@ gladius opened and never kills, never sweeps. `GLADIUS_BACKEND_CAPS` declares `r
 - Transport: **JSON-RPC 2.0 over stdio, newline-delimited** (one message per line) -
   **hand-rolled** in `src/mcp.rs` over `tokio` stdio and `serde_json`: no `rmcp` SDK, no
   external framing crate. STDOUT carries only protocol frames; all logs go to STDERR.
-- Lifecycle: `initialize` -> `tools/list` (exactly the 15 tools above) -> `tools/call` ->
+- Lifecycle: `initialize` -> `tools/list` (exactly the 16 tools above) -> `tools/call` ->
   stdio EOF / `close` -> shutdown.
 - Each `tools/call` response is `{ content: [{ type: "text"|"image", ... }] }` per MCP content
   convention; `screenshot` returns an `image` part (base64 PNG), everything else `text`.
