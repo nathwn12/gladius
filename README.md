@@ -281,16 +281,16 @@ opening a PR. The bundled engine is third-party (Apache-2.0, upstream
 
 **Unverified** — as-is, use at your own risk.
 
+## License
+
+MIT — see [LICENSE](LICENSE). The shipped engine binaries are third-party —
+see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
 ## Credits
 
 The shipped engine binaries are third-party: Obscura by `h4ckf0r0day`
 (Apache-2.0), unaffiliated with this project — see
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
-
-## License
-
-MIT — see [LICENSE](LICENSE). The shipped engine binaries are third-party —
-see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 <!-- nathwn12 house footer: identical in every repo. Do not edit. -->
 <p align="center">
