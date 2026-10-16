@@ -22,6 +22,7 @@
 | `hover` | `element: string` (CSS, or AX ref `@eN`) | `{ ok: true }` after hover |
 | `select` | `element: string, value?: string, text?: string` | `{ ok: true }` after choosing a `<select>` option by value (preferred) or visible text |
 | `key` | `key: string` (Enter, Tab, Escape, ...) | `{ ok: true }` after the named key press on the focused element |
+| `viewport` | `width?: number, height?: number, deviceScaleFactor?: number, mobile?: bool, reset?: bool` | applied metrics + live read-back of `window.innerWidth`/`innerHeight`/`devicePixelRatio` (`matched` false when the engine ignored the override); `reset:true` clears the override |
 | `tabs` | `action: string, url?: string, index?: number` | tab list / mutation result (list, new, close, select) |
 | `close` | - | `{ ok: true }`; reaps the owned browser process tree (or detaches from an attached external engine, leaving it running) |
 
