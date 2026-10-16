@@ -9,22 +9,18 @@
   <img src="https://img.shields.io/badge/platform-windows--64bit-2b3137?logo=windows&logoColor=white" alt="Platform" />
 </p>
 
-## What it is
+## Project name and description
 
 Gladius is a browser-use MCP server written in Rust. It drives the owned
 Obscura engine directly over CDP (Chrome DevTools Protocol) via WebSocket
 and serves MCP over stdio — one static native binary, no Node.js and no
 Playwright in the runtime path. MCP transport is hand-rolled JSON-RPC 2.0
 over stdin/stdout, newline-delimited (one JSON object per line); STDOUT
-carries only protocol frames and all logs go to STDERR.
-
-## Why
-
-The entire server is a single native binary: the owned Obscura engine is
-driven directly over CDP via WebSocket, so there are no driver binaries and
-no Node runtime between the agent and the browser, and the browser lifecycle
-(spawn the owned engine, reap the whole process tree on `close`) is managed
-inside the binary.
+carries only protocol frames and all logs go to STDERR. The entire server
+is a single native binary: the owned Obscura engine is driven directly over
+CDP via WebSocket, so there are no driver binaries and no Node runtime
+between the agent and the browser, and the browser lifecycle (spawn the owned
+engine, reap the whole process tree on `close`) is managed inside the binary.
 
 ## Technology stack
 
@@ -136,6 +132,23 @@ positional subcommand):
 }
 ```
 
+### Configuration
+
+One owned engine (Obscura, pinned in `bin\`), plus an explicit external attach
+by URL:
+
+| Variable | Meaning |
+| --- | --- |
+| `GLADIUS_OBSCURA` | Explicit Obscura engine binary path; overrides the sibling-of-exe default lookup. |
+| `GLADIUS_STARTUP_TIMEOUT_SECS` | Owned-engine readiness deadline (default 30). |
+| `GLADIUS_CDP_URL` | Attach instead of launching: a `ws://` or `wss://` endpoint, or an `http://`/`https://` base resolved via `GET <base>/json/version`. The attached engine is NOT owned. |
+| `GLADIUS_BACKEND_CAPS` | `render` (default) or `dom-only`. |
+
+> [!NOTE]
+> On `wss://`: the client TLS stack is compiled in (rustls) so a `wss://`
+> endpoint is accepted. A live `ws://` attach is proven end-to-end; `wss://` is
+> verified only to the TLS-handshake stage against loopback.
+
 ## Project structure
 
 ```text
@@ -154,7 +167,16 @@ docs/          # ARCHITECTURE, ENGINE, OBSCURA-COMPAT, RESEARCH, OPT-SURVEY, HEA
 bin\           # provisioned engine (obscura.exe + obscura-worker.exe, gitignored)
 ```
 
-## Tools
+Deeper reading:
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — architecture and tool contract
+- [docs/ENGINE.md](docs/ENGINE.md) — engine notes
+- [docs/OBSCURA-COMPAT.md](docs/OBSCURA-COMPAT.md) — Obscura capability record
+- [docs/RESEARCH.md](docs/RESEARCH.md) — browser-automation MCP landscape survey
+- [docs/OPT-SURVEY.md](docs/OPT-SURVEY.md) — optimization and feature survey with measured timings
+- [docs/HEADED-MODE.md](docs/HEADED-MODE.md) — headed-mode decision record (designed, not built)
+
+## Key features
 
 16 tools over the active page, in the order `tools/list` emits them
 (`src/tools.rs`). `fetch_text` is the browser-free fast path and is one of
@@ -200,23 +222,6 @@ Every tool error carries a stable machine-readable `structuredContent`
 prose is byte-for-byte what it always was, so clients that pattern-match
 English keep working.
 
-## Configure
-
-One owned engine (Obscura, pinned in `bin\`), plus an explicit external attach
-by URL:
-
-| Variable | Meaning |
-| --- | --- |
-| `GLADIUS_OBSCURA` | Explicit Obscura engine binary path; overrides the sibling-of-exe default lookup. |
-| `GLADIUS_STARTUP_TIMEOUT_SECS` | Owned-engine readiness deadline (default 30). |
-| `GLADIUS_CDP_URL` | Attach instead of launching: a `ws://` or `wss://` endpoint, or an `http://`/`https://` base resolved via `GET <base>/json/version`. The attached engine is NOT owned. |
-| `GLADIUS_BACKEND_CAPS` | `render` (default) or `dom-only`. |
-
-> [!NOTE]
-> On `wss://`: the client TLS stack is compiled in (rustls) so a `wss://`
-> endpoint is accepted. A live `ws://` attach is proven end-to-end; `wss://` is
-> verified only to the TLS-handshake stage against loopback.
-
 ## Development workflow
 
 ```powershell
@@ -260,6 +265,8 @@ from a `v*` tag as a 7-file bundle (`gladius.exe`, `obscura.exe`,
   engine, exit 0 on pass (`SELFTEST: ALL PASS`).
 - `cargo clippy --all-targets` — 0 warnings.
 
+**Unverified** — as-is, use at your own risk.
+
 ## Contributing
 
 Issues welcome. Keep the tool contract stable: no tool rename, no argument or
@@ -267,19 +274,6 @@ message change without a matching guard-test and CHANGELOG entry. Verify with
 `cargo test`, `cargo clippy --all-targets`, and `gladius.exe selftest` before
 opening a PR. The bundled engine is third-party (Apache-2.0, upstream
 `h4ckf0r0day/obscura`) — see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
-
-## Docs
-
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — architecture and tool contract
-- [docs/ENGINE.md](docs/ENGINE.md) — engine notes
-- [docs/OBSCURA-COMPAT.md](docs/OBSCURA-COMPAT.md) — Obscura capability record
-- [docs/RESEARCH.md](docs/RESEARCH.md) — browser-automation MCP landscape survey
-- [docs/OPT-SURVEY.md](docs/OPT-SURVEY.md) — optimization and feature survey with measured timings
-- [docs/HEADED-MODE.md](docs/HEADED-MODE.md) — headed-mode decision record (designed, not built)
-
-## Status
-
-**Unverified** — as-is, use at your own risk.
 
 ## License
 
