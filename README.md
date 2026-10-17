@@ -1,23 +1,40 @@
 # gladius
+
 **Stop walking pages by hand. Give your agent a browser it can drive.**
 
-## Let your AI install it
+## Install
+
+```powershell
+npx -y gladius-mcp@latest --doctor
+```
+You need Node 22.14 or newer on Windows x64 first. The first run provisions the pinned server runtime (0.2.1) plus the pinned chrome-headless-shell browser (155.0.8059.84), both hash-verified, then `--doctor` prints the manifest with the resolved cache paths and exits 0.
+
+### Or let your AI install it
 
 ```text
 Install the npm package gladius-mcp from nathwn12/gladius into my MCP client config, served with npx gladius-mcp@latest over stdio.
 Then verify with npx gladius-mcp@latest --doctor and npm view gladius-mcp version and show me both outputs.
 ```
 
-## Easy install
+### Offline or pinned
 
+Pin an exact version instead of `@latest`:
 ```powershell
-npx gladius-mcp@latest --doctor
+npx gladius-mcp@0.2.1 --doctor
 ```
+Point the launcher at a browser you already hold to skip the browser download. Set `GLADIUS_CHROMIUM` to your chrome-headless-shell binary before you start the server:
+```powershell
+$env:GLADIUS_CHROMIUM = "<path-to-your-chrome-headless-shell-binary>"
+```
+Redirect the caches with `GLADIUS_ENGINE_CACHE` and `GLADIUS_CHROMIUM_CACHE`, or inspect the pin with no network access:
+```powershell
+npx -y gladius-mcp@latest --print-manifest
+```
+The names above come from `gladius-mcp --help`. There is no fully offline fresh install: the first run still downloads the pinned runtime, so treat these as pins and overrides, not as a no-network setup.
 
-## Prefer to wire it yourself
+## Use it
 
-Add this to your MCP client config (Claude Desktop shape):
-
+Wire the server into your MCP client config:
 ```json
 {
   "mcpServers": {
@@ -30,48 +47,31 @@ Add this to your MCP client config (Claude Desktop shape):
   }
 }
 ```
-
-Check the install with the same two commands from the prompt above. You should see version 0.2.1 and a manifest pinning chrome-headless-shell 155.0.8059.84.
-
-## Use it
-
-### Open a page
-
+Open a page with the `navigate` tool:
 ```json
 {
   "url": "https://example.com"
 }
 ```
-
-Send that as the `navigate` tool input. You get back JSON carrying the page `url` and `title` once the load event fires. The suite asserts exactly this shape in tests/e2e_mcp.rs.
-
-### Read a value from the page
-
+You get back JSON carrying the page `url` and `title` once the load event fires. Read a value with the `evaluate` tool:
 ```json
 {
   "expression": "window.__gladiusValue"
 }
 ```
-
-Send that as the `evaluate` tool input against the repo test page. You get back:
-
+Against the repo test page you get back:
 ```json
 {
   "value": 42
 }
 ```
-
-That value is set in tests/fixtures/fixture.html, and tests/e2e_mcp.rs asserts the round trip.
-
-### Grab text without the browser
-
+Grab text without driving the browser with the `fetch_text` tool:
 ```json
 {
   "url": "https://example.com"
 }
 ```
-
-Send that as the `fetch_text` tool input. You get back the page text with tags stripped and scripts dropped. The suite proves this with a marker page in tests/e2e_mcp.rs.
+You get back the page text with tags stripped and scripts dropped.
 
 ## What you get
 
@@ -82,9 +82,9 @@ Send that as the `fetch_text` tool input. You get back the page text with tags s
 
 ## Requirements
 
-- Node 22.14 or newer (package engines, checked with node --version).
-- Windows x64. Other platforms are refused unless you set the diagnostics override named in --help.
-- First run downloads two pinned artifacts, both hash-verified: the server runtime from the tagged GitHub Release and the browser from the Chrome for Testing endpoint (docs/PUBLISHING.md).
+- Node 22.14 or newer (package engines, checked with `node --version`).
+- Windows x64. Other platforms are refused unless you set the diagnostics override named in `--help`.
+- The first run downloads two pinned artifacts, both hash-verified: the server runtime from the tagged GitHub Release and the browser from the Chrome for Testing endpoint (docs/PUBLISHING.md).
 
 ## Links
 
@@ -93,4 +93,4 @@ Send that as the `fetch_text` tool input. You get back the page text with tags s
 - Releases: https://github.com/nathwn12/gladius/releases
 - Issues: https://github.com/nathwn12/gladius/issues
 - License: MIT, see [LICENSE](LICENSE)
-- Browser pin: [docs/CHROMIUM.md](docs/CHROMIUM.md) - Engine notes: [docs/ENGINE.md](docs/ENGINE.md) - Changelog: [CHANGELOG.md](CHANGELOG.md)
+- Docs: [browser pin](docs/CHROMIUM.md), [engine notes](docs/ENGINE.md), [changelog](CHANGELOG.md)
