@@ -204,23 +204,27 @@ function extractZip(buf, destDir) {
     total += uncompSize;
     if (total > MAX_TOTAL_UNCOMPRESSED) throw new Error('archive uncompressed total exceeds cap');
 
-    // Traversal guard: zip names use forward slashes; reject absolute
-    // paths, drive letters, and `..` segments, then confirm the resolved
-    // target still sits under destDir.
-    // Backslash is a separator on Windows: without this check a name like
-    // `sub\..\..\evil` would survive the `/`-split `..` test above and
-    // escape destDir at path.join time. (Spelled via char code so the
-    // source never holds a literal double-backslash.)
+    // Traversal guard: zip names normally use forward slashes, but
+    // PowerShell's Compress-Archive can write nested entry names
+    // with backslashes (e.g. `THIRD-PARTY-LICENSES\Apache-2.0.txt`). Split
+    // on `/` alone would treat those as one segment, so normalize every
+    // backslash to `/` FIRST, then run the unchanged checks below on the
+    // normalized name: absolute paths, drive letters, and `..` segments
+    // stay rejected, and a `..\..\evil.txt` entry still trips the `..`
+    // guard. The resolved target must still sit under destDir.
+    // (Spelled via char code so the source never holds a literal
+    // double-backslash.)
     const BACKSLASH = String.fromCharCode(92);
-    if (rawName.startsWith('/') || /^[A-Za-z]:/.test(rawName) || rawName.includes(BACKSLASH)) {
+    const name = rawName.split(BACKSLASH).join('/');
+    if (name.startsWith('/') || /^[A-Za-z]:/.test(name)) {
       throw new Error(`unsafe entry name: ${rawName}`);
     }
-    const parts = rawName.split('/').filter((s) => s !== '' && s !== '.');
+    const parts = name.split('/').filter((s) => s !== '' && s !== '.');
     if (parts.length === 0 || parts.includes('..')) throw new Error(`unsafe entry name: ${rawName}`);
     const target = path.join(destDir, ...parts);
     const rel = path.relative(destDir, target);
     if (rel.startsWith('..') || path.isAbsolute(rel)) throw new Error(`entry escapes destination: ${rawName}`);
-    const isDir = rawName.endsWith('/');
+    const isDir = name.endsWith('/');
     if (isDir) {
       fs.mkdirSync(target, { recursive: true });
       continue;
