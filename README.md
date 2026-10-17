@@ -16,6 +16,23 @@ Install the npm package gladius-mcp from nathwn12/gladius into my MCP client con
 Then verify with npx gladius-mcp@latest --doctor and npm view gladius-mcp version and show me both outputs.
 ```
 
+### Wire it yourself
+
+Wire the server into your MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "gladius": {
+      "command": "npx",
+      "args": [
+        "gladius-mcp@latest"
+      ]
+    }
+  }
+}
+```
+
 ### Offline or pinned
 
 Pin an exact version instead of `@latest`:
@@ -34,19 +51,6 @@ The names above come from `gladius-mcp --help`. There is no fully offline fresh 
 
 ## Use it
 
-Wire the server into your MCP client config:
-```json
-{
-  "mcpServers": {
-    "gladius": {
-      "command": "npx",
-      "args": [
-        "gladius-mcp@latest"
-      ]
-    }
-  }
-}
-```
 Open a page with the `navigate` tool:
 ```json
 {
