@@ -6,8 +6,20 @@ mod tools;
 
 #[tokio::main]
 async fn main() {
-    let arg = std::env::args().nth(1);
-    let code = match arg.as_deref() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // No headed path exists (headless-only by owner decision 2026-10-17):
+    // a headed request fails closed here, before anything resolves,
+    // provisions, or launches.
+    if args.iter().any(|a| a == "--headed" || a == "headed") {
+        eprintln!(
+            "[gladius] headed mode is not supported: gladius is headless-only by owner decision \
+             (2026-10-17); the owned chrome-headless-shell artifact cannot go headed. \
+             Attach to an externally started engine with GLADIUS_CDP_URL instead"
+        );
+        std::process::exit(2);
+    }
+    let arg = args.first().map(|s| s.as_str());
+    let code = match arg {
         None | Some("mcp") => match mcp::serve().await {
             Ok(()) => 0,
             Err(e) => {

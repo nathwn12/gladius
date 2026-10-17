@@ -1,7 +1,7 @@
 //! F1 proof: `navigate` must not fabricate `"status": 200`.
 //! A loopback server answers 404; the navigate envelope must NOT carry a
 //! `status` field at all (a wrong field is worse than no field).
-//! Owned engine only (pinned `bin\obscura.exe`).
+//! Owned Chromium engine only (pinned `chrome-headless-shell`).
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -25,12 +25,8 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // Default-engine location pin (see e2e_mcp.rs): cargo tree has no
-        // obscura sibling, so point at the repo-pinned bin/obscura.exe.
-        cmd.env(
-            "GLADIUS_OBSCURA",
-            format!("{}/bin/obscura.exe", env!("CARGO_MANIFEST_DIR")),
-        );
+        // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
+        // resolves from its versioned cache with no env override.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;

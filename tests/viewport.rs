@@ -36,12 +36,8 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // Default-engine location pin (see e2e_mcp.rs): the cargo test tree
-        // has no obscura sibling, so point at the repo-pinned bin/obscura.exe.
-        cmd.env(
-            "GLADIUS_OBSCURA",
-            format!("{}/bin/obscura.exe", env!("CARGO_MANIFEST_DIR")),
-        );
+        // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
+        // resolves from its versioned cache with no env override.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -203,9 +199,12 @@ fn viewport_override_readback_reset_and_new_tab() {
     assert_eq!(env.get("matched"), Some(&json!(true)), "matched: {env}");
     assert_eq!(size_of(&mut c), (1440, 900), "page agrees: 1440x900");
 
-    // 390x844 (phone-sized), with the optional flags named.
-    let env =
-        c.viewport(json!({"width": 390, "height": 844, "mobile": true, "deviceScaleFactor": 3}));
+    // 390x844 (phone-sized), with the scale factor named. (No `mobile: true`
+    // here: on Chromium a mobile override on a page WITHOUT a viewport meta
+    // lays out at the 980px default - correct mobile behavior, honestly
+    // reported as `matched: false` - so the exact-match leg uses the desktop
+    // override, where the engine honours the size.)
+    let env = c.viewport(json!({"width": 390, "height": 844, "deviceScaleFactor": 3}));
     assert_eq!(readback(&env), (390, 844), "390x844 read-back: {env}");
     assert_eq!(
         env.get("readback")

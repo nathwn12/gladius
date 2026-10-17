@@ -1,97 +1,55 @@
-# Engine pin record (obscura)
+# Engine pin record (chromium)
 
-Gladius ships no engine binary in git. The engine is acquired at provision time by
-`scripts/fetch-engine.ps1` into `bin\` beside `gladius.exe`.
+Gladius ships no browser binary in git. The browser is acquired at provision time by
+`scripts/fetch-chromium.ps1` into `%LOCALAPPDATA%\gladius\chromium\` (overridable,
+see below). The full pin (upstream, version, hashes, cache layout, update path)
+lives in `docs/CHROMIUM.md`; this document records how gladius runs it.
 
-## Upstream
+## Resolution
 
-- Project: https://github.com/h4ckf0r0day/obscura (Apache-2.0, Rust + V8 + CDP)
-- Release: v0.2.4
-- Asset: `obscura-x86_64-windows.zip`
-- Asset URL: https://github.com/h4ckf0r0day/obscura/releases/download/v0.2.4/obscura-x86_64-windows.zip
+`find_chromium()` in `src/browser.rs`, in strict order:
 
-## Pin
+1. `GLADIUS_CHROMIUM` set and non-blank: that path (must be a file).
+2. Otherwise the pinned build under the owned cache root:
+   `GLADIUS_CHROMIUM_CACHE` when set and non-blank, otherwise
+   `%LOCALAPPDATA%\gladius\chromium\155.0.8059.84-5ca590a4\`
+   (`chrome-headless-shell-win64\chrome-headless-shell.exe` inside).
+3. Otherwise a clear error naming `scripts/fetch-chromium.ps1`.
 
-- Zip sha256: `8e5428bf8c101f1439c53a9dcb52d7d09bb22599206b49f6420028d93d01189b`
-- Zip size: `68520432` bytes
-- Zip contents: exactly two files at the root, `obscura.exe` and `obscura-worker.exe`.
-- `obscura.exe`: size `78702592`, sha256 `65B9DCADE8B425FEF7C0ED56DFAADBA56C3BA990E572A8B1B0CD8B0226932C0E`
-- `obscura-worker.exe`: size `72981504`, sha256 `D599456C0E08D9333C5B16F7A6307436E6B4A0295FBCE4A605251F2DFCAD93FA`
-
-## Why bin\ and never committed
-
-`bin\` is gitignored (`/bin` in `.gitignore`). Engine binaries are large
-(~150 MB for the pair) and platform-specific; they do not belong in the repo.
-Provision them locally with:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\fetch-engine.ps1
-```
-
-The script is idempotent: if both exes already match the pin it prints
-`already present, verified` and changes nothing. `scripts\fetch-engine.ps1`
-accepts an optional `-SourcePath <zip>` that skips the download and verifies a
-local zip instead (useful for offline or test use); the default path always
-downloads the pinned release asset.
+There is no third step: gladius never falls back to any ambient, shared, or
+system browser. `chrome-win64.zip` (the full headed-capable artifact) is never
+used.
 
 ## How gladius runs it (launch contract)
 
-Gladius launches the owned engine as:
+Headless-only by owner decision (2026-10-17): there is no headed path at all,
+and a headed request fails closed with an explicit unsupported error. Each
+owned instance launches the pinned `chrome-headless-shell.exe` as:
 
 ```
-obscura.exe serve --host 127.0.0.1 --port <free> --allow-private-network --allow-file-access
+chrome-headless-shell.exe --headless --remote-debugging-port=<free> --user-data-dir=<private> --no-first-run --no-default-browser-check --remote-allow-origins=http://127.0.0.1:<port> about:blank
 ```
 
-each flag exactly once (the engine's clap parser hard-fails on a repeated
-flag), spawned with `CREATE_NO_WINDOW`, with readiness discovered by polling
-`GET http://127.0.0.1:<port>/json/version` for `webSocketDebuggerUrl` (the
-`--ready-file` publish is not trusted - it was measured flaking). Backend
-selection is `GLADIUS_CDP_URL` (attach, never owned) first, otherwise
-this Obscura launch is the only engine; `GLADIUS_OBSCURA` overrides the engine
-path. Both gate flags are MANDATORY and measured: without
-`--allow-private-network`, loopback/LAN navigation fails; without
-`--allow-file-access`, `file://` navigation and `DOM.setFileInputFiles` are
-refused.
+each flag exactly once, spawned with `CREATE_NO_WINDOW`, with readiness
+discovered by polling `GET http://127.0.0.1:<port>/json/version` for
+`webSocketDebuggerUrl`. Backend selection is `GLADIUS_CDP_URL` (attach, never
+owned) first, otherwise this Chromium launch is the only engine.
 
-Full capability record (gate-flag failures verbatim, per-tool matrix,
-quirks, blank-load race, head-to-head numbers):
-`docs/OBSCURA-COMPAT.md`.
+The profile is functional, not hygiene: since Chrome 136 the
+remote-debugging switches are ignored on the default data directory, so a
+launch without a private profile binds no port. One fresh private profile
+directory per owned instance, created before launch and swept after the tree
+is reaped. Never passed: `--no-sandbox`, `--disable-dev-shm-usage`,
+keychain/password-store flags, `--remote-debugging-pipe`.
 
-## Console-subsystem requirement
+Full capability record: `docs/CHROMIUM.md`.
 
-Both exes are PE32+ (optional-header magic `0x020B`) with Subsystem 3
-(Windows console). They can allocate a visible console window, so gladius must
-spawn them with `CREATE_NO_WINDOW` (`0x08000000`). Spawning is covered by a
-separate change; this document only records the requirement.
+## Historical note
 
-## No-DLL-bundling fact
-
-No DLLs ship beside the two exes; the zip contains only the two exes at the
-root and nothing else is required at runtime.
-
-## License-file observation
-
-The zip contains no LICENSE file even though the upstream project is
-Apache-2.0. Keep the upstream URL and release tag in this record so the license
-terms remain traceable.
-
-## Re-pinning a future version
-
-1. Update the constants at the top of `scripts/fetch-engine.ps1`
-   (asset URL, zip sha256 + size, both exe sha256s + sizes).
-2. Delete `bin\obscura.exe` and `bin\obscura-worker.exe` (or provision on a
-   clean checkout) and re-run `scripts\fetch-engine.ps1`.
-3. Update this document with the new release, URL, hashes, and sizes.
-4. Commit the script and this document. Never commit `bin\`.
-
-## Network-idle waits and Fetch interception (2026-10-13)
-
-`ensure_network` enables CDP `Fetch` (wildcard `urlPattern: "*"`) beside
-`Network.enable`, and the reader auto-continues every `Fetch.requestPaused`
-immediately. Reason: this engine emits `Network.requestWillBeSent` at request
-START only when a request passes through Fetch interception - otherwise a JS
-`fetch` buffers its Network triple until the response arrives, so a held
-response is invisible and a network-idle wait would false-idle. The
-auto-continue is transparent to page behavior. Paths that never call a
-network-idle wait are untouched; once enabled, each request pays one extra
-`Fetch.continueRequest` round-trip.
+Before the Chromium swap, gladius drove an owned Obscura engine
+(`bin\obscura.exe` + `bin\obscura-worker.exe`, provisioned by
+`scripts/fetch-engine.ps1`, pinned v0.2.4). That record is retained for
+provenance in `docs/OBSCURA-COMPAT.md` and no longer describes current
+behavior: JS dialogs were inert on Obscura (never emitted
+`Page.javascriptDialogOpening`) and the `Log.entryAdded` leg was blind.
+Both are live on Chromium.

@@ -1,76 +1,55 @@
-# HEADED MODE - decision record
+# HEADED MODE - decision record (headless-only)
 
-Owner requirement, stated 2026-10-10:
+Owner decision, 2026-10-17: **headless-only. Headed mode is not built and is
+not planned.**
 
-> "we promised headless, it should be headless. (however it CAN open up a browser when it NEEDS to,
-> the one visible to the user push comes to shove.)"
+- The ONLY engine is the pinned `chrome-headless-shell` (a headless-only
+  content embedder). The artifact cannot go headed, and that is a property we
+  rely on - not a gap.
+- Nothing resolves, provisions, or launches a headed browser. There is no
+  headed code path at all: no `GLADIUS_HEADED` launch, no `--headed` launch,
+  never an automatic fallback and never a gate.
+- A headed request fails closed with an explicit unsupported error:
+  `GLADIUS_HEADED` set truthy refuses the launch in `launch()`, and a headed
+  CLI flag (`gladius mcp --headed`) exits 2 in `main.rs` before anything
+  resolves, provisions, or launches.
+- The visible path, if the owner ever needs eyes on a page, is an explicit
+  external attach (`GLADIUS_CDP_URL`) to an engine the user started
+  themselves. Gladius launches nothing, kills nothing, sweeps nothing there:
+  `close` only detaches the CDP session it opened.
 
-Status: **designed, not built.** Owner-facing contract is unchanged until it lands.
-Update 2026-10-12: gladius is self-contained (the chrome opt-in path is
-removed). Gladius itself never launches a headed-capable binary; the
-visible-when-needed fallback is an explicit external attach
-(`GLADIUS_CDP_URL`) to an engine the user started themselves.
+## Reasoning (kept)
 
-## The rule
+- Headless is the default and stays the default. No tool, no argument, and no
+  page can make a window appear.
+- Gladius never launches, selects, or profiles anyone else's browser. No
+  auto-selected system browser, no owner-profile path, ever.
+- Headlessness is asserted from the OS (no visible top-level window exists
+  for the instance), because CDP cannot observe window visibility.
 
-- **Headless is the default and stays the default.** No tool, no argument, and no page can make a
-  window appear. Zero behaviour change for existing users.
-- **Visible is an explicit opt-in** - armed for the whole process, never per call. An agent cannot
-  pop a window mid-task by choosing different arguments.
-- **Gladius never launches, selects, or profiles anyone else's browser.**
-  No auto-selected system browser, no owner-profile path, ever. A visible
-  engine is always one the user started and handed over by URL.
+## Retired design (not built)
 
-## Interface
+The earlier design below was superseded by the 2026-10-17 decision and is
+kept only so nobody re-proposes it:
 
-| Kind | Name | Meaning |
-|---|---|---|
-| env | `GLADIUS_HEADED=1` | reserved: run as a visible window (not built) |
-| cli | `gladius mcp --headed` | reserved: same, for a client config entry (not built) |
-| env | `GLADIUS_OBSCURA=<path>` | explicit engine override for the owned headless launch |
-| env | `GLADIUS_CDP_URL=<url>` | BUILT: attach to an externally started engine instead of launching - this is the visible path today (start a headed engine with a debug port, hand gladius the URL) |
-
-Helm only - no MCP tool argument exposes any of it.
-
-## Engine resolution
-
-- **Headless (the only launch gladius performs):** `GLADIUS_OBSCURA` ->
-  `obscura.exe` beside `gladius.exe` -> error naming
-  `scripts/fetch-engine.ps1`. The owned engine is always launched windowless
-  (`CREATE_NO_WINDOW`).
-- **Visible (no gladius launch at all):** `GLADIUS_CDP_URL` attaches to an
-  engine the user already started (headed or not). Gladius launches nothing,
-  kills nothing, sweeps nothing: `close` only detaches the CDP session it
-  opened. Driving an already-running visible browser still needs it to have
-  been started with a debug port, which cannot be retrofitted.
-- Gladius auto-selects no browser, headed or otherwise. There is no
-  resolution chain ending in a system install.
-
-## Profile
-
-- **Headless:** the owned engine creates no profile.
-- **Visible (attach):** gladius launches nothing, so there is no profile to
-  own. Sign-in/captcha state lives in the user's own engine, outside gladius.
-- Startup writes the resolved engine path to stderr in both modes.
-
-## Non-goals
-
-- No per-call "show me this one page" argument.
-- No change to the tool schemas.
-- No gladius-launched headed window: a headed launch would need a
-  headed-capable binary gladius does not ship, and reaching for someone
-  else's browser violates self-containment. If the owned engine ever gains a
-  headed mode, this record gets a launch-args section; until then, attach is
-  the whole visible story.
+- `GLADIUS_HEADED=1` / `gladius mcp --headed` as a visible-window opt-in:
+  rejected, fails closed instead.
+- Visible fallback by attaching to a user-started headed engine with a debug
+  port: still true as an attach (see above), but it is not a headed MODE -
+  gladius itself stays headless-only.
+- "If the owned engine ever gains a headed mode, this record gets a
+  launch-args section": moot - the owned artifact is headless-only by
+  construction.
 
 ## Validation gate
 
-1. **No regression in default mode:** `cargo test --release`, `gladius selftest` ALL PASS, and the
-    visible fallback re-verified via attach (below) - identical pass set, 0 hangs.
-2. **Headless really stays headless:** with no `GLADIUS_HEADED`, assert no visible window exists
-   after navigate (Windows: the owned-engine process owns no visible top-level window).
-3. **Visible smoke via attach:** start a headed engine with a debug port by hand,
-   `GLADIUS_CDP_URL=<url>` -> `navigate`/`snapshot`/`screenshot` work against the visible page;
-   `close` detaches and the external engine keeps running.
-4. **Isolation:** gladius never names the owner's default profile path, and no launch ever
-   resolves to a binary gladius does not own.
+1. **No regression in default mode:** `cargo test --release`, `gladius selftest` ALL PASS.
+2. **Headless really stays headless:** assert from the OS that no visible
+   top-level window exists for the instance after navigate
+   (`tests/headless_chromium.rs`: `headless_browser_has_no_visible_window`).
+3. **Headed fails closed:** `GLADIUS_HEADED=1` refuses the launch and a
+   headed CLI flag exits 2 (`headless_headed_request_fails_closed` plus the
+   `headed_request_fails_closed` unit test).
+4. **Isolation:** no launch ever resolves to a binary gladius does not own
+   (the rewritten `no_console_flash` guard fails the build on any ambient or
+   shared-browser resolution).

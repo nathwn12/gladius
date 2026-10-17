@@ -1,9 +1,9 @@
 # Gladius ARCHITECTURE
 
 > Gladius: headless, ultra-lightweight browser-use MCP server in Rust. Drives
-> the owned Obscura engine **directly over CDP** - no Node.js, no Playwright
-> in the runtime path. One static binary, MCP over stdio, lazy browser
-> lifecycle. Research grounding: `docs/RESEARCH.md`.
+> the owned pinned Chromium (`chrome-headless-shell`) **directly over CDP** - no
+> Node.js, no Playwright in the runtime path. One static binary, MCP over stdio,
+> lazy browser lifecycle. Research grounding: `docs/RESEARCH.md`.
 
 ## 1. Frozen tool contract (v1 - the surface never moves for backend swaps)
 
@@ -34,21 +34,29 @@ Rules: tools are **dumb primitives** - no planner, no LLM, no judgement-retries 
 
 | Tier | Backend | When | Notes |
 |---|---|---|---|
-| **Tier 0 (only launch)** | owned Obscura engine | now | `bin\obscura.exe` beside `gladius.exe`, provisioned by
-  `scripts/fetch-engine.ps1` (pinned v0.2.4, sha256-verified). Launched as
-  `obscura serve --host 127.0.0.1 --port <free> --allow-private-network
-  --allow-file-access`, readiness via `GET /json/version`. Full capability
-  record: `docs/OBSCURA-COMPAT.md`. |
+| **Tier 0 (only launch)** | owned pinned Chromium (`chrome-headless-shell`) | now | versioned cache under `%LOCALAPPDATA%\gladius\chromium\`, provisioned by
+  `scripts/fetch-chromium.ps1` (pinned 155.0.8059.84, self-hashed manifest).
+  Headless-only (owner decision 2026-10-17, no headed path). Launched as
+  `chrome-headless-shell --headless --remote-debugging-port <free>
+  --user-data-dir <private> --no-first-run --no-default-browser-check
+  --remote-allow-origins http://127.0.0.1:<port> about:blank`, readiness via
+  `GET /json/version`. Full pin record: `docs/CHROMIUM.md`, launch contract:
+  `docs/ENGINE.md`. |
 | **Tier 1 (rejected)** | Lightpanda no-render | — | Rejected: no Windows target; AGPL-3.0 §13-only; text-only raster. |
 
-No full-Chrome tier: there is no `--full-chrome` flag and none is planned — a fallback can never be a relic or someone else's.
+No full-Chrome tier: there is no headed path and none is planned - the shell
+artifact cannot go headed and that is a property we rely on; a fallback can
+never be a relic or someone else's.
 
 Selection: `GLADIUS_CDP_URL` to **attach** to an existing endpoint instead of
 launching (RESEARCH rule 5) — BUILT 2026-10-11: `ws://`/`wss://` connects
 directly, `http://`/`https://` resolves via `GET <base>/json/version`; the
 session/target flow after the connect is shared with the launch path —
-otherwise the owned Obscura launch (the only launchable engine;
-`GLADIUS_OBSCURA` overrides the engine path). Ownership: an attached engine
+otherwise the owned Chromium launch (the only launchable engine;
+`GLADIUS_CHROMIUM` overrides the browser path,
+`GLADIUS_CHROMIUM_CACHE` overrides the cache root). A headed request
+(`GLADIUS_HEADED`, `--headed`) fails closed with an explicit unsupported
+error. Ownership: an attached engine
 is NOT ours — `close` detaches the session
 gladius opened and never kills, never sweeps. `GLADIUS_BACKEND_CAPS` declares `render`
 (default) or `dom-only` (no rendering pipeline: `screenshot` refuses, never fakes).
@@ -64,16 +72,17 @@ gladius opened and never kills, never sweeps. `GLADIUS_BACKEND_CAPS` declares `r
   convention; `screenshot` returns an `image` part (base64 PNG), everything else `text`.
 - Server answers `initialize` with **no browser running** (lazy start, §4) - cold MCP handshake
   must never pay browser-launch cost. The response carries `serverInfo.backend`
-  (`obscura` or `external-cdp`) and `serverInfo.caps` (`render` or
+  (`chromium` or `external-cdp`) and `serverInfo.caps` (`render` or
   `dom-only`) so a client can see which engine and which caps it is talking to.
 
 ## 4. Browser lifecycle (lazy start, kill-tree on close)
 
 ```
-tools/call (first, non-close) --► resolve owned engine binary --► spawn child
-      (obscura serve on a free loopback port, both gate flags)
+tools/call (first, non-close) --► resolve owned browser binary --► create fresh
+      private profile --► spawn child
+      (chrome-headless-shell on a free loopback port, private --user-data-dir)
       --► CDP connect --► new target/page --► execute --► keep warm for session
-tools/call close  --OR--  stdio EOF / SIGTERM --► CDP Browser.close --► kill-tree (job object) --► reap
+tools/call close  --OR--  stdio EOF / SIGTERM --► CDP Browser.close --► kill-tree (job object) --► reap --► sweep profile
 ```
 
 Attach variant (same flow after the connect, §2): `GLADIUS_CDP_URL` set --► resolve ws
