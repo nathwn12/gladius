@@ -9,6 +9,13 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    # One owned-browser path by construction: the cache step, the provision
+    # script, and the suite all resolve through GLADIUS_CHROMIUM_CACHE.
+    # `runner.temp` is used because it is visible to workflow expressions
+    # (`env.LOCALAPPDATA` is not: a `${{ env.LOCALAPPDATA }}` path restores
+    # to the wrong place and the provision step re-downloads every run).
+    env:
+      GLADIUS_CHROMIUM_CACHE: ${{ runner.temp }}\gladius-chromium
     # The suite drives the owned pinned Chromium only: restore it from cache
     # when the pin is unchanged, else provision it with the repo's own script
     # (sha-verified) and run against it. CI must never point at a
@@ -36,7 +43,7 @@ jobs:
       - name: restore pinned browser cache
         uses: actions/cache@v6
         with:
-          path: ${{ env.LOCALAPPDATA }}\gladius\chromium
+          path: ${{ runner.temp }}\gladius-chromium
           key: chromium-win64-${{ steps.browser-pin.outputs.version }}-${{ steps.browser-pin.outputs.sha256 }}
       - run: powershell -ExecutionPolicy Bypass -File scripts/fetch-chromium.ps1
       - run: cargo build --locked
