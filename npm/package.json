@@ -12,8 +12,7 @@
     "node": ">=22.14.0"
   },
   "bin": {
-    "gladius-mcp": "./bin/gladius-mcp.js",
-    "gladius": "./bin/gladius-mcp.js"
+    "gladius-mcp": "./bin/gladius-mcp.js"
   },
   "files": [
     "bin/",
