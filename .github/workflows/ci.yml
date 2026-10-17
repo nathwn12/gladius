@@ -9,13 +9,6 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    # One owned-browser path by construction: the cache step, the provision
-    # script, and the suite all resolve through GLADIUS_CHROMIUM_CACHE.
-    # `runner.temp` is used because it is visible to workflow expressions
-    # (`env.LOCALAPPDATA` is not: a `${{ env.LOCALAPPDATA }}` path restores
-    # to the wrong place and the provision step re-downloads every run).
-    env:
-      GLADIUS_CHROMIUM_CACHE: ${{ runner.temp }}\gladius-chromium
     # The suite drives the owned pinned Chromium only: restore it from cache
     # when the pin is unchanged, else provision it with the repo's own script
     # (sha-verified) and run against it. CI must never point at a
@@ -33,6 +26,16 @@ jobs:
           $man = Get-Content scripts/chromium-manifest.json -Raw | ConvertFrom-Json
           "version=$($man.browser.version)" >> $env:GITHUB_OUTPUT
           "sha256=$($man.browser.asset.sha256)" >> $env:GITHUB_OUTPUT
+      # One owned-browser path by construction: the cache step, the provision
+      # script, and the suite all resolve through GLADIUS_CHROMIUM_CACHE,
+      # pointed here at the runner temp dir. (`env.LOCALAPPDATA` is not
+      # visible to workflow expressions, so the path is planted from
+      # $env:RUNNER_TEMP instead; the cache `path:` below uses the
+      # equivalent `runner.temp` context, which steps do allow.)
+      - name: point owned browser cache at the runner temp dir
+        shell: pwsh
+        run: |
+          "GLADIUS_CHROMIUM_CACHE=$([System.IO.Path]::Combine($env:RUNNER_TEMP, 'gladius-chromium'))" >> $env:GITHUB_ENV
       # The ~118 MB Chrome-for-Testing download happens once per pin; later
       # runs restore the versioned cache dir and the provision step below
       # re-verifies it. Key expression:
