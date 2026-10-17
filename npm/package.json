@@ -1,0 +1,23 @@
+{
+  "name": "gladius-mcp",
+  "version": "0.2.0",
+  "description": "MCP browser-use server (npx launcher): provisions the pinned Obscura engine on first run, then serves MCP over stdio",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nathwn12/gladius"
+  },
+  "homepage": "https://github.com/nathwn12/gladius",
+  "engines": {
+    "node": ">=22.14.0"
+  },
+  "bin": {
+    "gladius-mcp": "./bin/gladius-mcp.js"
+  },
+  "files": [
+    "bin/",
+    "engine-manifest.json",
+    "LICENSE",
+    "README.md"
+  ]
+}

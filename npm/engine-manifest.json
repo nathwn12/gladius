@@ -1,0 +1,46 @@
+{
+  "_comment": "Engine SOURCE is a manifest value: a later engine swap changes only this file (plus scripts/fetch-engine.ps1 and docs/ENGINE.md in lockstep). The release workflow cross-checks this engine identity against scripts/fetch-engine.ps1 AND the provisioned bin/ bytes, then fills the runtime.* / engine.repack hashes it computes from the real build artifacts. engine.archive documents the upstream provenance of the bundled engine bytes; engine.repack is the workflow's license-carrying re-pack attached to our release. The launcher downloads ONLY runtime.archive.",
+  "package": "gladius-mcp",
+  "serverVersion": "0.2.0",
+  "engine": {
+    "upstream": "https://github.com/h4ckf0r0day/obscura",
+    "release": "v0.2.4",
+    "source": "https://github.com/h4ckf0r0day/obscura/releases/download/v0.2.4",
+    "archive": {
+      "name": "obscura-x86_64-windows.zip",
+      "url": "https://github.com/h4ckf0r0day/obscura/releases/download/v0.2.4/obscura-x86_64-windows.zip",
+      "sha256": "8e5428bf8c101f1439c53a9dcb52d7d09bb22599206b49f6420028d93d01189b",
+      "size": 68520432
+    },
+    "files": [
+      {
+        "name": "obscura.exe",
+        "sha256": "65b9dcade8b425fef7c0ed56dfaadba56c3ba990e572a8b1b0cd8b0226932c0e",
+        "size": 78702592
+      },
+      {
+        "name": "obscura-worker.exe",
+        "sha256": "d599456c0e08d9333c5b16f7a6307436e6b4a0295fbce4a605251f2dfcad93fa",
+        "size": 72981504
+      }
+    ],
+    "repack": {
+      "name": "gladius-engine-v0.2.4-windows-x86_64.zip",
+      "sha256": "RELEASE_WORKFLOW_FILLS_THIS",
+      "size": 0
+    }
+  },
+  "runtime": {
+    "source": "https://github.com/nathwn12/gladius/releases/download/v0.2.0",
+    "archive": {
+      "name": "gladius-v0.2.0-windows-x86_64.zip",
+      "sha256": "RELEASE_WORKFLOW_FILLS_THIS",
+      "size": 0
+    },
+    "server": {
+      "name": "gladius.exe",
+      "sha256": "RELEASE_WORKFLOW_FILLS_THIS",
+      "size": 0
+    }
+  }
+}
