@@ -93,6 +93,16 @@ fn every_test_spawn_is_windowless() {
 /// - `program files`: system install locations.
 /// - `chrome-win64`: the FULL headed-capable CfT artifact (never provisioned;
 ///   only `chrome-headless-shell-win64` is ever used).
+/// - `chrome.exe` (bare): any ambient Chrome binary off `PATH` or an
+///   install dir. The owned `chrome-headless-shell.exe` never matches
+///   (after `chrome` comes `-headless`, not `.exe`), so this bites ambient
+///   resolutions without false-positiving on the pinned shell.
+/// - `google/chrome/application`: the per-user install layout
+///   (`%LOCALAPPDATA%/Google/Chrome/Application/chrome.exe`, no
+///   `program files` in the path, which is why the `program files`
+///   pattern alone misses it). Backslashes are normalized to `/` before
+///   matching, so the Windows spelling hits the same pattern without a
+///   second literal.
 /// - `gladius_chrome` / `gladius_backend` (bare): the removed
 ///   shared-cache-era knobs (`GLADIUS_CHROME`, `GLADIUS_BACKEND`).
 ///   `GLADIUS_BACKEND_CAPS` is the only legitimate `GLADIUS_BACKEND*` name
@@ -114,6 +124,8 @@ fn forbidden_patterns() -> Vec<&'static str> {
         "brave",
         "program files",
         "chrome-win64",
+        "chrome.exe",
+        "google/chrome/application",
         "gladius_chrome",
         "gladius_backend",
         "--remote-debugging-pipe",
@@ -130,7 +142,10 @@ fn forbidden_patterns() -> Vec<&'static str> {
 fn scan_text(name: &str, text: &str) -> Vec<String> {
     let mut hits = Vec::new();
     for (i, ln) in text.lines().enumerate() {
-        let low = ln.to_lowercase();
+        // Normalize once: backslashes become `/` so the Windows spelling of
+        // a path (`AppData\Local\Google\Chrome\Application\...`) hits the
+        // same forward-slash patterns (no second literal needed).
+        let low = ln.to_lowercase().replace('\\', "/");
         let scrubbed = low
             .replace("gladius_backend_caps", "")
             .replace("gladius_chromium_cache", "")
@@ -184,6 +199,15 @@ fn guard_bites_known_ambient_resolutions() {
         ("system edge", "launch msedge headless from its install dir"),
         ("system brave", "launch brave.exe from Program Files"),
         ("full chrome zip", "download chrome-win64.zip for headed use"),
+        ("bare chrome exe", "launch chrome.exe from PATH"),
+        (
+            "per-user chrome path",
+            "AppData/Local/Google/Chrome/Application/chrome.exe",
+        ),
+        (
+            "per-user chrome path (windows spelling)",
+            r"AppData\Local\Google\Chrome\Application\chrome.exe",
+        ),
         ("old chrome knob", "std::env::var(\"GLADIUS_CHROME\")"),
         ("old backend knob", "std::env::var(\"GLADIUS_BACKEND\")"),
         ("debug pipe", "spawn with --remote-debugging-pipe"),
@@ -200,13 +224,16 @@ fn guard_bites_known_ambient_resolutions() {
         );
     }
     // And the owned shapes must scan CLEAN, so the guard passes with our
-    // pinned binary present and cannot false-positive on it.
+    // pinned binary present and cannot false-positive on it. The accepted
+    // browser shape is the COMPLETE versioned pinned layout
+    // (`<version>-<zip-sha8>/chrome-headless-shell-win64/chrome-headless-shell.exe`),
+    // never a bare exe name or an artifact-relative suffix alone.
     let good_samples = [
         "let exe = find_chromium()?;",
         "std::env::var(\"GLADIUS_CHROMIUM\")",
         "std::env::var(\"GLADIUS_CHROMIUM_CACHE\")",
         "std::env::var(\"GLADIUS_BACKEND_CAPS\")",
-        "chrome-headless-shell-win64/chrome-headless-shell.exe",
+        "155.0.8059.84-5ca590a4/chrome-headless-shell-win64/chrome-headless-shell.exe",
         "args.push(\"--headless\")",
     ];
     for sample in good_samples {

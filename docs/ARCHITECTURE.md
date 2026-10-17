@@ -82,7 +82,7 @@ tools/call (first, non-close) --► resolve owned browser binary --► create fr
       private profile --► spawn child
       (chrome-headless-shell on a free loopback port, private --user-data-dir)
       --► CDP connect --► new target/page --► execute --► keep warm for session
-tools/call close  --OR--  stdio EOF / SIGTERM --► CDP Browser.close --► kill-tree (job object) --► reap --► sweep profile
+tools/call close  --OR--  stdio EOF / SIGTERM --► terminate direct child (non-waiting) --► deadline-wrapped reap (2s) --► bounded kill-tree fallback (5s, job cover when present) --► reap --► bounded profile sweep (10s retries)
 ```
 
 Attach variant (same flow after the connect, §2): `GLADIUS_CDP_URL` set --► resolve ws

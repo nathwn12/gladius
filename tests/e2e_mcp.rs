@@ -217,7 +217,7 @@ fn e2e_mcp_fixture_flow() {
     let ev_text = content_text(&ev);
     let ev_obj: Value = serde_json::from_str(&ev_text).expect("evaluate json");
     // Numeric compare (as_f64): engines differ in number shape (some return
-    // `42`, Obscura `42.0`) while the VALUE is identical.
+    // `42`, others `42.0`) while the VALUE is identical.
     assert_eq!(
         ev_obj.get("value").and_then(|v| v.as_f64()),
         Some(42.0),

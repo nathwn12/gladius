@@ -23,7 +23,7 @@
 //!   shell permits sharing across distinct ports, which is why production
 //!   always mints a fresh profile - negative companion).
 //! - `headless_console_log_leg_is_live`: a failed subresource fetch surfaces
-//!   a `Log.entryAdded`-sourced console entry (the leg Obscura never had).
+//!   a `Log.entryAdded`-sourced console entry (new with the Chromium engine).
 //! - `headless_headed_request_fails_closed`: `GLADIUS_HEADED=1` refuses the
 //!   launch with the headless-only error and launches nothing; a headed CLI
 //!   flag exits 2 without starting a browser.

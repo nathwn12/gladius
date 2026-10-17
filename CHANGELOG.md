@@ -25,6 +25,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+> Note: entries below marked "Pre-0.2.1 (Obscura era)" describe the former
+> engine and are superseded by `[0.2.1]` (owned pinned Chromium); the former
+> record is kept for provenance in `docs/OBSCURA-COMPAT.md`. Unmarked entries
+> describe the current Chromium engine.
+
 - Build provenance: `gladius --version` (also `version`) now reports the crate
   version **and** the exact commit the binary was built from, stamped at build
   time by `build.rs` (`git rev-parse HEAD`, `-dirty` when the tree held
@@ -43,7 +48,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   request), so a silently ignored override can never read as success. The
   override is session-scoped in CDP, so it is REPLAYED on every new session
   (`attach_to`): a later `navigate` or a new tab keeps it. Measured engine
-  default (obscura v0.2.4): **1280x720** — the "fixed 800x600-ish default"
+  default (pre-Chromium engine v0.2.4): **1280x720** - the "fixed 800x600-ish default"
   claim in `docs/OPT-SURVEY.md` was wrong. Tool count 15 -> 16.
 
 - Machine-readable error contract: every tool error now carries a stable
@@ -77,15 +82,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `screenshot: requires caps: render`, and an invalid/unusable caps value
   gates `screenshot` the same way (no rendering pipeline to capture from);
   on a `render` backend `gated` is empty. `serverInfo` is unchanged.
-- REMOVED the `chrome-headless-shell` fallback/opt-in entirely: `find_chrome`,
+- Pre-0.2.1 (Obscura era, superseded by `[0.2.1]`): REMOVED the `chrome-headless-shell` fallback/opt-in entirely: `find_chrome`,
   `GLADIUS_BACKEND`, `GLADIUS_CHROME`, the `%LOCALAPPDATA%\ms-playwright`
-  resolution, and the chrome launch/profile/sweep machinery are gone.
-  Gladius is self-contained: the owned Obscura engine in `bin\` is the only
+  resolution, and the chrome launch/profile/sweep machinery were gone.
+  Gladius was then self-contained on the owned Obscura engine in `bin\` as the only
   launchable engine, plus an explicit external attach via `GLADIUS_CDP_URL`.
   Enforced by the `self_containment_no_foreign_engine_in_src` guard test,
   which fails the build if any chrome/ms-playwright/playwright reference
   reappears in `src/`.
-- Obscura is the ONLY engine: unless `GLADIUS_CDP_URL` attaches, gladius
+- Pre-0.2.1 (Obscura era, superseded by `[0.2.1]`; see `docs/OBSCURA-COMPAT.md`): Obscura was the ONLY engine: unless `GLADIUS_CDP_URL` attached, gladius
   (`obscura.exe serve --host 127.0.0.1 --port <free> --allow-private-network
   --allow-file-access` beside `gladius.exe`, `CREATE_NO_WINDOW`, readiness by
   polling `GET /json/version`). Provisioned by `scripts/fetch-engine.ps1`
@@ -93,7 +98,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `bin\obscura-worker.exe`); a missing engine is a clear error naming that
   script, never a silent fallback. `GLADIUS_OBSCURA` overrides the engine
   path. `initialize` reports `serverInfo.backend` `obscura` on this path.
-- Capability exceptions on the Obscura path: JS dialogs are inert
+- Pre-0.2.1 capability exceptions on the Obscura path (historical, see `docs/OBSCURA-COMPAT.md`): JS dialogs were inert
   (`Page.javascriptDialogOpening` never fires, `Page.handleJavaScriptDialog`
   is unknown, `alert`/`confirm`/`prompt` silent no-ops); the `console` tool's
   `Log.entryAdded` leg is blind (`Runtime.consoleAPICalled` still flows);
@@ -120,10 +125,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Console-flash hardening: the `taskkill` reaper now spawns with
   `CREATE_NO_WINDOW`, so closing never flashes a console window even for
   launchers that give gladius no console of its own.
-- Self-contained engine resolution: the owned Obscura engine only
+- Pre-0.2.1 self-contained engine resolution (superseded by `[0.2.1]`): the owned Obscura engine only
   (`GLADIUS_OBSCURA` override, else `bin\obscura.exe` beside `gladius.exe`);
   a missing engine is a clear error naming `scripts/fetch-engine.ps1`.
-- New `self_containment_no_foreign_engine_in_src` guard test: fails the build
+- Pre-0.2.1 guard (superseded; the current guard is `self_containment_no_ambient_or_shared_browser_in_src`, which forbids ambient/shared resolutions while allowing the owned pinned Chromium): the Obscura-era `self_containment_no_foreign_engine_in_src` guard test failed the build
   if any chrome/ms-playwright/playwright reference reappears in `src/`,
   alongside the `no_console_flash` windowless-spawn guard.
 - `wait_for` hard deadline holds across the lazy network snapshot: the
