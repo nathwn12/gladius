@@ -1676,9 +1676,84 @@ fn check_obscura_child(guard: &mut ChildGuard) -> Result<(), String> {
     }
 }
 
-/// Default owned launch: the Obscura engine (`serve` on a free loopback
+/// Owned-launch attempts: the pick-port → spawn → readiness sequence runs up
+/// to this many times, with a FRESH `:0` pick per attempt (the pick lives
+/// inside the single-attempt function below, so a stale pick is never
+/// reused). Bounded so a permanently broken engine still fails fast with
+/// today's error instead of looping.
+const OWNED_LAUNCH_ATTEMPTS: usize = 3;
+
+/// Retryable owned-launch failure: ONLY the early-child-exit signal from
+/// `check_obscura_child` (`obscura child exited during startup: ...`) — the
+/// stale-port race where a local squatter claimed our freed pick between the
+/// `:0` probe and the engine's own bind, so the engine died on its bind and
+/// exited before `/json/version` ever went ready. Everything else is
+/// fail-closed and never retried: the squatter-confinement rejections
+/// (`owned ws endpoint rejected: ...`) stay hard errors (re-rolling the port
+/// until a squatter's advertisement accidentally matched would defeat the
+/// confinement), a `try_wait` failure is unknown child state (never treated
+/// as a dead-port signal), and timeouts keep their existing budgets. Pure:
+/// no I/O, unit-tested below via the retry helper.
+fn launch_startup_exit_is_retryable(err: &str) -> bool {
+    err.starts_with("obscura child exited during startup:")
+}
+
+/// Bounded retry over fallible attempts: runs `attempt` until it succeeds,
+/// surfaces a non-retryable error immediately, and surfaces the LAST error
+/// unchanged once `max_attempts` retryable failures exhaust the bound (an
+/// exhausted retry reports exactly what the final attempt reported — nothing
+/// is hidden). `max_attempts` is clamped to at least 1. Pure control flow:
+/// the owned launch passes its single-attempt future plus the
+/// early-child-exit predicate; the unit tests pass scripted closures.
+async fn retry_attempts<T, E, F, Fut>(
+    max_attempts: usize,
+    is_retryable: impl Fn(&E) -> bool,
+    mut attempt: F,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let bound = max_attempts.max(1);
+    let mut last: Option<E> = None;
+    for _ in 0..bound {
+        match attempt().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if !is_retryable(&e) {
+                    return Err(e);
+                }
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.expect("retry bound >= 1 runs at least one attempt"))
+}
+
+/// Owned launch with stale-port retry: the pick-port → spawn → readiness
+/// sequence frees its chosen port before the engine binds it, so under
+/// parallel load a local squatter can claim the pick and the engine exits 1
+/// on its bind before `/json/version` ever goes ready. An early child exit
+/// during startup is therefore retried with a FRESH port pick, bounded by
+/// `OWNED_LAUNCH_ATTEMPTS`. Only that signal retries (see
+/// `launch_startup_exit_is_retryable`); every attempt otherwise behaves
+/// exactly like today's single launch — same argv, same readiness poll,
+/// same budgets, same fail-closed confinement — and exhaustion surfaces the
+/// last attempt's error unchanged.
+async fn launch_owned_obscura() -> Result<Inner, String> {
+    retry_attempts(
+        OWNED_LAUNCH_ATTEMPTS,
+        |e: &String| launch_startup_exit_is_retryable(e),
+        launch_owned_obscura_once,
+    )
+    .await
+}
+
+/// Single owned-launch attempt: the Obscura engine (`serve` on a free loopback
 /// port), modelled as `Engine::Owned` so `close()` kills the tree we
-/// started. Readiness polls `GET http://127.0.0.1:<port>/json/version` for
+/// started. Picks a FRESH free port on every call (bind `:0`, read the port,
+/// drop it), so each retry attempt races a different pick. Readiness polls
+/// `GET http://127.0.0.1:<port>/json/version` for
 /// `webSocketDebuggerUrl` inside `startup_timeout()`: a ready-file is NOT
 /// trusted (measured flaking twice - the engine serving with no file
 /// published). The ws URL then flows through the SAME shared machinery the
@@ -1691,7 +1766,7 @@ fn check_obscura_child(guard: &mut ChildGuard) -> Result<(), String> {
 /// forked. Every wait here is bounded (the engine also drops idle browser
 /// WS connections at ~60-70 s, so clients connect lazily on first tool use
 /// and bound every wait).
-async fn launch_owned_obscura() -> Result<Inner, String> {
+async fn launch_owned_obscura_once() -> Result<Inner, String> {
     let deadline = startup_timeout();
     // No profile here: the engine's argv never receives one (measured: the
     // engine writes 0 profile bytes), so a failed temp-dir creation must not
@@ -1982,6 +2057,7 @@ mod job {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     /// Rig for timeout/atomicity proofs: a real WS pair whose server side
     /// NEVER answers (black-hole peer, local only), plus a sleeper child
@@ -2767,5 +2843,114 @@ mod tests {
             eprintln!("owned resolve+confine rejects squatter url {got_c}: {err}");
             http_c.abort();
         }
+    }
+
+    /// Owned-launch retry (a): two early-child exits then success → the
+    /// launch succeeds on attempt 3 and the attempt closure ran 3 times.
+    /// Scripted closures through the SAME `retry_attempts` production uses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_retry_succeeds_on_third_attempt() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let r: Result<&str, String> = retry_attempts(
+            OWNED_LAUNCH_ATTEMPTS,
+            |e: &String| launch_startup_exit_is_retryable(e),
+            || {
+                let calls = calls.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n < OWNED_LAUNCH_ATTEMPTS {
+                        Err(format!(
+                            "obscura child exited during startup: exit code: {n}"
+                        ))
+                    } else {
+                        Ok("ready")
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(r, Ok("ready"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            OWNED_LAUNCH_ATTEMPTS,
+            "two failures then success must run exactly 3 attempts"
+        );
+    }
+
+    /// Owned-launch retry (b): a NON-retryable error (the squatter
+    /// confinement rejection) surfaces immediately — the closure runs once,
+    /// no port re-roll. The predicate table asserts the boundary directly:
+    /// only the early-child-exit signal retries; confinement rejections,
+    /// unknown child state (`try_wait` failures), and timeouts never do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_retry_non_retryable_surfaces_immediately() {
+        assert!(launch_startup_exit_is_retryable(
+            "obscura child exited during startup: exit code: 1"
+        ));
+        for fatal in [
+            "owned ws endpoint rejected: port 2 != owned port 1 in ws://127.0.0.1:2/",
+            "obscura child wait failed during startup: unknown state",
+            "timeout waiting for obscura /json/version on http://127.0.0.1:1: \
+             deadline passed with no ready endpoint",
+        ] {
+            assert!(
+                !launch_startup_exit_is_retryable(fatal),
+                "must never retry: {fatal}"
+            );
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let r: Result<&str, String> = retry_attempts(
+            OWNED_LAUNCH_ATTEMPTS,
+            |e: &String| launch_startup_exit_is_retryable(e),
+            || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err("owned ws endpoint rejected: port 2 != owned port 1 in \
+                         ws://127.0.0.1:2/"
+                        .to_string())
+                }
+            },
+        )
+        .await;
+        assert!(r.is_err(), "confinement rejection must surface");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a non-retryable error must not re-run the attempt"
+        );
+    }
+
+    /// Owned-launch retry (c): exhausting the bound surfaces the LAST error
+    /// unchanged — exactly what the final attempt reported, so nothing is
+    /// hidden.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launch_retry_exhaustion_surfaces_last_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let r: Result<&str, String> = retry_attempts(
+            OWNED_LAUNCH_ATTEMPTS,
+            |e: &String| launch_startup_exit_is_retryable(e),
+            || {
+                let calls = calls.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    Err(format!(
+                        "obscura child exited during startup: exit code: {n}"
+                    ))
+                }
+            },
+        )
+        .await;
+        assert_eq!(
+            r,
+            Err(format!(
+                "obscura child exited during startup: exit code: {OWNED_LAUNCH_ATTEMPTS}"
+            ))
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            OWNED_LAUNCH_ATTEMPTS,
+            "an always-retryable failure must run exactly the bound"
+        );
     }
 }
