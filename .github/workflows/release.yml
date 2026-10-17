@@ -1,42 +1,188 @@
-# nathwn12 house release — stack: rust (copy to .github/workflows/release.yml)
+# gladius release: build the runtime, repack the pinned engine, publish npm.
+#
+# Trigger: owner pushes a `v*` tag. Two jobs share one tag and one commit:
+#   build   (windows-latest) provisions the pinned engine exactly the way
+#           docs/ENGINE.md implies (scripts/fetch-engine.ps1, sha-verified),
+#           builds + tests the crate with the MSRV toolchain, assembles the
+#           runtime bundle and the license-carrying engine re-pack, computes
+#           every hash from the REAL artifacts, and fills npm/engine-manifest.json.
+#   publish (ubuntu-latest) attaches those artifacts to the GitHub Release,
+#           then `npm publish`es the workflow-built npm package over OIDC
+#           trusted publishing (no token; provenance is automatic).
+#
+# Action majors were verified against the GitHub Releases API on 2026-10-17:
+# checkout v7, setup-node v7, upload-artifact v7, download-artifact v8,
+# softprops/action-gh-release v3. The toolchain is pinned to the crate MSRV
+# (1.88), not to the action's floating tag.
 name: release
 on:
   push:
     tags:
-      - "v*"
-permissions:
-  contents: write
+      - 'v*'
 jobs:
   build:
+    name: build runtime + manifest
     runs-on: windows-latest
-    # The suite drives the owned Obscura engine only: provision the pinned
-    # engine with the repo's own script (sha-verified) and run against it.
-    # A release must never point at a runner-provided browser.
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: powershell -ExecutionPolicy Bypass -File scripts/fetch-engine.ps1
-      - run: cargo build --release --locked
-      - run: cargo test --release --locked
-      - name: assemble release zip + sha256
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88.0
+      # Provision the pinned engine with the repo's own script (sha-verified).
+      # A release must never point at a runner-provided browser.
+      - name: provision pinned engine
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/fetch-engine.ps1
+      - name: build
+        run: cargo build --release --locked
+      - name: test
+        run: cargo test --release --locked
+      - name: assemble archives
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = $env:GITHUB_REF_NAME
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          # Runtime bundle: server + engine side by side (the layout the
+          # launcher provisions and gladius resolves by default), with the
+          # engine licence carried under THIRD-PARTY-LICENSES/.
           $stage = "dist\gladius-$tag-windows-x86_64"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
           Copy-Item target\release\gladius.exe, bin\obscura.exe, bin\obscura-worker.exe, LICENSE, THIRD-PARTY-NOTICES.md, README.md -Destination $stage
-          # Preserve the documented layout: the engine license must land under
-          # THIRD-PARTY-LICENSES/ in the zip, not flattened to the root.
           New-Item -ItemType Directory -Path "$stage\THIRD-PARTY-LICENSES" -Force | Out-Null
           Copy-Item THIRD-PARTY-LICENSES\Apache-2.0.txt -Destination "$stage\THIRD-PARTY-LICENSES"
-          $zip = "$stage.zip"
-          Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
-          $hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
-          "$hash  $(Split-Path $zip -Leaf)" | Out-File "$zip.sha256" -Encoding ascii
-          Write-Host "sha256: $hash"
-      - uses: softprops/action-gh-release@v2
+          Compress-Archive -Path "$stage\*" -DestinationPath "$stage.zip" -Force
+          Remove-Item -LiteralPath $stage -Recurse -Force
+          $zipHash = (Get-FileHash -Algorithm SHA256 -Path "$stage.zip").Hash.ToLowerInvariant()
+          "$zipHash  $(Split-Path $stage -Leaf).zip" | Out-File "$stage.zip.sha256" -Encoding ascii
+          Write-Host "runtime: $zipHash"
+          # Engine-only re-pack: the pinned third-party bytes plus their
+          # licence and a provenance record, so the redistributed engine is
+          # traceable on its own. (Redistribution itself is an owner decision
+          # before the first public release; see docs/PUBLISHING.md.)
+          $man = Get-Content npm/engine-manifest.json -Raw | ConvertFrom-Json
+          $eng = "dist\gladius-engine-$($man.engine.release)-windows-x86_64"
+          New-Item -ItemType Directory -Path $eng -Force | Out-Null
+          Copy-Item bin\obscura.exe, bin\obscura-worker.exe -Destination $eng
+          New-Item -ItemType Directory -Path "$eng\THIRD-PARTY-LICENSES" -Force | Out-Null
+          Copy-Item THIRD-PARTY-LICENSES\Apache-2.0.txt -Destination "$eng\THIRD-PARTY-LICENSES"
+          @(
+            "Engine provenance for $($man.engine.archive.name)",
+            "upstream: $($man.engine.upstream)",
+            "release: $($man.engine.release)",
+            "asset: $($man.engine.archive.url)",
+            "zip sha256: $($man.engine.archive.sha256)  size: $($man.engine.archive.size)",
+            "obscura.exe sha256: $(($man.engine.files | Where-Object name -eq 'obscura.exe').sha256)",
+            "obscura-worker.exe sha256: $(($man.engine.files | Where-Object name -eq 'obscura-worker.exe').sha256)"
+          ) | Out-File "$eng\ENGINE-PROVENANCE.txt" -Encoding ascii
+          Compress-Archive -Path "$eng\*" -DestinationPath "$eng.zip" -Force
+          Remove-Item -LiteralPath $eng -Recurse -Force
+          $engHash = (Get-FileHash -Algorithm SHA256 -Path "$eng.zip").Hash.ToLowerInvariant()
+          "$engHash  $(Split-Path $eng -Leaf).zip" | Out-File "$eng.zip.sha256" -Encoding ascii
+          Write-Host "engine repack: $engHash"
+      - name: assert versions + fill manifest from real artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          if (-not $tag.StartsWith('v')) { throw "tag '$tag' does not start with v" }
+          $ver = $tag.Substring(1)
+          function Get-Sha([string]$p) { return (Get-FileHash -Algorithm SHA256 -Path $p).Hash.ToLowerInvariant() }
+          # 1. One version everywhere: tag == crate == npm package.
+          $cargo = Get-Content Cargo.toml -Raw
+          if ($cargo -notmatch '(?m)^version\s*=\s*"([^"]+)"') { throw 'cannot read crate version from Cargo.toml' }
+          if ($Matches[1] -ne $ver) { throw "crate version $($Matches[1]) != tag version $ver" }
+          $pkg = Get-Content npm/package.json -Raw | ConvertFrom-Json
+          if ($pkg.version -ne $ver) { throw "npm package version $($pkg.version) != tag version $ver" }
+          if ($null -ne $pkg.scripts) { throw 'npm/package.json must not contain a scripts field (postinstall would never run under npx)' }
+          # 2. Engine identity drift gate: the manifest must agree with
+          # scripts/fetch-engine.ps1 (match is case-insensitive; the script
+          # stores uppercase hex) AND with the provisioned bin/ bytes.
+          $man = Get-Content npm/engine-manifest.json -Raw | ConvertFrom-Json
+          $ps1 = Get-Content scripts/fetch-engine.ps1 -Raw
+          $obscura = @($man.engine.files | Where-Object name -eq 'obscura.exe')[0]
+          $worker = @($man.engine.files | Where-Object name -eq 'obscura-worker.exe')[0]
+          foreach ($v in @($man.engine.archive.url, $man.engine.archive.sha256, $obscura.sha256, $worker.sha256)) {
+            if ($ps1 -notmatch [regex]::Escape($v)) { throw "drift: manifest value not found in scripts/fetch-engine.ps1: $v" }
+          }
+          foreach ($n in @("$($man.engine.archive.size)", "$($obscura.size)", "$($worker.size)")) {
+            if ($ps1 -notmatch [regex]::Escape($n)) { throw "drift: manifest size not found in scripts/fetch-engine.ps1: $n" }
+          }
+          foreach ($f in @($obscura, $worker)) {
+            $p = Join-Path 'bin' $f.name
+            if ((Get-Item -LiteralPath $p).Length -ne $f.size) { throw "bin\$($f.name) size drift vs manifest" }
+            if ((Get-Sha $p) -ne $f.sha256.ToLowerInvariant()) { throw "bin\$($f.name) hash drift vs manifest" }
+          }
+          Write-Host 'engine identity agrees: manifest == fetch-engine.ps1 == bin/'
+          # 3. Fill the release-computed hashes from the real artifacts.
+          $repo = 'https://github.com/nathwn12/gladius'
+          $bundle = "gladius-$tag-windows-x86_64.zip"
+          $engName = "gladius-engine-$($man.engine.release)-windows-x86_64.zip"
+          $server = Get-Item -LiteralPath target\release\gladius.exe
+          $man.serverVersion = $ver
+          $man.runtime.source = "$repo/releases/download/$tag"
+          $man.runtime.archive.name = $bundle
+          $man.runtime.archive.sha256 = Get-Sha "dist\$bundle"
+          $man.runtime.archive.size = (Get-Item -LiteralPath "dist\$bundle").Length
+          $man.runtime.server.sha256 = Get-Sha $server.FullName
+          $man.runtime.server.size = $server.Length
+          $man.engine.repack.name = $engName
+          $man.engine.repack.sha256 = Get-Sha "dist\$engName"
+          $man.engine.repack.size = (Get-Item -LiteralPath "dist\$engName").Length
+          $man | ConvertTo-Json -Depth 8 | Out-File npm/engine-manifest.json -Encoding utf8
+          Copy-Item npm/engine-manifest.json dist/engine-manifest.json
+          Write-Host "manifest filled for $tag"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+            dist/engine-manifest.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-package
+          path: npm/
+          if-no-files-found: error
+  publish:
+    name: github release + npm publish
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: npm-package
+          path: npm-pkg
+      - name: attach archives to the GitHub Release
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.zip
             dist/*.zip.sha256
+            dist/engine-manifest.json
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      # Trusted publishing needs npm >= 11.5.1 and Node >= 22.14.0.
+      # Provenance is automatic over OIDC: no --provenance flag, no token.
+      - name: assert toolchain + versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
+          node -e "const v=process.versions.node.split('.').map(Number); if (!(v[0]>22||(v[0]===22&&v[1]>=14))) { console.error('need node >= 22.14.0'); process.exit(1) }"
+          node -e "const v=require('child_process').execSync('npm --version').toString().trim().split('.').map(Number); if (!(v[0]>11||(v[0]===11&&(v[1]>5||(v[1]===5&&v[2]>=1))))) { console.error('need npm >= 11.5.1'); process.exit(1) }"
+          test "$(node -p "require('./npm-pkg/package.json').version")" = "${GITHUB_REF_NAME#v}" || { echo "npm package version != tag version"; exit 1; }
+          node -e "for (const f of ['./npm-pkg/package.json','./npm-pkg/engine-manifest.json','./npm-pkg/bin/gladius-mcp.js']) require('fs').accessSync(f); const p=require('./npm-pkg/package.json'); if (p.scripts!==undefined) { console.error('scripts field present'); process.exit(1) }; const m=require('./npm-pkg/engine-manifest.json'); for (const s of [m.runtime.archive.sha256, m.runtime.server.sha256, m.engine.repack.sha256]) if (!/^[0-9a-f]{64}$/.test(s)) { console.error('manifest still has placeholder hashes'); process.exit(1) }; console.log('npm package OK: no scripts field, all release hashes filled')"
+      - name: publish to npm (OIDC trusted publishing)
+        run: npm publish ./npm-pkg
