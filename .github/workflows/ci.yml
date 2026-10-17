@@ -9,12 +9,35 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    # The suite drives the owned Obscura engine only: provision the pinned
-    # engine with the repo's own script (sha-verified) and run against it.
-    # CI must never point at a runner-provided browser.
+    # The suite drives the owned pinned Chromium only: restore it from cache
+    # when the pin is unchanged, else provision it with the repo's own script
+    # (sha-verified) and run against it. CI must never point at a
+    # runner-provided browser.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: powershell -ExecutionPolicy Bypass -File scripts/fetch-engine.ps1
+      # Read the pinned browser version + zip sha256 out of the integrity
+      # root (scripts/chromium-manifest.json) so the cache key below names
+      # the exact pin: it changes if and only if the pin changes.
+      - name: read pinned browser pin
+        id: browser-pin
+        shell: pwsh
+        run: |
+          $man = Get-Content scripts/chromium-manifest.json -Raw | ConvertFrom-Json
+          "version=$($man.browser.version)" >> $env:GITHUB_OUTPUT
+          "sha256=$($man.browser.asset.sha256)" >> $env:GITHUB_OUTPUT
+      # The ~118 MB Chrome-for-Testing download happens once per pin; later
+      # runs restore the versioned cache dir and the provision step below
+      # re-verifies it. Key expression:
+      #   chromium-win64-${{ steps.browser-pin.outputs.version }}-${{ steps.browser-pin.outputs.sha256 }}
+      # (current pin: chromium-win64-155.0.8059.84-5ca590a4968864e219ea25ccd134597ef8898a733a4698c07fc3e8b2c480fef4).
+      # scripts/fetch-chromium.ps1 -Update rewrites scripts/chromium-manifest.json
+      # on every bump, so any pin change yields a different literal key.
+      - name: restore pinned browser cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.LOCALAPPDATA }}\gladius\chromium
+          key: chromium-win64-${{ steps.browser-pin.outputs.version }}-${{ steps.browser-pin.outputs.sha256 }}
+      - run: powershell -ExecutionPolicy Bypass -File scripts/fetch-chromium.ps1
       - run: cargo build --locked
       - run: cargo test --locked

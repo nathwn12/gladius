@@ -1,8 +1,9 @@
 # gladius-mcp
 
-MCP browser-use server: a native Rust binary driving the owned Obscura
-engine over CDP, served over stdio. This package is a dependency-free Node
-launcher plus a pinned engine manifest — it contains no engine bytes.
+MCP browser-use server: a native Rust binary driving the owned pinned
+Chromium (`chrome-headless-shell`) over CDP, served over stdio. This package
+is a dependency-free Node launcher plus a pinned browser/runtime manifest —
+it contains no browser bytes and no server bytes.
 
 ## Run
 
@@ -13,11 +14,15 @@ npx gladius-mcp@latest
 Or pin it in an MCP client as a stdio server with command `npx` and args
 `["gladius-mcp@latest"]`.
 
-First run provisions the pinned runtime (server + engine, ~160 MB download)
-into `%LOCALAPPDATA%\gladius\engine\<serverVersion>-<bundleSha8>\`, verifies
-every sha256 in `engine-manifest.json` before and after extraction, and
-reuses that directory on later runs. All launcher chatter goes to stderr;
-stdout belongs to the MCP channel.
+First run provisions two things, both sha256-verified before and after
+extraction: the pinned server runtime from the tagged GitHub Release into
+`%LOCALAPPDATA%\gladius\engine\<serverVersion>-<bundleSha8>\`, and the
+pinned browser from Google's Chrome-for-Testing endpoint (~118 MB download)
+into `%LOCALAPPDATA%\gladius\chromium\<version>-<zipSha8>\`. Both are reused
+on later runs (re-verified each time); any mismatch refuses and writes
+nothing. An explicit `GLADIUS_CHROMIUM` binary wins instead: on that path no
+browser is provisioned at all. All launcher chatter goes to stderr; stdout
+belongs to the MCP channel.
 
 ## Diagnostics (no network)
 
@@ -25,8 +30,8 @@ stdout belongs to the MCP channel.
 npx gladius-mcp@latest --doctor
 ```
 
-Prints the pinned manifest and the resolved engine cache path, exits 0,
-performs no fetch. `--print-manifest` is an alias.
+Prints the pinned manifest and the resolved cache paths, exits 0, performs
+no fetch. `--print-manifest` is an alias.
 
 ## Requirements
 
@@ -35,17 +40,16 @@ performs no fetch. `--print-manifest` is an alias.
 - Node.js >= 22.14.0 (global `fetch` plus `crypto`/`zlib` builtins only;
   zero dependencies).
 
-## Engine provenance
+## Browser provenance
 
-The engine is Obscura `v0.2.4` (Apache-2.0,
-https://github.com/h4ckf0r0day/obscura), repackaged with its licence into
-the release archives. The in-package manifest pins the upstream archive
-hash, both engine binary hashes, and the runtime bundle hash the release
-workflow computed from the real build artifacts.
-
-Redistribution note for the owner: the release archives redistribute a
-third-party engine binary. Confirm the redistribution question BEFORE the
-first public release — see `docs/PUBLISHING.md` in the repo.
+The browser is Chrome-for-Testing `chrome-headless-shell` `155.0.8059.84`
+(headless-only), fetched at provision time from
+`https://storage.googleapis.com/chrome-for-testing-public/155.0.8059.84/win64/chrome-headless-shell-win64.zip`.
+It is NEVER redistributed in our release assets or this package: our own
+manifest is the integrity root (CfT publishes no hashes), and the in-package
+manifest pins the archive hash, the extracted tree's file count + total size,
+and every per-file sha256. The runtime bundle carries the Chromium licence
+attribution copy (`THIRD-PARTY-LICENSES/LICENSE.headless_shell`).
 
 ## License
 

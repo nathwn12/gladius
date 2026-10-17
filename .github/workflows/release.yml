@@ -1,19 +1,22 @@
-# gladius release: build the runtime, repack the pinned engine, publish npm.
+# gladius release: build the server runtime, publish npm.
 #
 # Trigger: owner pushes a `v*` tag. Two jobs share one tag and one commit:
-#   build   (windows-latest) provisions the pinned engine exactly the way
-#           docs/ENGINE.md implies (scripts/fetch-engine.ps1, sha-verified),
+#   build   (windows-latest) provisions the pinned BROWSER exactly the way
+#           docs/CHROMIUM.md implies (scripts/fetch-chromium.ps1, sha-verified),
 #           builds + tests the crate with the MSRV toolchain, assembles the
-#           runtime bundle and the license-carrying engine re-pack, computes
-#           every hash from the REAL artifacts, and fills npm/engine-manifest.json.
+#           server-only runtime bundle (the browser is NEVER bundled: it is
+#           fetched from Google's Chrome-for-Testing endpoint at provision
+#           time), computes every hash from the REAL artifacts, and fills
+#           npm/engine-manifest.json.
 #   publish (ubuntu-latest) attaches those artifacts to the GitHub Release,
 #           then `npm publish`es the workflow-built npm package over OIDC
 #           trusted publishing (no token; provenance is automatic).
 #
 # Action majors were verified against the GitHub Releases API on 2026-10-17:
-# checkout v7, setup-node v7, upload-artifact v7, download-artifact v8,
-# softprops/action-gh-release v3. The toolchain is pinned to the crate MSRV
-# (1.88), not to the action's floating tag.
+# checkout v7 (v7.0.1), setup-node v7 (v7.1.0), upload-artifact v7 (v7.0.2),
+# download-artifact v8 (v8.0.2), softprops/action-gh-release v3 (v3.0.3).
+# The toolchain is pinned to the crate MSRV (1.88), not to the action's
+# floating tag.
 name: release
 on:
   push:
@@ -28,11 +31,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.88.0
-      # Provision the pinned engine with the repo's own script (sha-verified).
-      # A release must never point at a runner-provided browser.
-      - name: provision pinned engine
+      # Provision the pinned browser with the repo's own script (sha-verified).
+      # The suite runs against it, and the attribution copy carried below is
+      # taken from these verified bytes. A release must never point at a
+      # runner-provided browser, and the browser itself is never bundled.
+      - name: provision pinned browser
         shell: pwsh
-        run: powershell -ExecutionPolicy Bypass -File scripts/fetch-engine.ps1
+        run: powershell -ExecutionPolicy Bypass -File scripts/fetch-chromium.ps1
       - name: build
         run: cargo build --release --locked
       - name: test
@@ -43,43 +48,33 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $tag = $env:GITHUB_REF_NAME
           New-Item -ItemType Directory -Path dist -Force | Out-Null
-          # Runtime bundle: server + engine side by side (the layout the
-          # launcher provisions and gladius resolves by default), with the
-          # engine licence carried under THIRD-PARTY-LICENSES/.
+          # Runtime bundle: the server plus the licences/notices. The browser
+          # is NEVER bundled: the launcher provisions it from Google's
+          # Chrome-for-Testing endpoint on first run (see npm/bin/gladius-mcp.js),
+          # so no browser bytes ride the release. Attribution for the pinned
+          # browser is carried as THIRD-PARTY-LICENSES/LICENSE.headless_shell,
+          # copied from the provisioned (sha-verified) browser cache and
+          # itself verified against the manifest before it is carried.
           $stage = "dist\gladius-$tag-windows-x86_64"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          Copy-Item target\release\gladius.exe, bin\obscura.exe, bin\obscura-worker.exe, LICENSE, THIRD-PARTY-NOTICES.md, README.md -Destination $stage
+          Copy-Item target\release\gladius.exe, LICENSE, THIRD-PARTY-NOTICES.md, README.md -Destination $stage
           New-Item -ItemType Directory -Path "$stage\THIRD-PARTY-LICENSES" -Force | Out-Null
-          Copy-Item THIRD-PARTY-LICENSES\Apache-2.0.txt -Destination "$stage\THIRD-PARTY-LICENSES"
+          $cm = Get-Content scripts/chromium-manifest.json -Raw | ConvertFrom-Json
+          $pinDir = "$($cm.browser.version)-$($cm.browser.asset.sha256.Substring(0,8))"
+          $licName = "$($cm.browser.root)/LICENSE.headless_shell"
+          $licEntry = @($cm.browser.files | Where-Object name -eq $licName)[0]
+          if ($null -eq $licEntry) { throw "manifest has no entry for $licName" }
+          $licSrc = Join-Path $env:LOCALAPPDATA "gladius\chromium\$pinDir\$($licName.Replace('/','\'))"
+          if ((Get-Item -LiteralPath $licSrc).Length -ne $licEntry.size) { throw "provisioned LICENSE.headless_shell size drift vs manifest" }
+          $licHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $licSrc).Hash.ToLowerInvariant()
+          if ($licHash -ne $licEntry.sha256.ToLowerInvariant()) { throw "provisioned LICENSE.headless_shell hash drift vs manifest" }
+          Copy-Item -LiteralPath $licSrc -Destination "$stage\THIRD-PARTY-LICENSES\LICENSE.headless_shell"
+          Write-Host "licence attribution: $licName verified ($licHash)"
           Compress-Archive -Path "$stage\*" -DestinationPath "$stage.zip" -Force
           Remove-Item -LiteralPath $stage -Recurse -Force
           $zipHash = (Get-FileHash -Algorithm SHA256 -Path "$stage.zip").Hash.ToLowerInvariant()
           "$zipHash  $(Split-Path $stage -Leaf).zip" | Out-File "$stage.zip.sha256" -Encoding ascii
           Write-Host "runtime: $zipHash"
-          # Engine-only re-pack: the pinned third-party bytes plus their
-          # licence and a provenance record, so the redistributed engine is
-          # traceable on its own. (Redistribution itself is an owner decision
-          # before the first public release; see docs/PUBLISHING.md.)
-          $man = Get-Content npm/engine-manifest.json -Raw | ConvertFrom-Json
-          $eng = "dist\gladius-engine-$($man.engine.release)-windows-x86_64"
-          New-Item -ItemType Directory -Path $eng -Force | Out-Null
-          Copy-Item bin\obscura.exe, bin\obscura-worker.exe -Destination $eng
-          New-Item -ItemType Directory -Path "$eng\THIRD-PARTY-LICENSES" -Force | Out-Null
-          Copy-Item THIRD-PARTY-LICENSES\Apache-2.0.txt -Destination "$eng\THIRD-PARTY-LICENSES"
-          @(
-            "Engine provenance for $($man.engine.archive.name)",
-            "upstream: $($man.engine.upstream)",
-            "release: $($man.engine.release)",
-            "asset: $($man.engine.archive.url)",
-            "zip sha256: $($man.engine.archive.sha256)  size: $($man.engine.archive.size)",
-            "obscura.exe sha256: $(($man.engine.files | Where-Object name -eq 'obscura.exe').sha256)",
-            "obscura-worker.exe sha256: $(($man.engine.files | Where-Object name -eq 'obscura-worker.exe').sha256)"
-          ) | Out-File "$eng\ENGINE-PROVENANCE.txt" -Encoding ascii
-          Compress-Archive -Path "$eng\*" -DestinationPath "$eng.zip" -Force
-          Remove-Item -LiteralPath $eng -Recurse -Force
-          $engHash = (Get-FileHash -Algorithm SHA256 -Path "$eng.zip").Hash.ToLowerInvariant()
-          "$engHash  $(Split-Path $eng -Leaf).zip" | Out-File "$eng.zip.sha256" -Encoding ascii
-          Write-Host "engine repack: $engHash"
       - name: assert versions + fill manifest from real artifacts
         shell: pwsh
         run: |
@@ -88,50 +83,52 @@ jobs:
           if (-not $tag.StartsWith('v')) { throw "tag '$tag' does not start with v" }
           $ver = $tag.Substring(1)
           function Get-Sha([string]$p) { return (Get-FileHash -Algorithm SHA256 -Path $p).Hash.ToLowerInvariant() }
-          # 1. One version everywhere: tag == crate == npm package.
+          # 1. One version everywhere: tag == crate == npm package == manifest serverVersion.
           $cargo = Get-Content Cargo.toml -Raw
           if ($cargo -notmatch '(?m)^version\s*=\s*"([^"]+)"') { throw 'cannot read crate version from Cargo.toml' }
           if ($Matches[1] -ne $ver) { throw "crate version $($Matches[1]) != tag version $ver" }
           $pkg = Get-Content npm/package.json -Raw | ConvertFrom-Json
           if ($pkg.version -ne $ver) { throw "npm package version $($pkg.version) != tag version $ver" }
           if ($null -ne $pkg.scripts) { throw 'npm/package.json must not contain a scripts field (postinstall would never run under npx)' }
-          # 2. Engine identity drift gate: the manifest must agree with
-          # scripts/fetch-engine.ps1 (match is case-insensitive; the script
-          # stores uppercase hex) AND with the provisioned bin/ bytes.
           $man = Get-Content npm/engine-manifest.json -Raw | ConvertFrom-Json
-          $ps1 = Get-Content scripts/fetch-engine.ps1 -Raw
-          $obscura = @($man.engine.files | Where-Object name -eq 'obscura.exe')[0]
-          $worker = @($man.engine.files | Where-Object name -eq 'obscura-worker.exe')[0]
-          foreach ($v in @($man.engine.archive.url, $man.engine.archive.sha256, $obscura.sha256, $worker.sha256)) {
-            if ($ps1 -notmatch [regex]::Escape($v)) { throw "drift: manifest value not found in scripts/fetch-engine.ps1: $v" }
+          if ($man.serverVersion -ne $ver) { throw "manifest serverVersion $($man.serverVersion) != tag version $ver" }
+          # 2. Browser identity drift gate: the npm manifest's browser pin must
+          # equal the integrity root scripts/chromium-manifest.json, agree with
+          # the pin constants in scripts/fetch-chromium.ps1, and match the
+          # provisioned browser bytes (checked on the exe, the security-critical file).
+          $cm = Get-Content scripts/chromium-manifest.json -Raw | ConvertFrom-Json
+          $pinned = $cm.browser | ConvertTo-Json -Depth 8 -Compress
+          $declared = $man.browser | ConvertTo-Json -Depth 8 -Compress
+          if ($pinned -ne $declared) { throw 'drift: npm/engine-manifest.json browser pin != scripts/chromium-manifest.json' }
+          $ps1 = Get-Content scripts/fetch-chromium.ps1 -Raw
+          foreach ($v in @($man.browser.version, $man.browser.asset.url, $man.browser.asset.sha256)) {
+            if ($ps1 -notmatch [regex]::Escape($v)) { throw "drift: browser pin value not found in scripts/fetch-chromium.ps1: $v" }
           }
-          foreach ($n in @("$($man.engine.archive.size)", "$($obscura.size)", "$($worker.size)")) {
-            if ($ps1 -notmatch [regex]::Escape($n)) { throw "drift: manifest size not found in scripts/fetch-engine.ps1: $n" }
+          foreach ($n in @("$($man.browser.asset.size)")) {
+            if ($ps1 -notmatch [regex]::Escape($n)) { throw "drift: browser pin size not found in scripts/fetch-chromium.ps1: $n" }
           }
-          foreach ($f in @($obscura, $worker)) {
-            $p = Join-Path 'bin' $f.name
-            if ((Get-Item -LiteralPath $p).Length -ne $f.size) { throw "bin\$($f.name) size drift vs manifest" }
-            if ((Get-Sha $p) -ne $f.sha256.ToLowerInvariant()) { throw "bin\$($f.name) hash drift vs manifest" }
-          }
-          Write-Host 'engine identity agrees: manifest == fetch-engine.ps1 == bin/'
+          $pinDir = "$($cm.browser.version)-$($cm.browser.asset.sha256.Substring(0,8))"
+          $exeName = "$($cm.browser.root)/chrome-headless-shell.exe"
+          $exeEntry = @($cm.browser.files | Where-Object name -eq $exeName)[0]
+          $exePath = Join-Path $env:LOCALAPPDATA "gladius\chromium\$pinDir\$($exeName.Replace('/','\'))"
+          if ((Get-Item -LiteralPath $exePath).Length -ne $exeEntry.size) { throw 'provisioned browser exe size drift vs manifest' }
+          if ((Get-Sha $exePath) -ne $exeEntry.sha256.ToLowerInvariant()) { throw 'provisioned browser exe hash drift vs manifest' }
+          Write-Host 'browser identity agrees: npm manifest == chromium-manifest.json == fetch-chromium.ps1 == provisioned bytes'
           # 3. Fill the release-computed hashes from the real artifacts.
           $repo = 'https://github.com/nathwn12/gladius'
           $bundle = "gladius-$tag-windows-x86_64.zip"
-          $engName = "gladius-engine-$($man.engine.release)-windows-x86_64.zip"
           $server = Get-Item -LiteralPath target\release\gladius.exe
-          $man.serverVersion = $ver
           $man.runtime.source = "$repo/releases/download/$tag"
           $man.runtime.archive.name = $bundle
           $man.runtime.archive.sha256 = Get-Sha "dist\$bundle"
           $man.runtime.archive.size = (Get-Item -LiteralPath "dist\$bundle").Length
           $man.runtime.server.sha256 = Get-Sha $server.FullName
           $man.runtime.server.size = $server.Length
-          $man.engine.repack.name = $engName
-          $man.engine.repack.sha256 = Get-Sha "dist\$engName"
-          $man.engine.repack.size = (Get-Item -LiteralPath "dist\$engName").Length
           $man | ConvertTo-Json -Depth 8 | Out-File npm/engine-manifest.json -Encoding utf8
           Copy-Item npm/engine-manifest.json dist/engine-manifest.json
           Write-Host "manifest filled for $tag"
+      # Artifacts hand files to the publish job only; retention-days: 1 keeps
+      # them out of the plan allowance (no public-repo exemption).
       - uses: actions/upload-artifact@v7
         with:
           name: dist
@@ -140,11 +137,13 @@ jobs:
             dist/*.zip.sha256
             dist/engine-manifest.json
           if-no-files-found: error
+          retention-days: 1
       - uses: actions/upload-artifact@v7
         with:
           name: npm-package
           path: npm/
           if-no-files-found: error
+          retention-days: 1
   publish:
     name: github release + npm publish
     needs: [build]
@@ -183,6 +182,6 @@ jobs:
           node -e "const v=process.versions.node.split('.').map(Number); if (!(v[0]>22||(v[0]===22&&v[1]>=14))) { console.error('need node >= 22.14.0'); process.exit(1) }"
           node -e "const v=require('child_process').execSync('npm --version').toString().trim().split('.').map(Number); if (!(v[0]>11||(v[0]===11&&(v[1]>5||(v[1]===5&&v[2]>=1))))) { console.error('need npm >= 11.5.1'); process.exit(1) }"
           test "$(node -p "require('./npm-pkg/package.json').version")" = "${GITHUB_REF_NAME#v}" || { echo "npm package version != tag version"; exit 1; }
-          node -e "for (const f of ['./npm-pkg/package.json','./npm-pkg/engine-manifest.json','./npm-pkg/bin/gladius-mcp.js']) require('fs').accessSync(f); const p=require('./npm-pkg/package.json'); if (p.scripts!==undefined) { console.error('scripts field present'); process.exit(1) }; const m=require('./npm-pkg/engine-manifest.json'); for (const s of [m.runtime.archive.sha256, m.runtime.server.sha256, m.engine.repack.sha256]) if (!/^[0-9a-f]{64}$/.test(s)) { console.error('manifest still has placeholder hashes'); process.exit(1) }; console.log('npm package OK: no scripts field, all release hashes filled')"
+          node -e "for (const f of ['./npm-pkg/package.json','./npm-pkg/engine-manifest.json','./npm-pkg/bin/gladius-mcp.js']) require('fs').accessSync(f); const p=require('./npm-pkg/package.json'); if (p.scripts!==undefined) { console.error('scripts field present'); process.exit(1) }; const m=require('./npm-pkg/engine-manifest.json'); if (m.serverVersion!==p.version) { console.error('serverVersion != package version'); process.exit(1) }; for (const s of [m.runtime.archive.sha256, m.runtime.server.sha256, m.browser.asset.sha256]) if (!/^[0-9a-f]{64}$/.test(s)) { console.error('manifest still has placeholder hashes'); process.exit(1) }; if (!Array.isArray(m.browser.files) || m.browser.files.length!==m.browser.fileCount) { console.error('browser file list != fileCount'); process.exit(1) }; console.log('npm package OK: no scripts field, serverVersion matches, all release hashes filled, browser pin complete')"
       - name: publish to npm (OIDC trusted publishing)
         run: npm publish ./npm-pkg

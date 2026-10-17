@@ -97,12 +97,15 @@ Rule: a bump lands through the suite and the e2e before any release.
 ## Licence posture
 
 DECISION (owner can override): the browser is FETCHED from Google's endpoint at
-provision time and is NEVER redistributed in our release assets. The release workflow
-repacks only the Obscura engine, never the chromium tree.
+provision time and is NEVER redistributed in our release assets or npm package.
+The runtime bundle carries only the server plus licences/notices, including a
+`THIRD-PARTY-LICENSES/LICENSE.headless_shell` attribution copy taken from the
+provisioned (sha-verified) browser cache — carried for attribution, never as
+bundled browser bytes.
 
 - The manifest is our integrity root, not a licence.
 - The shipped `LICENSE.headless_shell` (inside the CfT zip, recorded in the manifest)
-  is carried for attribution if anyone ever bundles the browser.
+  is carried for attribution because the bundle carries no browser bytes at all.
 
 Open question, stated plainly: no primary statement of CfT redistribution terms was
 found, which is why we do not redistribute.

@@ -1,18 +1,20 @@
 # Publishing gladius-mcp (owner only)
 
 `npx gladius-mcp@latest` installs the launcher in `npm/` plus the pinned
-engine manifest. The engine itself is fetched on first RUN, never at
-install. Do NOT publish, tag, or release from any automated session:
-every step below is a human act, in order.
+browser/runtime manifest. The server runtime is fetched on first RUN from
+the tagged GitHub Release, and the browser from Google's
+Chrome-for-Testing endpoint — never at install. Do NOT publish, tag, or
+release from any automated session: every step below is a human act, in
+order.
 
-> REDISTRIBUTION CAVEAT — settle BEFORE the first public release. The
-> release archives redistribute a third-party engine binary (Obscura
-> `v0.2.4`, upstream Apache-2.0, https://github.com/h4ckf0r0day/obscura).
-> The workflow carries the licence into every archive
-> (`THIRD-PARTY-LICENSES/Apache-2.0.txt`, `ENGINE-PROVENANCE.txt`,
-> `THIRD-PARTY-NOTICES.md`), but carrying a file is not permission: confirm
-> the redistribution question yourself before anything goes public. Do not
-> delegate this judgment, do not silently skip it.
+> POSTURE (settled — no redistribution question remains). No third-party
+> binary is redistributed: Obscura no longer ships anywhere. The runtime
+> bundle carries only the server plus licences/notices (including the
+> Chromium licence attribution copy
+> `THIRD-PARTY-LICENSES/LICENSE.headless_shell`, taken from the provisioned,
+> sha-verified browser cache). The browser itself is fetched at provision
+> time from Google and never bundled — which is also why our own manifest
+> is the integrity root (CfT publishes no hashes).
 
 Prerequisites: an npm account (first publish is manual, with 2FA or a
 granular token), and locally npm >= 11.5.1 with Node >= 22.14.0
@@ -24,11 +26,11 @@ granular token), and locally npm >= 11.5.1 with Node >= 22.14.0
    own the package. Package name is unscoped `gladius-mcp`; it publishes
    under whoever publishes first — confirm the handle at sign-in.
 
-2. Push the version tag (e.g. `v0.2.0`). The `release` workflow builds the
-   crate with the MSRV toolchain, runs the suite, provisions the pinned
-   engine, assembles the runtime bundle + engine re-pack, fills
-   `engine-manifest.json` with hashes computed from the REAL artifacts,
-   and creates the GitHub Release with the archives attached. Its
+2. Push the version tag (e.g. `v0.2.1`). The `release` workflow builds the
+   crate with the MSRV toolchain, runs the suite against the provisioned
+   pinned browser, assembles the server-only runtime bundle (no browser
+   bytes), fills `engine-manifest.json` with hashes computed from the REAL
+   artifacts, and creates the GitHub Release with the archives attached. Its
    `npm publish` step FAILS (no trusted publisher yet) — expected, not a
    problem. Nothing reaches npm.
 
@@ -65,8 +67,12 @@ granular token), and locally npm >= 11.5.1 with Node >= 22.14.0
 A release tag `vX.Y.Z` requires, on that commit: `Cargo.toml` version
 `X.Y.Z`, `npm/package.json` version `X.Y.Z`, `npm/engine-manifest.json`
 `serverVersion` `X.Y.Z` with matching `runtime.source`/`runtime.archive`
-names (the workflow asserts all three equal the tag and fills the hashes),
+names (the workflow asserts all four equal the tag and fills the hashes),
 and a `CHANGELOG.md` entry. The workflow fails closed on any mismatch.
+The manifest's `browser` pin must equal `scripts/chromium-manifest.json`'s
+(the workflow asserts deep equality plus the `fetch-chromium.ps1` constants
+and the provisioned bytes); a browser bump also refreshes the version named
+in `THIRD-PARTY-NOTICES.md`.
 
 ## Why these exact values
 

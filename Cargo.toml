@@ -1,9 +1,9 @@
 [package]
 name = "gladius"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
-description = "Browser-use MCP server in Rust driving the owned Obscura engine over CDP - single static binary, stdio transport"
+description = "Browser-use MCP server in Rust driving the owned pinned Chromium (chrome-headless-shell) over CDP - single static binary, stdio transport"
 repository = "https://github.com/nathwn12/gladius"
 keywords = ["mcp", "model-context-protocol", "browser-automation", "cdp", "headless-browser"]
 categories = ["command-line-utilities"]
