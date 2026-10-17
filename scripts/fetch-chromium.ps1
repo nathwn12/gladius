@@ -16,8 +16,7 @@
   never touches the user's installed Brave/Edge/Chrome profiles.
 
   Recovery: delete the cache dir shown below (or re-run with -Force) and run
-  this script again. The Rust engine swap that consumes this cache is a
-  later pass; until then the absence error text names this script.
+  this script again.
 
   Update path: -Check resolves the newest Stable CfT build from
   last-known-good-versions.json, compares it with the pin, prints both plus
@@ -287,6 +286,27 @@ if ($Update) {
     $selfText = $selfText -replace ([regex]::Escape(('$ExpectedZipSize = {0}' -f $ExpectedZipSize))), ('$ExpectedZipSize = {0}' -f $newZipSize)
     [System.IO.File]::WriteAllText($selfPath, $selfText, [System.Text.UTF8Encoding]::new($false))
     Write-Host 'updated pin constants in scripts/fetch-chromium.ps1'
+
+    # Same-pass runtime pin: src/browser.rs searches the versioned cache dir
+    # `<version>-<zip-sha8>`, so a manifest-only bump would provision the new
+    # browser while the executable still searches the OLD directory. Rewrite
+    # the runtime constants here and VALIDATE in this same pass (fail closed
+    # on any mismatch); the `pinned_runtime_matches_manifest` unit test
+    # re-validates on every suite run so drift can never ship silently.
+    $newShort8 = $newZipHash.Substring(0, 8)
+    $oldShort8 = $ExpectedZipSha256.Substring(0, 8)
+    $browserRs = Join-Path $PSScriptRoot '../src/browser.rs'
+    $rsText = [System.IO.File]::ReadAllText($browserRs)
+    $rsText = $rsText -replace ([regex]::Escape(('PINNED_CHROMIUM_VERSION: &str = "{0}"' -f $oldVersion))), ('PINNED_CHROMIUM_VERSION: &str = "{0}"' -f $newVersion)
+    $rsText = $rsText -replace ([regex]::Escape(('PINNED_ZIP_SHORT8: &str = "{0}"' -f $oldShort8))), ('PINNED_ZIP_SHORT8: &str = "{0}"' -f $newShort8)
+    [System.IO.File]::WriteAllText($browserRs, $rsText, [System.Text.UTF8Encoding]::new($false))
+    $rsCheck = [System.IO.File]::ReadAllText($browserRs)
+    if (-not $rsCheck.Contains(('PINNED_CHROMIUM_VERSION: &str = "{0}"' -f $newVersion)) -or
+        -not $rsCheck.Contains(('PINNED_ZIP_SHORT8: &str = "{0}"' -f $newShort8))) {
+      Write-Host 'scripts\fetch-chromium.ps1: runtime pin update FAILED: src/browser.rs constants do not carry the new pin after rewrite; wrote manifest+script but refusing cache work.'
+      exit 1
+    }
+    Write-Host 'updated runtime pin constants in src/browser.rs and validated'
 
     if (Test-Path -LiteralPath $newCacheDir) {
       $already = Get-RelFiles $newCacheDir | Sort-Object Rel

@@ -4,8 +4,11 @@
 # scripts/fetch-chromium.ps1 -Check (download nothing), then runs
 # scripts/fetch-chromium.ps1 -Update. If Stable moved, -Update downloads the
 # new win64 chrome-headless-shell zip, recomputes scripts/chromium-manifest.json
-# from the real files, updates the pin constants in scripts/fetch-chromium.ps1,
-# and this workflow opens (or updates) a pull request with those two files.
+# from the real files, updates the pin constants in scripts/fetch-chromium.ps1
+# AND the runtime pin constants in src/browser.rs in the same pass (validated
+# there; the `pinned_runtime_matches_manifest` unit test re-validates on
+# every suite run), and this workflow opens (or updates) a pull request with
+# those three files.
 # A human lands the bump through the suite and the e2e before any release;
 # this workflow NEVER merges, never tags, never publishes.
 #
@@ -42,9 +45,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
-          git diff --quiet -- scripts/chromium-manifest.json scripts/fetch-chromium.ps1
+          git diff --quiet -- scripts/chromium-manifest.json scripts/fetch-chromium.ps1 src/browser.rs
           if ($LASTEXITCODE -eq 0) {
-            Write-Host 'browser-update: manifest+script unchanged; no PR.'
+            Write-Host 'browser-update: manifest+script+runtime unchanged; no PR.'
             exit 0
           }
           $man = Get-Content scripts/chromium-manifest.json -Raw | ConvertFrom-Json
@@ -53,7 +56,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git checkout -B $branch
-          git add scripts/chromium-manifest.json scripts/fetch-chromium.ps1
+          git add scripts/chromium-manifest.json scripts/fetch-chromium.ps1 src/browser.rs
           git commit -m ("chore(browser): bump chrome-headless-shell to {0}" -f $newVer)
           git push -u origin $branch
           $existing = ''

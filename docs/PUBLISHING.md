@@ -41,12 +41,29 @@ granular token), and locally npm >= 11.5.1 with Node >= 22.14.0
    launcher refuses to run with). Verify: `npm view gladius-mcp version`
    and `npx gladius-mcp@latest --doctor`.
 
-4. Trusted publisher. In the package's Settings → Trusted Publisher →
-   GitHub Actions enter exactly: Organization or user `nathwn12`
-   (required), Repository `gladius` (required), Workflow filename
-   `release.yml` (required — filename only, exact case; it exists in
-   `.github/workflows/`). Optionally an Environment and an
-   allowed-actions choice (`npm stage publish` is always allowed).
+4. Trusted publisher (VERIFIED CLI route — trust is NOW REGISTERED).
+   From your own machine, in an interactive shell (it needs a one-time
+   password: npm prints a web-auth URL for a person's approval in the
+   browser), run exactly:
+
+   ```powershell
+   npm trust github gladius-mcp --file release.yml --repo nathwn12/gladius --allow-publish --allow-stage-publish
+   ```
+
+   This works even before a first publish (no existing version required).
+   Fallback: the package's Settings → Trusted Publisher → GitHub Actions
+   panel with exactly Organization or user `nathwn12` (required),
+   Repository `gladius` (required), Workflow filename `release.yml`
+   (required — filename only, exact case; it exists in
+   `.github/workflows/`), optionally an Environment and an allowed-actions
+   choice (`npm stage publish` is always allowed).
+
+   Status: this trust is NOW REGISTERED. Proven working: a re-run of the
+   publish step got past authentication and failed only on the version
+   clash (the manually published version cannot be re-published by the
+   workflow). Consequently every `v*` tag from here on publishes over OIDC
+   with automatic provenance and NO human step — no `--provenance` flag,
+   no token, no long-lived tokens stored anywhere.
 
 5. Within 2 DAYS of configuring, land the first workflow publish: cut the
    next version (checklist below) and push its `v*` tag. The publish job

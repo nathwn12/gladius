@@ -343,9 +343,9 @@ async fn tool_navigate(browser: &Browser, url: &str) -> Result<Value, ToolErr> {
     // capture here), and a hardcoded 200 lies on every 404. A wrong field is
     // worse than no field, so the envelope is just url + title.
     //
-    // Transient blank-load race (first measured on the former Obscura
-    // engine, which double-fetched documents so the losing request could
-    // commit an EMPTY DOM - empty title, empty body - at the right URL):
+    // Transient blank-load race (a commit of an EMPTY DOM - empty title,
+    // empty body - at the right URL, historically observed as a double-fetch
+    // race where the losing request won the commit):
     // when the committed page is non-blank yet title AND body text are both
     // empty, say so in a `warning` field so the caller can see it (and
     // re-navigate - the flake is retryable). One extra eval, only on

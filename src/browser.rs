@@ -94,7 +94,16 @@ struct Shared {
     /// that never ask pay nothing.
     net_inflight: AsyncMutex<HashSet<String>>,
     net_notify: tokio::sync::Notify,
-    net_enabled: AsyncMutex<bool>,
+    /// Sessions where the CDP Network domain has been enabled. `Network`
+    /// is session-scoped like the viewport override: a later attach (new
+    /// tab, re-attach) gets a FRESH session id that has never seen
+    /// `Network.enable`, so a connection-wide boolean would leave the new
+    /// tab unobserved while `wait_network_idle` still reported idle (a
+    /// FALSE idle). Tracking per session lets `ensure_network` enable on
+    /// the then-current session and lets `attach_to` replay onto the new
+    /// one; the in-flight set is cleared on attach so stale ids from the
+    /// old session neither block nor fake the new session's idle.
+    net_enabled: AsyncMutex<HashSet<String>>,
     /// Active device-metrics override (`Emulation.setDeviceMetricsOverride`
     /// params), or None when the engine default applies. The override is a
     /// property of the CDP SESSION, not of the connection, so it is
@@ -116,13 +125,17 @@ struct Shared {
 ///   the CDP session we opened and never kills, never sweeps a profile.
 enum Engine {
     Owned {
-        /// Private profile dir for this instance (created fresh before
-        /// launch; `Drop` sweeps it after the tree is reaped).
-        _profile: ProfileDir,
-        #[cfg(windows)]
-        _job: Option<std::os::windows::io::OwnedHandle>,
         child: Box<tokio::process::Child>,
         pid: u32,
+        #[cfg(windows)]
+        _job: Option<std::os::windows::io::OwnedHandle>,
+        /// Private profile dir for this instance (created fresh before
+        /// launch; swept deterministically in `close()` after the tree is
+        /// reaped, with a bounded retry in `Drop` as fallback). Declared
+        /// LAST so Rust drops it LAST: the profile must outlive the child
+        /// handle and the job cover, or grandchildren still holding files
+        /// would make the sweep fail.
+        _profile: ProfileDir,
     },
     Attached {
         cdp_url: String,
@@ -219,7 +232,7 @@ fn new_shared(sink: WsSink) -> Arc<Shared> {
         console: AsyncMutex::new(VecDeque::new()),
         net_inflight: AsyncMutex::new(HashSet::new()),
         net_notify: tokio::sync::Notify::new(),
-        net_enabled: AsyncMutex::new(false),
+        net_enabled: AsyncMutex::new(HashSet::new()),
         viewport: AsyncMutex::new(None),
     })
 }
@@ -464,18 +477,23 @@ impl Browser {
         // acknowledgement (measured on Chromium: stale size but fresh DPR
         // immediately after clear, correct size within 1s). Poll briefly
         // for a size that differs from pre-clear; expiry just falls through
-        // to the tool's live read-back, never an error.
+        // to the tool's live read-back, never an error. Each read-back is
+        // wrapped in the REMAINING settle budget: the read-back allows
+        // `send_raw`'s 30 s per-call timeout, so an unwrapped await would
+        // turn this 1 s settle into 30 s+.
         if let Some((bw, bh, _)) = before {
             let deadline = Instant::now() + Duration::from_secs(1);
             loop {
-                match self.viewport_readback().await {
-                    Ok((w, h, _)) if w != bw || h != bh => break,
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(remaining, self.viewport_readback()).await {
+                    Ok(Ok((w, h, _))) if w != bw || h != bh => break,
                     _ => {}
                 }
                 if Instant::now() >= deadline {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
             }
         }
         r
@@ -672,20 +690,48 @@ impl Browser {
                 reader,
             } = inner;
             match engine {
-                Engine::Owned { mut child, pid, .. } => {
+                Engine::Owned {
+                    _profile: profile,
+                    #[cfg(windows)]
+                    _job: job,
+                    mut child,
+                    pid,
+                } => {
                     reader.abort();
-                    // Fast path: terminate the direct child and wait for it. The
-                    // KILL_ON_JOB_CLOSE job handle (dropped with the rest of the
-                    // owned state) reaps surviving grandchildren, so the old
-                    // taskkill spawn (~220 ms measured) is fallback-only.
-                    let _ = child.kill().await;
+                    // Deterministic reap-then-sweep: non-waiting termination
+                    // followed by deadline-wrapped waits (never an unbounded
+                    // await), then a bounded tree-kill fallback, then a
+                    // bounded profile sweep. The profile outlives the child
+                    // handle and the job cover by declaration order, and is
+                    // swept here explicitly before `close()` returns, so a
+                    // clean close guarantees the dir is gone (the red-gate
+                    // assertion) instead of racing grandchildren still
+                    // holding files.
+                    let _ = child.start_kill();
                     let exited =
                         tokio::time::timeout(Duration::from_secs(2), child.wait())
                             .await
-                            .is_ok();
-                    if !exited {
-                        kill_tree(pid);
+                            .map(|r| r.is_ok())
+                            .unwrap_or(false);
+                    #[cfg(windows)]
+                    let job_cover = job.is_some();
+                    #[cfg(not(windows))]
+                    let job_cover = true;
+                    if !exited || !job_cover {
+                        #[cfg(windows)]
+                        if !job_cover {
+                            eprintln!(
+                                "[gladius] close: no job cover (assignment failed at launch); forcing kill_tree fallback for pid {pid}"
+                            );
+                        }
+                        kill_tree_bounded(pid).await;
                         let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                    }
+                    #[cfg(windows)]
+                    drop(job);
+                    if let Err(e) = sweep_profile_dir(profile.path()).await {
+                        eprintln!("[gladius] close: profile sweep failed: {e}");
+                        return Err(e);
                     }
                 }
                 Engine::Attached { cdp_url } => {
@@ -807,18 +853,23 @@ impl Browser {
         }
     }
 
-    /// Enable the CDP Network domain once (lazy: the first network-idle
-    /// wait pays one round-trip; every other op pays nothing). On Chromium
-    /// `Network.enable` alone is sufficient to observe request starts via
-    /// `Network.requestWillBeSent`; no `Fetch.enable` interception is used.
+    /// Enable the CDP Network domain on the CURRENT session (lazy: the first
+    /// network-idle wait pays one round-trip per session; every other op
+    /// pays nothing). `Network` is session-scoped, so enablement is tracked
+    /// PER SESSION: a later attach gets a fresh session that must be
+    /// enabled separately, or its requests would never surface as
+    /// `requestWillBeSent` events and `wait_network_idle` would report a
+    /// false idle. On Chromium `Network.enable` alone is sufficient to
+    /// observe request starts via `Network.requestWillBeSent`; no
+    /// `Fetch.enable` interception is used.
     pub async fn ensure_network(&self) -> Result<(), String> {
         let shared = self.shared().await?;
-        if *shared.net_enabled.lock().await {
+        let session = ensure_session(&shared).await?;
+        if shared.net_enabled.lock().await.contains(&session) {
             return Ok(());
         }
-        let session = ensure_session(&shared).await?;
         send_raw(&shared, "Network.enable", json!({}), Some(session.clone())).await?;
-        *shared.net_enabled.lock().await = true;
+        shared.net_enabled.lock().await.insert(session);
         Ok(())
     }
 
@@ -986,6 +1037,12 @@ async fn attach_to(shared: &Arc<Shared>, target_id: &str) -> Result<String, Stri
         .to_string();
     *shared.session.lock().await = Some(sid.clone());
     *shared.target.lock().await = Some(target_id.to_string());
+    // New session means fresh Network accounting: request ids are
+    // session-scoped, so stale in-flight ids from the old session would
+    // otherwise block the new session's idle forever (or, when empty,
+    // fake it). Clear here; the replay below re-arms observation.
+    shared.net_inflight.lock().await.clear();
+    shared.net_notify.notify_waiters();
     // Enable page events on every new session: this is what delivers
     // Page.javascriptDialogOpening to the reader for auto-handling.
     let _ = send_raw(shared, "Page.enable", json!({}), Some(sid.clone())).await;
@@ -995,6 +1052,19 @@ async fn attach_to(shared: &Arc<Shared>, target_id: &str) -> Result<String, Stri
     // two string compares per event, i.e. no steady-state cost.
     let _ = send_raw(shared, "Runtime.enable", json!({}), Some(sid.clone())).await;
     let _ = send_raw(shared, "Log.enable", json!({}), Some(sid.clone())).await;
+    // Replay Network enablement onto THIS session when any prior session
+    // needed it. Without the replay a newly attached tab would never emit
+    // `requestWillBeSent`, so a network-idle wait on it would return a
+    // FALSE idle. Best-effort like the enables above; a replay failure
+    // leaves this session unmarked so the next `ensure_network` retries.
+    let had_network = !shared.net_enabled.lock().await.is_empty();
+    if had_network
+        && send_raw(shared, "Network.enable", json!({}), Some(sid.clone()))
+            .await
+            .is_ok()
+    {
+        shared.net_enabled.lock().await.insert(sid.clone());
+    }
     // Replay an active device-metrics override onto THIS session. The
     // override is session-scoped, so a new tab / re-attach would otherwise
     // observe (and report) the engine default while the caller still holds
@@ -1988,7 +2058,67 @@ impl ProfileDir {
 
 impl Drop for ProfileDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        // Fallback sweep for non-`close()` drops (abnormal exits): `close()`
+        // already swept deterministically above. Bounded retries with a
+        // report instead of a silent discard, so a failed removal is never
+        // swallowed.
+        for attempt in 0..5 {
+            if std::fs::symlink_metadata(&self.path).is_err() {
+                return;
+            }
+            if let Err(e) = std::fs::remove_dir_all(&self.path) {
+                if attempt == 4 {
+                    eprintln!(
+                        "[gladius] profile drop: remove {} failed: {e}",
+                        self.path.display()
+                    );
+                }
+            }
+            if std::fs::symlink_metadata(&self.path).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if std::fs::symlink_metadata(&self.path).is_ok() {
+            eprintln!(
+                "[gladius] profile drop: {} still present after bounded retries",
+                self.path.display()
+            );
+        }
+    }
+}
+
+/// Deterministic profile sweep for `close()`: retries `remove_dir_all` until
+/// the dir is gone or the budget (10 s, matching the gate's poll window)
+/// expires. Returns `Err` (reported by the caller) instead of discarding
+/// the failure, so a red gate names its cause. Grandchildren still holding
+/// files under load are the reason for the retries: the tree is reaped
+/// before this runs, but Windows file locks release asynchronously.
+async fn sweep_profile_dir(path: &std::path::Path) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_err: String;
+    loop {
+        if std::fs::symlink_metadata(path).is_err() {
+            return Ok(());
+        }
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => {
+                if std::fs::symlink_metadata(path).is_err() {
+                    return Ok(());
+                }
+                last_err = "remove succeeded but dir still present".to_string();
+            }
+            Err(e) => {
+                last_err = e.to_string();
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "profile sweep: {} still present after bounded retries: {last_err}",
+                path.display()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -2038,6 +2168,9 @@ fn owner_alive(_pid: u32) -> bool {
 
 #[cfg(windows)]
 fn kill_tree(pid: u32) {
+    // Best-effort synchronous fallback for `Drop` contexts (which cannot
+    // await). Bounded: polls `try_wait` up to 5 s instead of the old
+    // unbounded `status()` wait, then reports and gives up.
     let mut cmd = std::process::Command::new("taskkill");
     cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
@@ -2048,11 +2181,82 @@ fn kill_tree(pid: u32) {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    let _ = cmd.status();
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[gladius] kill_tree: spawn taskkill for pid {pid} failed: {e}");
+            return;
+        }
+    };
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    eprintln!("[gladius] kill_tree: taskkill for pid {pid} exited: {status}");
+                }
+                return;
+            }
+            Ok(None) => {
+                if start.elapsed() >= Duration::from_secs(5) {
+                    eprintln!(
+                        "[gladius] kill_tree: taskkill for pid {pid} timed out after 5s (bounded); giving up"
+                    );
+                    let _ = child.kill();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                eprintln!("[gladius] kill_tree: try_wait for pid {pid} failed: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// Bounded async tree-kill for the `close()` path: `taskkill /T /F` wrapped
+/// in a 5 s timeout (never unbounded), with failures reported to stderr
+/// instead of discarded. The `CREATE_NO_WINDOW` flag keeps the reaper
+/// windowless like every other spawn.
+#[cfg(windows)]
+async fn kill_tree_bounded(pid: u32) {
+    let mut cmd = tokio::process::Command::new("taskkill");
+    cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[gladius] kill_tree: spawn taskkill for pid {pid} failed: {e}");
+            return;
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(Ok(status)) => {
+            if !status.success() {
+                eprintln!("[gladius] kill_tree: taskkill for pid {pid} exited: {status}");
+            }
+        }
+        Ok(Err(e)) => {
+            eprintln!("[gladius] kill_tree: wait for pid {pid} failed: {e}");
+        }
+        Err(_) => {
+            eprintln!(
+                "[gladius] kill_tree: taskkill for pid {pid} timed out after 5s (bounded); giving up"
+            );
+            let _ = child.start_kill();
+        }
+    }
 }
 
 #[cfg(not(windows))]
 fn kill_tree(_pid: u32) {}
+
+#[cfg(not(windows))]
+async fn kill_tree_bounded(_pid: u32) {}
 
 /// Raw `kernel32` job-object cover (G-4): no new crate. The spawned browser
 /// is assigned to a job with `KILL_ON_JOB_CLOSE`, so the OS reaps the whole
@@ -2382,6 +2586,120 @@ mod tests {
         for t in fake.tasks {
             t.abort();
         }
+    }
+
+    /// Network follows the session: `Network.enable` is tracked PER SESSION
+    /// and replayed on every new attach, with the in-flight set cleared so
+    /// stale ids neither block nor fake the new tab's idle. Pre-fix the
+    /// enablement was one connection-wide boolean issued on the
+    /// then-current session and never replayed: a later attach left the new
+    /// tab unobserved while `wait_network_idle` still reported idle (a FALSE
+    /// idle). This test FAILS on that shape (second session never enabled,
+    /// stale in-flight retained) and passes on per-session replay + clear.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn network_enable_follows_session_on_attach() {
+        use std::sync::Mutex as StdMutex;
+        let enable_sessions = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let sid_ctr = Arc::new(AtomicU64::new(1));
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let port = ln.local_addr().expect("loopback addr").port();
+        let es = enable_sessions.clone();
+        let ctr = sid_ctr.clone();
+        let srv = tokio::spawn(async move {
+            while let Ok((s, _)) = ln.accept().await {
+                let es = es.clone();
+                let ctr = ctr.clone();
+                tokio::spawn(async move {
+                    let mut ws = match tokio_tungstenite::accept_async(s).await {
+                        Ok(w) => w,
+                        Err(_) => return,
+                    };
+                    while let Some(msg) = ws.next().await {
+                        let text = match msg {
+                            Ok(Message::Text(t)) => t.to_string(),
+                            Ok(Message::Binary(b)) => String::from_utf8_lossy(&b).into_owned(),
+                            _ => continue,
+                        };
+                        let v: Value = match serde_json::from_str(&text) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let id = match v.get("id").and_then(|i| i.as_u64()) {
+                            Some(i) => i,
+                            None => continue,
+                        };
+                        let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        let sess = v
+                            .get("sessionId")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if method == "Network.enable" && !sess.is_empty() {
+                            es.lock().unwrap().push(sess);
+                        }
+                        let result = match method {
+                            "Target.getTargets" => json!({"targetInfos": [
+                                {"targetId": "T1", "type": "page",
+                                 "url": "about:blank", "title": "fake"}
+                            ]}),
+                            "Target.attachToTarget" => {
+                                let n = ctr.fetch_add(1, Ordering::SeqCst);
+                                json!({"sessionId": format!("S{n}")})
+                            }
+                            "Runtime.evaluate" => json!({"result": {"type": "string", "value": "fake"}}),
+                            _ => json!({}),
+                        };
+                        let _ = ws
+                            .send(Message::Text(
+                                json!({"id": id, "result": result}).to_string().into(),
+                            ))
+                            .await;
+                    }
+                });
+            }
+        });
+        let ws_url = format!("ws://127.0.0.1:{port}/");
+        let inner = attach(&ws_url).await.expect("attach over ws");
+        let b = wrap_attached(inner);
+        // First network-idle enable lands on S1.
+        b.ensure_network().await.expect("enable on S1");
+        let shared = b.shared().await.expect("shared");
+        let s1 = shared.session.lock().await.clone().expect("S1 tracked");
+        assert_eq!(
+            enable_sessions.lock().unwrap().as_slice(),
+            &[s1.clone()],
+            "first enable on the first session"
+        );
+        // Stale accounting from the old session must not survive the switch.
+        shared
+            .net_inflight
+            .lock()
+            .await
+            .insert("stale-old-session-id".to_string());
+        // New tab / re-attach: fresh session, replay + clear.
+        let s2 = attach_to(&shared, "T2").await.expect("attach T2");
+        assert_ne!(s1, s2, "second attach gets a fresh session");
+        assert!(
+            enable_sessions.lock().unwrap().contains(&s2),
+            "FALSE IDLE: Network.enable was not replayed on the new session {s2} (saw {:?})",
+            enable_sessions.lock().unwrap()
+        );
+        assert!(
+            shared.net_inflight.lock().await.is_empty(),
+            "stale in-flight ids must be cleared on session change"
+        );
+        // Idempotent per session: a second ensure on the same session adds nothing.
+        b.ensure_network().await.expect("re-ensure on S2");
+        assert_eq!(
+            enable_sessions.lock().unwrap().len(),
+            2,
+            "one enable per session, no duplicates: {:?}",
+            enable_sessions.lock().unwrap()
+        );
+        b.close().await.expect("detach close");
+        srv.abort();
     }
 
     /// F4 proof: `console_drain` (single-lock take-and-return) against a
@@ -2911,6 +3229,65 @@ mod tests {
         std::env::set_var("GLADIUS_CHROMIUM_CACHE", &scratch);
         assert_eq!(find_chromium().expect("planted cache must win"), exe);
         std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// Pin drift: the runtime constants MUST equal the committed
+    /// `scripts/chromium-manifest.json` pin. After an advertised browser
+    /// bump the executable keeps searching the OLD versioned directory
+    /// unless all three move together (manifest + PowerShell constants +
+    /// these runtime constants), so a clean machine would provision the
+    /// new browser and never find it. This test FAILS on any drift, so
+    /// drift can never ship silently. The update path
+    /// (`scripts/fetch-chromium.ps1 -Update` + `.github/workflows/browser-update.yml`)
+    /// rewrites all three in the same pass; this test is the validator.
+    #[test]
+    fn pinned_runtime_matches_manifest() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let man_text = std::fs::read_to_string(root.join("scripts/chromium-manifest.json"))
+            .expect("read chromium-manifest.json");
+        let man: Value = serde_json::from_str(&man_text).expect("manifest parses");
+        let ver = man
+            .get("browser")
+            .and_then(|b| b.get("version"))
+            .and_then(|v| v.as_str())
+            .expect("manifest browser.version");
+        let sha = man
+            .get("browser")
+            .and_then(|b| b.get("asset"))
+            .and_then(|a| a.get("sha256"))
+            .and_then(|s| s.as_str())
+            .expect("manifest browser.asset.sha256");
+        let short8 = &sha[..8];
+        assert_eq!(
+            PINNED_CHROMIUM_VERSION, ver,
+            "runtime pin drift: src/browser.rs PINNED_CHROMIUM_VERSION != manifest version"
+        );
+        assert_eq!(
+            PINNED_ZIP_SHORT8, short8,
+            "runtime pin drift: src/browser.rs PINNED_ZIP_SHORT8 != manifest sha256[..8]"
+        );
+        // The runtime's expected versioned path must carry the manifest pin:
+        // a clean machine provisions `<version>-<short8>` and the executable
+        // searches exactly that directory.
+        let expected_frag = format!("{ver}-{short8}");
+        let probe = std::path::PathBuf::from("/probe-cache")
+            .join(format!("{PINNED_CHROMIUM_VERSION}-{PINNED_ZIP_SHORT8}"))
+            .join(CHROMIUM_EXE_REL.replace('/', std::path::MAIN_SEPARATOR_STR));
+        assert!(
+            probe.to_string_lossy().contains(&expected_frag),
+            "runtime expected path {probe:?} must carry the manifest pin {expected_frag}"
+        );
+        // The PowerShell pin constants must agree too (same-pass update).
+        let ps1 = std::fs::read_to_string(root.join("scripts/fetch-chromium.ps1"))
+            .expect("read fetch-chromium.ps1");
+        assert!(
+            ps1.contains(&format!("$PinnedVersion = '{ver}'")),
+            "fetch-chromium.ps1 pin drift: missing $PinnedVersion = '{ver}'"
+        );
+        assert!(
+            ps1.to_lowercase().contains(&sha.to_lowercase()),
+            "fetch-chromium.ps1 pin drift: missing zip sha256 {sha}"
+        );
     }
 
     /// dom-only refusal: screenshot errors naming the backend and the

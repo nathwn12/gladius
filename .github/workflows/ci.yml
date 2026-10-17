@@ -14,7 +14,11 @@ jobs:
     # (sha-verified) and run against it. CI must never point at a
     # runner-provided browser.
     steps:
-      - uses: actions/checkout@v4
+      # Action majors were verified against the GitHub Releases API on 2026-10-17:
+      # actions/checkout v7 (latest v7.0.1, published 2026-07-20) — the same
+      # major the repo's other workflows already use. v4 is Node-20 and the
+      # runner annotates its deprecation.
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # Read the pinned browser version + zip sha256 out of the integrity
       # root (scripts/chromium-manifest.json) so the cache key below names

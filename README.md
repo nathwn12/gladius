@@ -255,10 +255,16 @@ from a `v*` tag.
 - Tool errors are typed at the site (`code`/`reason` plus the real offending
   value, never derived by re-reading the prose); untyped engine failures use
   the `error` fallback with a code only.
-- A guard test fails the build if any ambient or shared-browser resolution
-  reappears in `src/` (system browser, Playwright/Puppeteer cache, bare
-  binary off `PATH`, the full `chrome-win64` artifact, or the piped debug
-  transport) — gladius is self-contained on the owned pinned Chromium.
+- A guard test (`tests/no_console_flash.rs`) fails the build if any of its
+  enumerated ambient/shared-browser substrings reappears in `src/`
+  (`ms-playwright`, `playwright`, `puppeteer`, `.cache/puppeteer`, `msedge`,
+  `brave`, `program files`, `chrome-win64`, bare `chrome.exe`, the per-user
+  `Google/Chrome/Application` layout, the removed `GLADIUS_CHROME` /
+  bare `GLADIUS_BACKEND` knobs, `--remote-debugging-pipe`, `--no-sandbox`,
+  `--disable-dev-shm-usage`, `--headless=new`, `--headless=old`) and every
+  `Command::new` spawn site lacks `CREATE_NO_WINDOW` — no wider claim:
+  gladius is self-contained on the owned pinned Chromium resolved only via
+  `GLADIUS_CHROMIUM` / `GLADIUS_CHROMIUM_CACHE` / `%LOCALAPPDATA%`.
 - No `[profile.release]` block: the release defaults are already the
   build-time-friendly set; dev keeps `line-tables-only` debuginfo for
   file:line backtraces.
