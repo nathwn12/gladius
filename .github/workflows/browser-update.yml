@@ -1,0 +1,71 @@
+# browser-update: monthly pinned-chromium bump check.
+#
+# What it does: resolves the newest Stable Chrome-for-Testing build via
+# scripts/fetch-chromium.ps1 -Check (download nothing), then runs
+# scripts/fetch-chromium.ps1 -Update. If Stable moved, -Update downloads the
+# new win64 chrome-headless-shell zip, recomputes scripts/chromium-manifest.json
+# from the real files, updates the pin constants in scripts/fetch-chromium.ps1,
+# and this workflow opens (or updates) a pull request with those two files.
+# A human lands the bump through the suite and the e2e before any release;
+# this workflow NEVER merges, never tags, never publishes.
+#
+# Note: this repo's workflows are partly switched off by hand, so this
+# workflow only runs if it is left enabled.
+#
+# Action majors were verified against the GitHub Releases API on 2026-10-17:
+# actions/checkout v7 (latest v7.0.1, published 2026-07-20). This is the same
+# major the repo's release workflow already uses. No other actions are used;
+# PR creation goes through the preinstalled gh CLI.
+name: browser-update
+on:
+  schedule:
+    - cron: '0 9 1 * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  pull-requests: write
+jobs:
+  bump:
+    name: check Stable and propose bump PR
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: check for new Stable (no download)
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/fetch-chromium.ps1 -Check
+      - name: update manifest if Stable moved
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/fetch-chromium.ps1 -Update
+      - name: open or update bump PR
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git diff --quiet -- scripts/chromium-manifest.json scripts/fetch-chromium.ps1
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host 'browser-update: manifest+script unchanged; no PR.'
+            exit 0
+          }
+          $man = Get-Content scripts/chromium-manifest.json -Raw | ConvertFrom-Json
+          $newVer = $man.browser.version
+          $branch = 'bot/browser-update'
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git checkout -B $branch
+          git add scripts/chromium-manifest.json scripts/fetch-chromium.ps1
+          git commit -m ("chore(browser): bump chrome-headless-shell to {0}" -f $newVer)
+          git push -u origin $branch
+          $existing = ''
+          try { $existing = gh pr view $branch --json number --jq '.number' 2>$null } catch { $existing = '' }
+          if ([string]::IsNullOrWhiteSpace($existing)) {
+            gh pr create --base main --head $branch --title ("chore(browser): bump chrome-headless-shell to {0}" -f $newVer) --body (@(
+              ("Automated monthly bump to CfT Stable {0}." -f $newVer),
+              '',
+              'Update path: scripts/fetch-chromium.ps1 -Check / -Update recomputed scripts/chromium-manifest.json from the real downloaded files (CfT carries no hashes; the manifest is our integrity root).',
+              '',
+              'Rule: land this through the suite and the e2e before any release. This workflow never merges, tags, or publishes.'
+            ) -join "`n")
+          } else {
+            Write-Host ("browser-update: PR #{0} already open for {1}; pushed update." -f $existing, $branch)
+          }
