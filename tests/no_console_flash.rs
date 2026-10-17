@@ -1,7 +1,15 @@
 //! Console-flash / headless-backend guard: every process-spawn site must
 //! carry the windowless `CREATE_NO_WINDOW` flag, and engine resolution must
-//! not fall back to a system (headed-capable) browser. Scans source text so
-//! the guarantee cannot silently regress.
+//! never depend on an ambient or SHARED browser. Scans source text so the
+//! guarantee cannot silently regress.
+//!
+//! Intent (not a word ban): gladius owns exactly one pinned browser - the
+//! `chrome-headless-shell` build provisioned by `scripts/fetch-chromium.ps1`
+//! into the versioned cache and resolved ONLY via `GLADIUS_CHROMIUM` (explicit
+//! path) or `GLADIUS_CHROMIUM_CACHE`/`%LOCALAPPDATA%` (pinned cache root). A
+//! pinned, hash-verified browser we provision ourselves satisfies the intent;
+//! resolving a system install, a Playwright/Puppeteer shared cache, a bare
+//! binary off `PATH`, or the full headed `chrome-win64` artifact breaks it.
 
 use std::path::PathBuf;
 
@@ -61,6 +69,8 @@ fn every_test_spawn_is_windowless() {
         if p.file_name().and_then(|x| x.to_str()) == Some("no_console_flash.rs") {
             continue;
         }
+        // The headless assertions spawn the pinned browser and probe the OS
+        // (powershell/tasklist): those sites carry the flag like all others.
         let text = std::fs::read_to_string(&p).expect("read test file");
         if text.contains("Command::new(") {
             checked += 1;
@@ -73,16 +83,74 @@ fn every_test_spawn_is_windowless() {
     assert!(checked > 0, "guard test found no test spawns to check");
 }
 
+/// Forbidden ambient/shared-browser resolutions (case-insensitive
+/// substrings). Each is a shape gladius must never depend on:
+///
+/// - `ms-playwright` / `playwright`: Playwright's shared browser cache
+///   (GC-deleted, someone else's revisions).
+/// - `puppeteer` / `.cache/puppeteer`: Puppeteer's shared cache ditto.
+/// - `msedge`, `brave`: system browsers (headed-capable, someone else's).
+/// - `program files`: system install locations.
+/// - `chrome-win64`: the FULL headed-capable CfT artifact (never provisioned;
+///   only `chrome-headless-shell-win64` is ever used).
+/// - `gladius_chrome` / `gladius_backend` (bare): the removed
+///   shared-cache-era knobs (`GLADIUS_CHROME`, `GLADIUS_BACKEND`).
+///   `GLADIUS_BACKEND_CAPS` is the only legitimate `GLADIUS_BACKEND*` name
+///   and is exempted before matching; `GLADIUS_CHROMIUM` /
+///   `GLADIUS_CHROMIUM_CACHE` are the owned knobs and never match these.
+/// - `--remote-debugging-pipe`: the piped transport with no HTTP surface
+///   (the readiness poll cannot work on it).
+/// - `--no-sandbox`, `--disable-dev-shm-usage`: Windows-unsupported /
+///   Linux-container flags that must never appear in our argv.
+/// - `--headless=new`, `--headless=old`: wrong headless selectors (the
+///   first is the full browser's flag, the second was removed at M132).
+fn forbidden_patterns() -> Vec<&'static str> {
+    vec![
+        "ms-playwright",
+        "playwright",
+        "puppeteer",
+        ".cache/puppeteer",
+        "msedge",
+        "brave",
+        "program files",
+        "chrome-win64",
+        "gladius_chrome",
+        "gladius_backend",
+        "--remote-debugging-pipe",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--headless=new",
+        "--headless=old",
+    ]
+}
+
+/// Scan one source text, returning `src/{name}:{line}` hits. The legitimate
+/// caps knob (`GLADIUS_BACKEND_CAPS`) is scrubbed before matching so only
+/// the removed bare `GLADIUS_BACKEND` knob (and `GLADIUS_CHROME`) can hit.
+fn scan_text(name: &str, text: &str) -> Vec<String> {
+    let mut hits = Vec::new();
+    for (i, ln) in text.lines().enumerate() {
+        let low = ln.to_lowercase();
+        let scrubbed = low
+            .replace("gladius_backend_caps", "")
+            .replace("gladius_chromium_cache", "")
+            .replace("gladius_chromium", "");
+        for pat in forbidden_patterns() {
+            if scrubbed.contains(pat) {
+                hits.push(format!("src/{name}:{}: [{pat}] {ln}", i + 1));
+                break;
+            }
+        }
+    }
+    hits
+}
+
 #[test]
-fn self_containment_no_foreign_engine_in_src() {
-    // Gladius is self-contained: the owned Obscura engine in `bin\` is the
-    // ONLY launchable engine, plus an explicit external attach by URL. Any
-    // reintroduction of a foreign-engine reference in `src/` fails the
-    // build here. Tokens (case-insensitive):
-    // - `chrome` covers chrome-headless-shell / system-Chrome paths and the
-    //   `GLADIUS_CHROME` override alike; `GLADIUS_BACKEND_CAPS` is the only
-    //   legitimate `GLADIUS_BACKEND*` name and is exempted before matching.
-    // - `ms-playwright` / `playwright` cover the shared-cache resolution.
+fn self_containment_no_ambient_or_shared_browser_in_src() {
+    // The owned pinned browser (`chrome-headless-shell` via `GLADIUS_CHROMIUM`
+    // / `GLADIUS_CHROMIUM_CACHE` / `%LOCALAPPDATA%`) is the ONLY resolution;
+    // any ambient or shared-browser resolution regressed into `src/` fails
+    // the build here.
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut hits: Vec<String> = Vec::new();
     let mut files = 0;
@@ -94,23 +162,58 @@ fn self_containment_no_foreign_engine_in_src() {
         files += 1;
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
         let text = std::fs::read_to_string(&p).expect("read src file");
-        for (i, ln) in text.lines().enumerate() {
-            let low = ln.to_lowercase();
-            // Exempt the legitimate caps knob before matching.
-            let scrubbed = low.replace("gladius_backend_caps", "");
-            if scrubbed.contains("chrome")
-                || scrubbed.contains("playwright")
-                || scrubbed.contains("gladius_chrome")
-                || scrubbed.contains("gladius_backend")
-            {
-                hits.push(format!("src/{name}:{}: {ln}", i + 1));
-            }
-        }
+        hits.extend(scan_text(&name, &text));
     }
     assert!(files > 0, "guard scanned no src files");
     assert!(
         hits.is_empty(),
-        "foreign-engine reference regressed into src/ (self-containment broken):\n{}",
+        "ambient/shared-browser resolution regressed into src/ (self-containment broken):\n{}",
         hits.join("\n")
     );
+}
+
+#[test]
+fn guard_bites_known_ambient_resolutions() {
+    // Positive control: the scanner MUST flag every forbidden shape. A check
+    // that cannot fail proves nothing - if any sample below ever scans
+    // clean, the guard is vacuous and this test fails.
+    let bad_samples = [
+        ("playwright cache", "resolve the newest ms-playwright chromium revision"),
+        ("playwright", "find the newest playwright chromium revision"),
+        ("puppeteer cache", "resolve from .cache/puppeteer/chrome"),
+        ("system edge", "launch msedge headless from its install dir"),
+        ("system brave", "launch brave.exe from Program Files"),
+        ("full chrome zip", "download chrome-win64.zip for headed use"),
+        ("old chrome knob", "std::env::var(\"GLADIUS_CHROME\")"),
+        ("old backend knob", "std::env::var(\"GLADIUS_BACKEND\")"),
+        ("debug pipe", "spawn with --remote-debugging-pipe"),
+        ("no-sandbox", "push --no-sandbox for containers"),
+        ("dev-shm", "push --disable-dev-shm-usage on linux"),
+        ("headless=new", "args.push(\"--headless=new\")"),
+        ("headless=old", "args.push(\"--headless=old\")"),
+    ];
+    for (what, sample) in bad_samples {
+        let hits = scan_text("sample.rs", sample);
+        assert!(
+            !hits.is_empty(),
+            "guard is vacuous: it does not bite the {what} sample: {sample:?}"
+        );
+    }
+    // And the owned shapes must scan CLEAN, so the guard passes with our
+    // pinned binary present and cannot false-positive on it.
+    let good_samples = [
+        "let exe = find_chromium()?;",
+        "std::env::var(\"GLADIUS_CHROMIUM\")",
+        "std::env::var(\"GLADIUS_CHROMIUM_CACHE\")",
+        "std::env::var(\"GLADIUS_BACKEND_CAPS\")",
+        "chrome-headless-shell-win64/chrome-headless-shell.exe",
+        "args.push(\"--headless\")",
+    ];
+    for sample in good_samples {
+        let hits = scan_text("sample.rs", sample);
+        assert!(
+            hits.is_empty(),
+            "guard false-positives on the owned shape: {sample:?}: {hits:?}"
+        );
+    }
 }

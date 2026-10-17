@@ -1,9 +1,9 @@
-//! dlg-01 + tab-02 regressions on the owned Obscura engine: JS dialogs never
-//! hang (bounded wait; `alert()`/`confirm()` are silent no-ops on this
-//! engine, so clicks return plain `{"ok":true}` with no dialog report while
-//! the page keeps running) and a freshly opened tab settles so the next tool
-//! observes its committed URL. Each test owns one server process and reaps
-//! its engine.
+//! dlg-01 + tab-02 regressions on the owned Chromium engine: JS dialogs never
+//! hang (bounded wait; `alert()`/`confirm()` fire REAL `Page.javascriptDialogOpening`
+//! events on Chromium, so the reader auto-accepts and clicks return a typed
+//! dialog report while the page keeps running) and a freshly opened tab settles
+//! so the next tool observes its committed URL. Each test owns one server
+//! process and reaps its engine.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -34,12 +34,8 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // Owned-engine pin (see e2e_mcp.rs): cargo tree has no obscura
-        // sibling, so point at the repo-pinned bin/obscura.exe.
-        cmd.env(
-            "GLADIUS_OBSCURA",
-            format!("{}/bin/obscura.exe", env!("CARGO_MANIFEST_DIR")),
-        );
+        // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
+        // resolves from its versioned cache with no env override.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -152,8 +148,9 @@ fn boot() -> Client {
 
 /// dlg-01 slow-page face: the alert button is injected 3s AFTER load (cold
 /// page outlasts navigate's load poll). The click must WAIT (bounded) for
-/// it and fire it - never miss it instantly. On the owned engine the alert
-/// is a silent no-op, so there is no dialog report: plain `{"ok":true}`.
+/// it and fire it - never miss it instantly. On Chromium the alert fires a
+/// real dialog: the reader auto-accepts and the click carries a typed dialog
+/// report naming the probe message.
 #[test]
 fn dialog_click_waits_for_late_button() {
     let mut c = boot();
@@ -188,18 +185,18 @@ fn dialog_click_waits_for_late_button() {
     );
     let t = content_text(&clk);
     assert!(
-        !t.contains("dialog"),
-        "owned engine fires no dialog (silent no-op), got: {t}"
+        t.contains("dialog") && t.contains("DLG_PROBE_late-xyz"),
+        "Chromium fires a real dialog with the probe message, got: {t}"
     );
     finish(c);
 }
 
 /// dlg-01: clicking a button that fires `alert()` must return BOUNDED (well
-/// under the 15s bench ceiling) with plain `{"ok":true}` - the owned engine
-/// never opens a dialog (`alert()` is a silent no-op), so there is no typed
-/// dialog report, only the page's own handler effect. Never a hang.
+/// under the 15s bench ceiling) with a typed dialog report - Chromium fires
+/// `Page.javascriptDialogOpening`, the reader auto-accepts, and the click
+/// reports the dialog's own message text. Never a hang.
 #[test]
-fn dialog_alert_never_hangs_and_is_inert() {
+fn dialog_alert_reports_real_dialog_and_never_hangs() {
     let mut c = boot();
     let nav = c.call(
         "navigate",
@@ -225,8 +222,8 @@ fn dialog_alert_never_hangs_and_is_inert() {
     );
     let t = content_text(&clk);
     assert!(
-        !t.contains("dialog"),
-        "no dialog report on the owned engine (alert is a silent no-op), got: {t}"
+        t.contains("dialog") && t.contains("DLG_PROBE_alert-xyz"),
+        "real dialog report with the probe message, got: {t}"
     );
     // The page kept running: the click's own handler ran.
     let res = content_text(&c.call(
@@ -241,10 +238,11 @@ fn dialog_alert_never_hangs_and_is_inert() {
     finish(c);
 }
 
-/// dlg-01 second face: `confirm()` returns true on the owned engine (silent,
-/// no dialog opens) and the page keeps running. Bounded, never a hang.
+/// dlg-01 second face: `confirm()` fires a real dialog on Chromium (auto-
+/// accepted, so it answers true) and the page keeps running. Bounded, never
+/// a hang.
 #[test]
-fn dialog_confirm_never_hangs_and_is_inert() {
+fn dialog_confirm_reports_real_dialog_and_never_hangs() {
     let mut c = boot();
     let nav = c.call(
         "navigate",
@@ -261,8 +259,8 @@ fn dialog_confirm_never_hangs_and_is_inert() {
     assert!(clk.get("isError").is_none(), "confirm click ok: {clk}");
     let t = content_text(&clk);
     assert!(
-        !t.contains("dialog"),
-        "no dialog report on the owned engine (confirm is silent), got: {t}"
+        t.contains("dialog") && t.contains("DLG_PROBE_confirm-xyz"),
+        "real dialog report with the probe message, got: {t}"
     );
     let res = content_text(&c.call(
         "evaluate",
@@ -279,9 +277,7 @@ fn dialog_confirm_never_hangs_and_is_inert() {
 /// tab-02 slow-commit face: the new tab's navigation takes ~4s to answer.
 /// `tabs new` must WAIT through the blank phase (bounded) and then observe
 /// the committed URL - never strand the next tool on about:blank. New tabs
-/// open via the `tabs new` tool (engine-level target creation): synthetic
-/// clicks on `target=_blank` links are popup-blocked on the owned engine, so
-/// they are not the opener here.
+/// open via the `tabs new` tool (engine-level target creation).
 #[test]
 fn new_tab_waits_for_slow_commit() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind localhost");
@@ -354,9 +350,7 @@ fn new_tab_waits_for_slow_commit() {
 }
 
 /// tab-02: open a new tab via `tabs new` and IMMEDIATELY read its URL - it
-/// must be the committed page, not "" / about:blank. (New tabs open via the
-/// `tabs new` tool: synthetic clicks on `target=_blank` links are
-/// popup-blocked on the owned engine.)
+/// must be the committed page, not "" / about:blank.
 #[test]
 fn new_tab_settles_to_committed_url() {
     let mut c = boot();

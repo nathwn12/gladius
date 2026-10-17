@@ -9,7 +9,8 @@
 //! - `wait_for_hard_deadline` (P2): `ms:0` is an immediate no-op success;
 //!   missing selectors fail at the budget; over-max budgets clamp to 15s.
 //!
-//! Every test drives the owned Obscura engine (`bin\obscura.exe`): there is
+//! Every test drives the owned Chromium engine (pinned
+//! `chrome-headless-shell` from the versioned cache): there is
 //! no other launchable engine.
 
 use std::io::{BufRead, BufReader, Write};
@@ -69,12 +70,9 @@ impl Client {
     }
 
     fn spawn() -> Self {
-        // Default-engine location pin (see e2e_mcp.rs): cargo tree has no
-        // obscura sibling, so point at the repo-pinned bin/obscura.exe.
-        Self::spawn_with_env(&[(
-            "GLADIUS_OBSCURA",
-            &format!("{}/bin/obscura.exe", env!("CARGO_MANIFEST_DIR")),
-        )])
+        // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
+        // resolves from its versioned cache with no env override.
+        Self::spawn_with_env(&[])
     }
 
     fn recv(&self, what: &str) -> Value {

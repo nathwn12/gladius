@@ -33,12 +33,8 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // Default-engine location pin (see e2e_mcp.rs): cargo tree has no
-        // obscura sibling, so point at the repo-pinned bin/obscura.exe.
-        cmd.env(
-            "GLADIUS_OBSCURA",
-            format!("{}/bin/obscura.exe", env!("CARGO_MANIFEST_DIR")),
-        );
+        // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
+        // resolves from its versioned cache with no env override.
         for (k, v) in env_extra {
             cmd.env(k, v);
         }

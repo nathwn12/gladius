@@ -106,15 +106,19 @@ struct Shared {
 
 /// Ownership of the engine behind an `Inner` connection.
 ///
-/// - `Owned`: gladius launched the owned Obscura engine itself (child
-///   handle, job cover; the owned path creates no profile). `close()` reaps
-///   the whole tree.
+/// - `Owned`: gladius launched the owned Chromium (`chrome-headless-shell`,
+///   pinned build resolved by `find_chromium`) itself: child handle, job
+///   cover, and one fresh private profile dir created before launch and
+///   swept after the tree is reaped. `close()` reaps the whole tree.
 /// - `Attached`: gladius connected to an externally started engine via
 ///   `GLADIUS_CDP_URL` (the external-CDP seam: any compatible engine plugs in
 ///   here). The engine is NOT ours: `close()` only detaches
 ///   the CDP session we opened and never kills, never sweeps a profile.
 enum Engine {
     Owned {
+        /// Private profile dir for this instance (created fresh before
+        /// launch; `Drop` sweeps it after the tree is reaped).
+        _profile: ProfileDir,
         #[cfg(windows)]
         _job: Option<std::os::windows::io::OwnedHandle>,
         child: Box<tokio::process::Child>,
@@ -174,12 +178,12 @@ pub fn cdp_url_override() -> Option<String> {
 
 /// Engine name for the initialize response: `external-cdp` when an explicit
 /// `GLADIUS_CDP_URL` attaches to an external engine, otherwise the owned
-/// `obscura` launch (the default and the only launchable engine).
+/// `chromium` launch (the default and the only launchable engine).
 pub fn backend_name() -> String {
     if cdp_url_override().is_some() {
         "external-cdp".to_string()
     } else {
-        "obscura".to_string()
+        "chromium".to_string()
     }
 }
 
@@ -446,14 +450,35 @@ impl Browser {
     pub async fn viewport_reset(&self) -> Result<Value, String> {
         let shared = self.shared().await?;
         let session = ensure_session(&shared).await?;
+        // Pre-clear size: the settle target below.
+        let before = self.viewport_readback().await.ok();
         *shared.viewport.lock().await = None;
-        send_raw(
+        let r = send_raw(
             &shared,
             "Emulation.clearDeviceMetricsOverride",
             json!({}),
             Some(session),
         )
-        .await
+        .await;
+        // Settle: on later-created targets the size update can lag the
+        // acknowledgement (measured on Chromium: stale size but fresh DPR
+        // immediately after clear, correct size within 1s). Poll briefly
+        // for a size that differs from pre-clear; expiry just falls through
+        // to the tool's live read-back, never an error.
+        if let Some((bw, bh, _)) = before {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match self.viewport_readback().await {
+                    Ok((w, h, _)) if w != bw || h != bh => break,
+                    _ => {}
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        r
     }
 
     /// Live `(innerWidth, innerHeight, devicePixelRatio)` from the active
@@ -783,7 +808,9 @@ impl Browser {
     }
 
     /// Enable the CDP Network domain once (lazy: the first network-idle
-    /// wait pays one round-trip; every other op pays nothing).
+    /// wait pays one round-trip; every other op pays nothing). On Chromium
+    /// `Network.enable` alone is sufficient to observe request starts via
+    /// `Network.requestWillBeSent`; no `Fetch.enable` interception is used.
     pub async fn ensure_network(&self) -> Result<(), String> {
         let shared = self.shared().await?;
         if *shared.net_enabled.lock().await {
@@ -791,23 +818,6 @@ impl Browser {
         }
         let session = ensure_session(&shared).await?;
         send_raw(&shared, "Network.enable", json!({}), Some(session.clone())).await?;
-        // This engine only emits `Network.requestWillBeSent` at request START
-        // when the request passes through CDP Fetch interception: without it
-        // (measured on Obscura) a JS `fetch` buffers its whole Network event
-        // triple in engine state and releases it only once the response is
-        // received, so a request whose server holds the response open is
-        // invisible and `wait_network_idle` sees an empty set. Enable Fetch
-        // interception for all URLs so the request id lands in `net_inflight`
-        // at start; the reader auto-continues every paused request, so this is
-        // transparent to page behavior and only pays a bounded extra
-        // round-trip while a network-idle wait is live.
-        send_raw(
-            &shared,
-            "Fetch.enable",
-            json!({"patterns": [{"urlPattern": "*"}]}),
-            Some(session),
-        )
-        .await?;
         *shared.net_enabled.lock().await = true;
         Ok(())
     }
@@ -1323,36 +1333,6 @@ async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
             }
             continue;
         }
-        // Fetch interception (enabled lazily with the Network domain so the
-        // engine reports `Network.requestWillBeSent` at request START, not at
-        // response). The engine waits for a resolution per paused request;
-        // continue immediately, fire-and-forget, so page behavior is
-        // unchanged. The matching `requestWillBeSent` still lands the id in
-        // `net_inflight` while the request is genuinely live.
-        if v.get("method").and_then(|m| m.as_str()) == Some("Fetch.requestPaused") {
-            if let Some(rid) = v
-                .get("params")
-                .and_then(|p| p.get("requestId"))
-                .and_then(|r| r.as_str())
-            {
-                let hid = shared.next_id.fetch_add(1, Ordering::SeqCst);
-                let mut envelope = serde_json::Map::new();
-                envelope.insert("id".to_string(), json!(hid));
-                envelope.insert("method".to_string(), json!("Fetch.continueRequest"));
-                envelope.insert("params".to_string(), json!({"requestId": rid}));
-                if let Some(s) = v.get("sessionId").and_then(|s| s.as_str()) {
-                    envelope.insert("sessionId".to_string(), json!(s));
-                }
-                let text = Value::Object(envelope).to_string();
-                let (tx, _rx) = oneshot::channel();
-                shared.pending.lock().unwrap().insert(hid, tx);
-                let mut sink = shared.sink.lock().await;
-                if sink.send(Message::Text(text.into())).await.is_err() {
-                    shared.pending.lock().unwrap().remove(&hid);
-                }
-            }
-            continue;
-        }
         // Event-driven wait signal: wake any `wait_for_load` waiter. The
         // `readyState` poll there is the fallback, so a missed or
         // session-scoped event can only cost one 10 ms cadence, never a
@@ -1364,11 +1344,9 @@ async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
         // Console ring: buffer console.* calls, uncaught exceptions, and
         // failed-resource log lines for the `console` tool. Bounded
         // (`CONSOLE_CAP`); a quiet page costs two string compares here.
-        // Engine note: `Log.enable` succeeds everywhere, but engines that
-        // never emit `Log.entryAdded` (measured: Obscura, zero events) lose
-        // the Log leg - `Runtime.consoleAPICalled` still flows, so the
-        // `console` tool works for page consoles and only loses Log-sourced
-        // entries.
+        // Chromium emits `Log.entryAdded` live (failed resources,
+        // violations), so the Log leg reports alongside
+        // `Runtime.consoleAPICalled`.
         if v.get("method").and_then(|m| m.as_str()) == Some("Runtime.consoleAPICalled") {
             let params = v.get("params").cloned().unwrap_or(Value::Null);
             push_console(&shared, console_message(&params)).await;
@@ -1420,14 +1398,8 @@ async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
         // dialog is handled (measured: dlg-01 click HANG, 15s bench timeout).
         // Auto-ACCEPT immediately so a dialog can NEVER wedge a run, and
         // record it for the acting tool's typed report.
-        // Engine note: this send fires ONLY on `Page.javascriptDialogOpening`.
-        // On engines that never emit that event (measured: Obscura never
-        // fires it, and its `Page.handleJavaScriptDialog` answers `-32601
-        // Unknown Page method`), the flow goes inert - no send, no reply, so
-        // NO error path here can surface on such an engine. The user-visible
-        // effect is only the absence of dialog reports (`click` returns plain
-        // `{"ok":true}`, `evaluate` a plain value); Obscura's `alert()` is a
-        // silent no-op (returns undefined immediately), so no hang either.
+        // Chromium fires `Page.javascriptDialogOpening` with
+        // stall-until-handled semantics, so this path acts on every dialog.
         if v.get("method").and_then(|m| m.as_str()) == Some("Page.javascriptDialogOpening") {
             let params = v.get("params").cloned().unwrap_or(Value::Null);
             let dtype = params
@@ -1508,88 +1480,136 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Launch dispatcher: `GLADIUS_CDP_URL` set means attach to the external
-/// engine instead of launching; anything else
-/// launches the owned Obscura engine (`launch_owned_obscura`, the default
-/// and only launch path).
+/// Headed-mode request: headless-only BY OWNER DECISION (2026-10-17).
+/// There is no headed code path at all: the `chrome-headless-shell` artifact
+/// cannot go headed and that is a property we rely on. `GLADIUS_HEADED` set
+/// to a truthy non-blank value (`1`/`true`/`yes`, case-insensitive) is an
+/// explicit request for a visible browser and fails closed here; blank/unset
+/// (and `0`/`false`/`no`) means headless. A headed CLI flag is rejected in
+/// `main.rs` with the same error.
+fn headed_requested() -> bool {
+    match std::env::var("GLADIUS_HEADED") {
+        Ok(v) => {
+            let t = v.trim().to_ascii_lowercase();
+            !t.is_empty() && !["0", "false", "no", "off"].contains(&t.as_str())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Headed-mode refusal text (single source: `launch` and `main.rs` share it).
+fn headed_unsupported_error() -> String {
+    "headed mode is not supported: gladius is headless-only by owner decision \
+     (2026-10-17); the owned chrome-headless-shell artifact cannot go headed. \
+     Attach to an externally started engine with GLADIUS_CDP_URL instead"
+        .to_string()
+}
+
+/// Launch dispatcher: a headed request fails closed (no headed path exists);
+/// `GLADIUS_CDP_URL` set means attach to the external engine instead of
+/// launching; anything else launches the owned Chromium
+/// (`launch_owned_chromium`, the default and only launch path).
 async fn launch() -> Result<Inner, String> {
+    if headed_requested() {
+        return Err(headed_unsupported_error());
+    }
     // A bad caps value is a config error: fail fast on either path.
     backend_caps()?;
     if let Some(raw) = cdp_url_override() {
         return attach(&raw).await;
     }
-    launch_owned_obscura().await
+    launch_owned_chromium().await
 }
 
-#[cfg(windows)]
-const OBSCURA_FILE: &str = "obscura.exe";
-#[cfg(not(windows))]
-const OBSCURA_FILE: &str = "obscura";
+/// Pinned Chromium identity (keep in lockstep with
+/// `scripts/fetch-chromium.ps1` and `scripts/chromium-manifest.json`).
+const PINNED_CHROMIUM_VERSION: &str = "155.0.8059.84";
+/// First 8 hex chars of the pinned zip sha256 (the versioned cache dir tag).
+const PINNED_ZIP_SHORT8: &str = "5ca590a4";
+/// Env override for the explicit browser binary path.
+const CHROMIUM_ENV: &str = "GLADIUS_CHROMIUM";
+/// Env override for the versioned cache root.
+const CHROMIUM_CACHE_ENV: &str = "GLADIUS_CHROMIUM_CACHE";
+/// Zip-relative path of the shell binary inside the versioned cache dir.
+const CHROMIUM_EXE_REL: &str = "chrome-headless-shell-win64/chrome-headless-shell.exe";
 
-/// Obscura (only launchable engine) resolution: `GLADIUS_OBSCURA` wins when
-/// set and non-blank, otherwise `obscura.exe` as a sibling of the running
-/// executable (`std::env::current_exe()` parent dir - the engine ships beside
-/// `gladius.exe`). A missing engine is a CLEAR error naming
-/// `scripts/fetch-engine.ps1`: never a silent fallback to another browser.
-fn find_obscura() -> Result<std::path::PathBuf, String> {
-    if let Ok(p) = std::env::var("GLADIUS_OBSCURA") {
+/// Owned Chromium resolution: an explicit `GLADIUS_CHROMIUM` path wins when
+/// set and non-blank (must be a file), else the pinned build under the owned
+/// cache root (`GLADIUS_CHROMIUM_CACHE` when set and non-blank, otherwise
+/// `%LOCALAPPDATA%\gladius\chromium\<version>-<zip-sha8>\`). A missing
+/// browser is a CLEAR error naming `scripts/fetch-chromium.ps1`: never a
+/// silent fallback to any ambient, shared, or system browser.
+fn find_chromium() -> Result<std::path::PathBuf, String> {
+    if let Ok(p) = std::env::var(CHROMIUM_ENV) {
         if !p.trim().is_empty() {
             let cand = std::path::PathBuf::from(p.trim());
             if cand.is_file() {
                 return Ok(cand);
             }
             return Err(format!(
-                "obscura engine not found: GLADIUS_OBSCURA='{}' is not a file; \
-                 run scripts/fetch-engine.ps1 to provision the pinned engine",
+                "chromium browser not found: GLADIUS_CHROMIUM='{}' is not a file; \
+                 run scripts/fetch-chromium.ps1 to provision the pinned browser",
                 cand.display()
             ));
         }
     }
-    let sibling = std::env::current_exe()
-        .ok()
-        .and_then(|e| e.parent().map(|d| d.join(OBSCURA_FILE)));
-    match sibling {
-        Some(cand) if cand.is_file() => Ok(cand),
-        Some(cand) => Err(format!(
-            "obscura engine not found: expected {} beside the running gladius \
-             executable; run scripts/fetch-engine.ps1 to provision the pinned engine",
-            cand.display()
-        )),
-        None => Err(
-            "obscura engine not found: cannot locate the running executable; \
-             set GLADIUS_OBSCURA to the engine path or run scripts/fetch-engine.ps1 \
-             to provision the pinned engine"
-                .to_string(),
-        ),
+    let root = match std::env::var(CHROMIUM_CACHE_ENV) {
+        Ok(v) if !v.trim().is_empty() => std::path::PathBuf::from(v.trim()),
+        _ => match std::env::var("LOCALAPPDATA") {
+            Ok(local) if !local.trim().is_empty() => {
+                std::path::PathBuf::from(local.trim()).join("gladius/chromium")
+            }
+            _ => {
+                return Err(
+                    "chromium browser not found: LOCALAPPDATA is unset and \
+                     GLADIUS_CHROMIUM_CACHE is unset; set one of them or run \
+                     scripts/fetch-chromium.ps1 to provision the pinned browser"
+                        .to_string(),
+                );
+            }
+        },
+    };
+    let cand = root
+        .join(format!("{PINNED_CHROMIUM_VERSION}-{PINNED_ZIP_SHORT8}"))
+        .join(CHROMIUM_EXE_REL.replace('/', std::path::MAIN_SEPARATOR_STR));
+    if cand.is_file() {
+        return Ok(cand);
     }
+    Err(format!(
+        "chromium browser not found: expected {} (pinned \
+         {PINNED_CHROMIUM_VERSION}); run scripts/fetch-chromium.ps1 to provision \
+         the pinned browser",
+        cand.display()
+    ))
 }
 
-/// Obscura serve argv for `port`. Each flag appears EXACTLY ONCE: the
-/// engine's clap parser hard-fails on a repeated flag (`error: the argument
-/// '<flag>' cannot be used multiple times`). Both gate flags are MANDATORY
-/// and measured, not guessed: without `--allow-private-network`,
-/// `Page.navigate` to loopback fails `-32000 Network error: Access to
-/// private/internal IP address 127.0.0.1 is not allowed`; without
-/// `--allow-file-access`, `file://` navigate fails `-32601 Page.navigate to
-/// file:// is disabled` and `DOM.setFileInputFiles` is refused. That
-/// re-opens the engine's SSRF gate and allows local-file reads; the trade is
-/// deliberate (automation needs loopback and file URLs on a loopback-bound
-/// CDP server).
-fn obscura_argv(port: u16) -> Vec<String> {
+/// Owned Chromium argv for `port` with private `profile_dir`. Each flag
+/// appears EXACTLY ONCE (kept with the repo's exactly-once discipline).
+/// Bare `--headless` is the shell's headless selector (the full browser's
+/// new-mode spelling is not ours, and the removed old-mode spelling must
+/// never reappear). The profile dir is created fresh per instance before
+/// launch: since Chrome 136 the remote-debugging switches are ignored on
+/// the default data directory, so without a private profile no port binds
+/// and readiness never goes ready. `about:blank` is the last positional
+/// token. Never passed: sandbox-off switches (unsupported on Windows),
+/// dev-shm switches (Linux containers only), keychain/password-store
+/// flags, or the piped debug transport (it has no HTTP surface, so the
+/// readiness poll cannot work).
+fn chromium_argv(port: u16, profile_dir: &std::path::Path) -> Vec<String> {
     vec![
-        "serve".to_string(),
-        "--host".to_string(),
-        "127.0.0.1".to_string(),
-        "--port".to_string(),
-        port.to_string(),
-        "--allow-private-network".to_string(),
-        "--allow-file-access".to_string(),
+        "--headless".to_string(),
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={}", profile_dir.display()),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        format!("--remote-allow-origins=http://127.0.0.1:{port}"),
+        "about:blank".to_string(),
     ]
 }
 
-/// Confine the OWNED Obscura ws endpoint to our loopback port.
+/// Confine the OWNED Chromium ws endpoint to our loopback port.
 ///
-/// The owned path frees its chosen port before the engine binds it, so a
+/// The owned path frees its chosen port before the browser binds it, so a
 /// local squatter can claim the port and advertise `ws://<somewhere-else>/`
 /// via `/json/version`. The attach path (`resolve_ws_url`) must keep
 /// accepting whatever the user pointed at, so confinement lives here and is
@@ -1638,7 +1658,7 @@ fn confine_owned_ws_uri(port: u16, uri: &TungsteniteHttpUri) -> Result<(), Strin
 /// Parse an owned-path ws URL ONCE with the connector's own parser
 /// (`IntoClientRequest` - the same parse `connect_async` performs), confine
 /// the resulting URI to our loopback port, and return the SAME request for
-/// the connector to dial. Production (`launch_owned_obscura`) and the
+/// the connector to dial. Production (`launch_owned_chromium`) and the
 /// confinement tests both call this, so validation and dialing can never
 /// parse differently: the connector reads host/port off `request.uri()`,
 /// which is the exact value confined here. Never hand-roll URI parsing.
@@ -1668,11 +1688,11 @@ fn startup_remaining(start: Instant, deadline: Duration) -> Option<Duration> {
 /// error (the port may now belong to someone else - never keep polling it),
 /// and a `try_wait` failure is an error too (an unknown child state is never
 /// treated as alive).
-fn check_obscura_child(guard: &mut ChildGuard) -> Result<(), String> {
+fn check_chromium_child(guard: &mut ChildGuard) -> Result<(), String> {
     match guard.child.as_mut().expect("guard holds child").try_wait() {
-        Ok(Some(status)) => Err(format!("obscura child exited during startup: {status}")),
+        Ok(Some(status)) => Err(format!("chromium child exited during startup: {status}")),
         Ok(None) => Ok(()),
-        Err(e) => Err(format!("obscura child wait failed during startup: {e}")),
+        Err(e) => Err(format!("chromium child wait failed during startup: {e}")),
     }
 }
 
@@ -1684,9 +1704,9 @@ fn check_obscura_child(guard: &mut ChildGuard) -> Result<(), String> {
 const OWNED_LAUNCH_ATTEMPTS: usize = 3;
 
 /// Retryable owned-launch failure: ONLY the early-child-exit signal from
-/// `check_obscura_child` (`obscura child exited during startup: ...`) — the
+/// `check_chromium_child` (`chromium child exited during startup: ...`) — the
 /// stale-port race where a local squatter claimed our freed pick between the
-/// `:0` probe and the engine's own bind, so the engine died on its bind and
+/// `:0` probe and the browser's own bind, so the browser died on its bind and
 /// exited before `/json/version` ever went ready. Everything else is
 /// fail-closed and never retried: the squatter-confinement rejections
 /// (`owned ws endpoint rejected: ...`) stay hard errors (re-rolling the port
@@ -1695,7 +1715,7 @@ const OWNED_LAUNCH_ATTEMPTS: usize = 3;
 /// as a dead-port signal), and timeouts keep their existing budgets. Pure:
 /// no I/O, unit-tested below via the retry helper.
 fn launch_startup_exit_is_retryable(err: &str) -> bool {
-    err.starts_with("obscura child exited during startup:")
+    err.starts_with("chromium child exited during startup:")
 }
 
 /// Bounded retry over fallible attempts: runs `attempt` until it succeeds,
@@ -1731,8 +1751,8 @@ where
 }
 
 /// Owned launch with stale-port retry: the pick-port → spawn → readiness
-/// sequence frees its chosen port before the engine binds it, so under
-/// parallel load a local squatter can claim the pick and the engine exits 1
+/// sequence frees its chosen port before the browser binds it, so under
+/// parallel load a local squatter can claim the pick and the browser exits
 /// on its bind before `/json/version` ever goes ready. An early child exit
 /// during startup is therefore retried with a FRESH port pick, bounded by
 /// `OWNED_LAUNCH_ATTEMPTS`. Only that signal retries (see
@@ -1740,57 +1760,61 @@ where
 /// exactly like today's single launch — same argv, same readiness poll,
 /// same budgets, same fail-closed confinement — and exhaustion surfaces the
 /// last attempt's error unchanged.
-async fn launch_owned_obscura() -> Result<Inner, String> {
+async fn launch_owned_chromium() -> Result<Inner, String> {
     retry_attempts(
         OWNED_LAUNCH_ATTEMPTS,
         |e: &String| launch_startup_exit_is_retryable(e),
-        launch_owned_obscura_once,
+        launch_owned_chromium_once,
     )
     .await
 }
 
-/// Single owned-launch attempt: the Obscura engine (`serve` on a free loopback
-/// port), modelled as `Engine::Owned` so `close()` kills the tree we
-/// started. Picks a FRESH free port on every call (bind `:0`, read the port,
-/// drop it), so each retry attempt races a different pick. Readiness polls
-/// `GET http://127.0.0.1:<port>/json/version` for
-/// `webSocketDebuggerUrl` inside `startup_timeout()`: a ready-file is NOT
-/// trusted (measured flaking twice - the engine serving with no file
-/// published). The ws URL then flows through the SAME shared machinery the
-/// attach path uses (`resolve_ws_url` handles `http://...` ->
-/// `/json/version` -> `webSocketDebuggerUrl`, bounded here by the remaining
-/// startup budget so one poll iteration can never exceed it), then through
-/// the SAME `owned_ws_request` the tests exercise (connector-parser parse +
-/// loopback-port confine, and the returned request is what `connect_async`
-/// dials - no re-parse), so the post-connect session/target flow is never
-/// forked. Every wait here is bounded (the engine also drops idle browser
-/// WS connections at ~60-70 s, so clients connect lazily on first tool use
-/// and bound every wait).
-async fn launch_owned_obscura_once() -> Result<Inner, String> {
+/// Single owned-launch attempt: the owned Chromium (`chrome-headless-shell`
+/// on a free loopback port with a fresh private profile), modelled as
+/// `Engine::Owned` so `close()` kills the tree we started and sweeps the
+/// profile. Picks a FRESH free port AND a fresh profile on every call (both
+/// live inside the single-attempt function below, so a stale pick is never
+/// reused). Readiness polls `GET http://127.0.0.1:<port>/json/version` for
+/// `webSocketDebuggerUrl` inside `startup_timeout()`. The ws URL then flows
+/// through the SAME shared machinery the attach path uses (`resolve_ws_url`
+/// handles `http://...` -> `/json/version` -> `webSocketDebuggerUrl`,
+/// bounded here by the remaining startup budget so one poll iteration can
+/// never exceed it), then through the SAME `owned_ws_request` the tests
+/// exercise (connector-parser parse + loopback-port confine, and the
+/// returned request is what `connect_async` dials - no re-parse), so the
+/// post-connect session/target flow is never forked. Every wait here is
+/// bounded (the browser also drops idle browser WS connections at ~60-70 s,
+/// so clients connect lazily on first tool use and bound every wait).
+async fn launch_owned_chromium_once() -> Result<Inner, String> {
     let deadline = startup_timeout();
-    // No profile here: the engine's argv never receives one (measured: the
-    // engine writes 0 profile bytes), so a failed temp-dir creation must not
-    // abort a profile-free launch.
-    let obscura = find_obscura()?;
+    sweep_stale_profiles();
+    // Fresh private profile BEFORE launch (functional, not hygiene): since
+    // Chrome 136 the remote-debugging switches are ignored on the default
+    // data directory, so without this no port binds and readiness never goes
+    // ready. The dir is created here so the argv path is private to this
+    // instance; `Drop` sweeps it after the tree is reaped.
+    let profile = ProfileDir::create()?;
+    let chromium = find_chromium()?;
     // Free loopback port: bind :0, read the port, drop it.
     let port = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .map_err(|e| format!("obscura free port: {e}"))?;
+            .map_err(|e| format!("chromium free port: {e}"))?;
         let port = listener
             .local_addr()
-            .map_err(|e| format!("obscura free port: {e}"))?
+            .map_err(|e| format!("chromium free port: {e}"))?
             .port();
         drop(listener);
         port
     };
     eprintln!(
-        "[gladius] backend: obscura {} (port {port})",
-        obscura.display()
+        "[gladius] backend: chromium {} (port {port})",
+        chromium.display()
     );
-    let mut std_cmd = std::process::Command::new(&obscura);
-    std_cmd.args(obscura_argv(port));
-    // Readiness is the HTTP poll below, so engine stdio is discarded (never
-    // a piped-but-undrained buffer the engine could block on).
+    eprintln!("[gladius] profile: {}", profile.path().display());
+    let mut std_cmd = std::process::Command::new(&chromium);
+    std_cmd.args(chromium_argv(port, profile.path()));
+    // Readiness is the HTTP poll below, so browser stdio is discarded (never
+    // a piped-but-undrained buffer the browser could block on).
     std_cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1802,14 +1826,14 @@ async fn launch_owned_obscura_once() -> Result<Inner, String> {
     }
     let spawned = Command::from(std_cmd)
         .spawn()
-        .map_err(|e| format!("spawn obscura: {e}"))?;
+        .map_err(|e| format!("spawn chromium: {e}"))?;
     // Guard is armed from here on: any `?`/early-return kills the tree.
     let mut guard = ChildGuard {
         pid: spawned.id().unwrap_or(u32::MAX),
         child: Some(spawned),
     };
     if guard.pid == u32::MAX {
-        return Err("obscura child has no pid".to_string());
+        return Err("chromium child has no pid".to_string());
     }
     // Hard-kill cover (G-4): the OS reaps the tree
     // when gladius dies by ANY means.
@@ -1819,16 +1843,16 @@ async fn launch_owned_obscura_once() -> Result<Inner, String> {
     let base = format!("http://127.0.0.1:{port}");
     let start = Instant::now();
     let ws_request = loop {
-        // Child-exit detection: if the engine died, the port may now belong
+        // Child-exit detection: if the browser died, the port may now belong
         // to someone else - never keep polling it, fail on the exit status.
         // Fail-closed: a `try_wait` error is never treated as "still alive".
-        check_obscura_child(&mut guard)?;
+        check_chromium_child(&mut guard)?;
         // Single-sample budget: this one sample feeds BOTH the expiry check
         // and the per-iteration bound below, so the subtraction cannot race
         // and underflow-panic.
         let remaining = startup_remaining(start, deadline).ok_or_else(|| {
             format!(
-                "timeout waiting for obscura /json/version on {base}: \
+                "timeout waiting for chromium /json/version on {base}: \
                  deadline passed with no ready endpoint"
             )
         })?;
@@ -1840,7 +1864,7 @@ async fn launch_owned_obscura_once() -> Result<Inner, String> {
         match tokio::time::timeout(remaining, resolve_ws_url(&base)).await {
             Err(_) => {
                 return Err(format!(
-                    "timeout waiting for obscura /json/version on {base}: \
+                    "timeout waiting for chromium /json/version on {base}: \
                      deadline passed while awaiting resolve"
                 ));
             }
@@ -1849,14 +1873,14 @@ async fn launch_owned_obscura_once() -> Result<Inner, String> {
                 // timeout: the budget is enforced, not just tested on error.
                 if start.elapsed() >= deadline {
                     return Err(format!(
-                        "timeout waiting for obscura /json/version on {base}: \
+                        "timeout waiting for chromium /json/version on {base}: \
                          deadline passed before accepting a ready endpoint"
                     ));
                 }
                 // Re-check the child: it may have died while `resolve_ws_url`
-                // awaited - a late resolve from a dead engine's port must
-                // never be accepted as a live owned engine.
-                check_obscura_child(&mut guard)?;
+                // awaited - a late resolve from a dead browser's port must
+                // never be accepted as a live owned browser.
+                check_chromium_child(&mut guard)?;
                 // Owned path only: parse with the CONNECTOR's parser and
                 // confine the advertised endpoint to our loopback port before
                 // connecting anywhere. The loop yields the SAME request the
@@ -1866,10 +1890,10 @@ async fn launch_owned_obscura_once() -> Result<Inner, String> {
             Ok(Err(e)) => {
                 if start.elapsed() >= deadline {
                     return Err(format!(
-                        "timeout waiting for obscura /json/version on {base}: last error: {e}"
+                        "timeout waiting for chromium /json/version on {base}: last error: {e}"
                     ));
                 }
-                // Engine still starting: re-poll at 100 ms cadence inside
+                // Browser still starting: re-poll at 100 ms cadence inside
                 // the same deadline.
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -1880,7 +1904,7 @@ async fn launch_owned_obscura_once() -> Result<Inner, String> {
     // must error on elapse, never overshoot the deadline unbounded.
     let ws_url = ws_request.uri().to_string();
     let remaining = startup_remaining(start, deadline).ok_or_else(|| {
-        format!("timeout waiting for obscura ws connect on {ws_url}: startup budget exhausted")
+        format!("timeout waiting for chromium ws connect on {ws_url}: startup budget exhausted")
     })?;
     let (ws, _) = tokio::time::timeout(remaining, connect_async(ws_request))
         .await
@@ -1898,27 +1922,28 @@ async fn launch_owned_obscura_once() -> Result<Inner, String> {
     // the handshake awaited, this socket may belong to an impostor: fail
     // here so the guard kills the tree and the socket is dropped.
     // Review-enforced, not test-enforced: no test drives
-    // `launch_owned_obscura`, so removing this call (or the
+    // `launch_owned_chromium`, so removing this call (or the
     // `owned_ws_request` confine above) stays green.
-    check_obscura_child(&mut guard)?;
+    check_chromium_child(&mut guard)?;
     // Tokio's `timeout` polls the inner future first, so a handshake that
     // completes at/after expiry still returns `Ok`: re-enforce the deadline
     // after a successful connect, before building `Inner` or announcing
     // readiness.
     if start.elapsed() >= deadline {
         return Err(format!(
-            "timeout waiting for obscura ws connect on {ws_url}: \
+            "timeout waiting for chromium ws connect on {ws_url}: \
              handshake completed after the startup budget expired"
         ));
     }
     let (sink, stream) = ws.split();
     let shared = new_shared(sink);
     let reader = tokio::spawn(reader_loop(stream, shared.clone()));
-    eprintln!("[gladius] browser ready pid={pid} (obscura)");
+    eprintln!("[gladius] browser ready pid={pid} (chromium)");
     let child = guard.child.take().expect("guard holds child");
     drop(guard); // disarmed: child moved out, Drop is a no-op
     Ok(Inner {
         engine: Engine::Owned {
+            _profile: profile,
             #[cfg(windows)]
             _job: job,
             child: Box::new(child),
@@ -1927,6 +1952,88 @@ async fn launch_owned_obscura_once() -> Result<Inner, String> {
         shared,
         reader,
     })
+}
+
+/// Owned browser profile dir. The name carries our own pid
+/// (`gladius-<gladius-pid>-<millis>-<n>`) so a later launch can sweep it
+/// after a hard kill; graceful exit removes it via this Drop (as before).
+struct ProfileDir {
+    path: std::path::PathBuf,
+}
+
+impl ProfileDir {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    fn create() -> Result<Self, String> {
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        for _ in 0..100 {
+            let n = CTR.fetch_add(1, Ordering::SeqCst);
+            let path =
+                std::env::temp_dir().join(format!("gladius-{}-{now}-{n}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(ProfileDir { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("profile dir: {e}")),
+            }
+        }
+        Err("profile dir: too many collisions".to_string())
+    }
+}
+
+impl Drop for ProfileDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Delete `gladius-<pid>-*` profile dirs whose owner gladius pid is dead.
+/// Runs at every owned launch: the recovery path for hard-killed servers
+/// whose graceful cleanup never ran. Conservative: our prefix only, never
+/// our own pid, and only provably-dead owners (any doubt keeps the dir, so
+/// a live server's profile is never swept).
+fn sweep_stale_profiles() {
+    let rd = match std::fs::read_dir(std::env::temp_dir()) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let pid: u32 = match name
+            .strip_prefix("gladius-")
+            .and_then(|r| r.split('-').next())
+            .and_then(|p| p.parse().ok())
+        {
+            Some(p) => p,
+            None => continue,
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        if owner_alive(pid) {
+            continue;
+        }
+        eprintln!(
+            "[gladius] sweep: removing stale profile {}",
+            e.path().display()
+        );
+        let _ = std::fs::remove_dir_all(e.path());
+    }
+}
+
+#[cfg(windows)]
+fn owner_alive(pid: u32) -> bool {
+    job::process_alive(pid)
+}
+
+#[cfg(not(windows))]
+fn owner_alive(_pid: u32) -> bool {
+    true // conservative: never sweep where liveness is unchecked
 }
 
 #[cfg(windows)]
@@ -1959,6 +2066,8 @@ mod job {
 
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
     const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const ERROR_INVALID_PARAMETER: u32 = 87;
 
     #[repr(C)]
     #[derive(Default)]
@@ -2006,6 +2115,8 @@ mod job {
         ) -> i32;
         fn AssignProcessToJobObject(job: RawHandle, process: RawHandle) -> i32;
         fn CloseHandle(handle: RawHandle) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> RawHandle;
+        fn GetLastError() -> u32;
     }
 
     /// Assign `child` to a fresh kill-on-close job, returning the handle
@@ -2050,6 +2161,19 @@ mod job {
             }
             eprintln!("[gladius] job: browser armed with KILL_ON_JOB_CLOSE");
             Some(OwnedHandle::from_raw_handle(job))
+        }
+    }
+
+    /// True unless the pid is provably dead (conservative: any doubt keeps
+    /// the profile dir, so a live server's profile is never swept).
+    pub(super) fn process_alive(pid: u32) -> bool {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if !h.is_null() {
+                CloseHandle(h);
+                return true;
+            }
+            GetLastError() != ERROR_INVALID_PARAMETER
         }
     }
 }
@@ -2100,8 +2224,10 @@ mod tests {
         }
         let child = Command::from(std_cmd).spawn().expect("spawn sleeper");
         let pid = child.id().expect("sleeper pid");
+        let profile = ProfileDir::create().expect("profile");
         let inner = Inner {
             engine: Engine::Owned {
+                _profile: profile,
                 #[cfg(windows)]
                 _job: None,
                 child: Box::new(child),
@@ -2600,25 +2726,32 @@ mod tests {
     }
 
     /// Default path selection: with neither env var set the backend is the
-    /// owned Obscura launch with render caps.
+    /// owned Chromium launch with render caps.
     #[test]
-    fn default_path_is_obscura_render_when_no_env() {
-        let (_lock, _env) = EnvGuard::hold(&["GLADIUS_CDP_URL", "GLADIUS_BACKEND_CAPS"]);
+    fn default_path_is_chromium_render_when_no_env() {
+        let (_lock, _env) = EnvGuard::hold(&[
+            "GLADIUS_CDP_URL",
+            "GLADIUS_BACKEND_CAPS",
+            "GLADIUS_CHROMIUM",
+            "GLADIUS_CHROMIUM_CACHE",
+            "GLADIUS_HEADED",
+        ]);
         assert_eq!(cdp_url_override(), None);
         assert_eq!(backend_caps().unwrap(), BackendCaps::Render);
-        assert_eq!(backend_name(), "obscura");
+        assert_eq!(backend_name(), "chromium");
+        assert!(!headed_requested());
         let info = backend_info();
-        assert_eq!(info.get("backend"), Some(&json!("obscura")));
+        assert_eq!(info.get("backend"), Some(&json!("chromium")));
         assert_eq!(info.get("caps"), Some(&json!("render")));
         assert!(info.get("cdpUrl").is_none());
     }
 
-    /// Backend selection: unset -> obscura (the default and only launchable
+    /// Backend selection: unset -> chromium (the default and only launchable
     /// engine); `GLADIUS_CDP_URL` set -> attach. There is no other knob.
     #[test]
-    fn backend_selection_prefers_attach_then_obscura() {
-        let (_lock, _env) = EnvGuard::hold(&["GLADIUS_CDP_URL"]);
-        assert_eq!(backend_name(), "obscura");
+    fn backend_selection_prefers_attach_then_chromium() {
+        let (_lock, _env) = EnvGuard::hold(&["GLADIUS_CDP_URL", "GLADIUS_HEADED"]);
+        assert_eq!(backend_name(), "chromium");
         std::env::set_var("GLADIUS_CDP_URL", "ws://127.0.0.1:9/");
         assert_eq!(backend_name(), "external-cdp");
         let info = backend_info();
@@ -2626,66 +2759,158 @@ mod tests {
         assert_eq!(info.get("cdpUrl"), Some(&json!("ws://127.0.0.1:9/")));
     }
 
-    /// Obscura argv: the serve subcommand, loopback host/port, and BOTH gate
-    /// flags - each flag exactly once (the engine's clap parser hard-fails
-    /// on a repeated flag).
+    /// Headed requests fail closed: `GLADIUS_HEADED` truthy means the launch
+    /// dispatcher refuses with the headless-only error instead of launching
+    /// anything. Blank/unset/`0`/`false`/`no` mean headless (no refusal).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn headed_request_fails_closed() {
+        let (_lock, _env) = EnvGuard::hold(&["GLADIUS_HEADED", "GLADIUS_CDP_URL"]);
+        assert!(!headed_requested());
+        for off in ["", "   ", "0", "false", "FALSE", "no", "off"] {
+            std::env::set_var("GLADIUS_HEADED", off);
+            assert!(!headed_requested(), "must mean headless: {off:?}");
+        }
+        for on in ["1", "true", "TRUE", "yes"] {
+            std::env::set_var("GLADIUS_HEADED", on);
+            assert!(headed_requested(), "must request headed: {on:?}");
+            match launch().await {
+                Ok(_) => panic!("headed launch must fail for {on:?}"),
+                Err(e) => assert!(
+                    e.contains("headless-only") && e.contains("not supported"),
+                    "headed refusal must be explicit, got: {e}"
+                ),
+            }
+        }
+    }
+
+    /// Chromium argv: the researched launch contract, each flag exactly
+    /// once, `about:blank` last. Bare `--headless` (the shell's selector);
+    /// the exact-set match below is the enforcement: any added flag
+    /// (a wrong headless selector, a sandbox-off switch, the piped debug
+    /// transport, keychain switches) fails it.
     #[test]
-    fn obscura_argv_has_gates_once_and_no_duplicates() {
-        let argv = obscura_argv(19431);
-        assert_eq!(argv.first().map(|s| s.as_str()), Some("serve"));
+    fn chromium_argv_matches_launch_contract_once_and_no_more() {
+        let dir = std::env::temp_dir().join("gladius-argv-probe");
+        let argv = chromium_argv(19431, &dir);
+        assert!(
+            argv.contains(&"--headless".to_string()),
+            "bare --headless: {argv:?}"
+        );
+        assert_eq!(
+            argv.last().map(|s| s.as_str()),
+            Some("about:blank"),
+            "about:blank last: {argv:?}"
+        );
         for flag in [
-            "--host",
-            "--port",
-            "--allow-private-network",
-            "--allow-file-access",
+            "--headless",
+            "--no-first-run",
+            "--no-default-browser-check",
         ] {
             let n = argv.iter().filter(|a| a.as_str() == flag).count();
             assert_eq!(n, 1, "flag {flag} must appear exactly once: {argv:?}");
         }
-        let h = argv.iter().position(|a| a == "--host").expect("--host");
-        assert_eq!(argv.get(h + 1).map(|s| s.as_str()), Some("127.0.0.1"));
-        let i = argv.iter().position(|a| a == "--port").expect("--port");
-        assert_eq!(argv.get(i + 1).map(|s| s.as_str()), Some("19431"));
-        // No other flag-like token: exactly the four known flags.
-        let mut flags: Vec<&str> = argv
+        let port_flag = "--remote-debugging-port=19431".to_string();
+        assert_eq!(
+            argv.iter().filter(|a| *a == &port_flag).count(),
+            1,
+            "explicit debug port once: {argv:?}"
+        );
+        let profile_flag = format!("--user-data-dir={}", dir.display());
+        assert_eq!(
+            argv.iter().filter(|a| *a == &profile_flag).count(),
+            1,
+            "private profile once: {argv:?}"
+        );
+        let origin_flag = "--remote-allow-origins=http://127.0.0.1:19431".to_string();
+        assert_eq!(
+            argv.iter().filter(|a| *a == &origin_flag).count(),
+            1,
+            "explicit loopback origin once: {argv:?}"
+        );
+        // No other flag-like token: exactly the known set.
+        let mut flags: Vec<String> = argv
             .iter()
             .filter(|a| a.starts_with("--"))
-            .map(|s| s.as_str())
+            .cloned()
             .collect();
         flags.sort_unstable();
-        assert_eq!(
-            flags,
-            vec![
-                "--allow-file-access",
-                "--allow-private-network",
-                "--host",
-                "--port"
-            ],
-            "no extra or duplicated flags: {argv:?}"
-        );
+        let mut want = vec![
+            "--headless".to_string(),
+            "--no-default-browser-check".to_string(),
+            "--no-first-run".to_string(),
+            "--remote-allow-origins=http://127.0.0.1:19431".to_string(),
+            "--remote-debugging-port=19431".to_string(),
+            profile_flag,
+        ];
+        want.sort_unstable();
+        assert_eq!(flags, want, "no extra or duplicated flags: {argv:?}");
+        // Full-assertion companion: the shell's headless selector is bare,
+        // never a suffixed spelling.
+        for a in &argv {
+            if a.starts_with("--headless") {
+                assert_eq!(a, "--headless", "bare headless selector only: {argv:?}");
+            }
+        }
     }
 
-    /// Obscura-missing: an explicit bad override AND a blank override (sibling
-    /// lookup, which ships no engine beside the test binary) both fail with
-    /// the clear error naming the provision script.
+    /// Chromium resolution order: explicit `GLADIUS_CHROMIUM` wins when it
+    /// is a file; else the pinned cache path (honouring `GLADIUS_CHROMIUM_CACHE`
+    /// as the root); else a clear error naming `scripts/fetch-chromium.ps1`
+    /// that never falls back to any ambient, shared, or system browser.
     #[test]
-    fn obscura_missing_reports_fetch_script() {
-        let (_lock, _env) = EnvGuard::hold(&["GLADIUS_OBSCURA"]);
+    fn chromium_resolution_order_and_missing_error() {
+        let (_lock, _env) = EnvGuard::hold(&[
+            "GLADIUS_CHROMIUM",
+            "GLADIUS_CHROMIUM_CACHE",
+            "LOCALAPPDATA",
+        ]);
+        // Explicit override pointing nowhere: names the script.
         std::env::set_var(
-            "GLADIUS_OBSCURA",
-            r"C:\no-such-gladius-dir-xyz\obscura.exe",
+            "GLADIUS_CHROMIUM",
+            r"C:\no-such-gladius-dir-xyz\chrome-headless-shell.exe",
         );
-        let e = find_obscura().expect_err("missing engine must fail");
+        let e = find_chromium().expect_err("missing engine must fail");
         assert!(
-            e.contains("scripts/fetch-engine.ps1"),
+            e.contains("scripts/fetch-chromium.ps1"),
             "names the provision script, got: {e}"
         );
-        std::env::set_var("GLADIUS_OBSCURA", "   ");
-        let e2 = find_obscura().expect_err("missing sibling must fail");
         assert!(
-            e2.contains("scripts/fetch-engine.ps1"),
-            "sibling miss names the script, got: {e2}"
+            e.contains("GLADIUS_CHROMIUM"),
+            "names the override, got: {e}"
         );
+        // Explicit override pointing at a real file wins (this test file).
+        let here = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        std::env::set_var("GLADIUS_CHROMIUM", &here);
+        assert_eq!(find_chromium().expect("explicit file must win"), here);
+        // Blank override + empty cache root + missing cache entry: the error
+        // names the script and never resolves anything ambient.
+        std::env::set_var("GLADIUS_CHROMIUM", "   ");
+        let empty_root = std::env::temp_dir().join("gladius-no-such-cache-root-xyz");
+        std::env::set_var("GLADIUS_CHROMIUM_CACHE", &empty_root);
+        let e2 = find_chromium().expect_err("missing cache entry must fail");
+        assert!(
+            e2.contains("scripts/fetch-chromium.ps1"),
+            "cache miss names the script, got: {e2}"
+        );
+        assert!(
+            e2.contains(PINNED_CHROMIUM_VERSION),
+            "cache miss names the pin, got: {e2}"
+        );
+        // Cache-root override is honoured: plant the exact pinned layout
+        // under a scratch root and it resolves.
+        let scratch = std::env::temp_dir().join(format!(
+            "gladius-chromium-cache-probe-{}",
+            std::process::id()
+        ));
+        let exe = scratch
+            .join(format!("{PINNED_CHROMIUM_VERSION}-{PINNED_ZIP_SHORT8}"))
+            .join(CHROMIUM_EXE_REL.replace('/', std::path::MAIN_SEPARATOR_STR));
+        std::fs::create_dir_all(exe.parent().expect("exe parent")).expect("plant cache");
+        std::fs::write(&exe, b"probe").expect("plant exe");
+        std::env::set_var("GLADIUS_CHROMIUM_CACHE", &scratch);
+        assert_eq!(find_chromium().expect("planted cache must win"), exe);
+        std::fs::remove_dir_all(&scratch).ok();
     }
 
     /// dom-only refusal: screenshot errors naming the backend and the
@@ -2860,7 +3085,7 @@ mod tests {
                     let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
                     if n < OWNED_LAUNCH_ATTEMPTS {
                         Err(format!(
-                            "obscura child exited during startup: exit code: {n}"
+                            "chromium child exited during startup: exit code: {n}"
                         ))
                     } else {
                         Ok("ready")
@@ -2885,12 +3110,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn launch_retry_non_retryable_surfaces_immediately() {
         assert!(launch_startup_exit_is_retryable(
-            "obscura child exited during startup: exit code: 1"
+            "chromium child exited during startup: exit code: 1"
         ));
         for fatal in [
             "owned ws endpoint rejected: port 2 != owned port 1 in ws://127.0.0.1:2/",
-            "obscura child wait failed during startup: unknown state",
-            "timeout waiting for obscura /json/version on http://127.0.0.1:1: \
+            "chromium child wait failed during startup: unknown state",
+            "timeout waiting for chromium /json/version on http://127.0.0.1:1: \
              deadline passed with no ready endpoint",
         ] {
             assert!(
@@ -2935,7 +3160,7 @@ mod tests {
                 async move {
                     let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
                     Err(format!(
-                        "obscura child exited during startup: exit code: {n}"
+                        "chromium child exited during startup: exit code: {n}"
                     ))
                 }
             },
@@ -2944,7 +3169,7 @@ mod tests {
         assert_eq!(
             r,
             Err(format!(
-                "obscura child exited during startup: exit code: {OWNED_LAUNCH_ATTEMPTS}"
+                "chromium child exited during startup: exit code: {OWNED_LAUNCH_ATTEMPTS}"
             ))
         );
         assert_eq!(

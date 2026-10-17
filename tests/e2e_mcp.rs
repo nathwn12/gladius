@@ -35,16 +35,12 @@ impl Client {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .creation_flags(0x08000000); // CREATE_NO_WINDOW
-                                         // Default-engine tests locate the pinned engine binary: cargo runs
-                                         // the server from target/release (no obscura sibling there), so
-                                         // GLADIUS_OBSCURA points at the repo-pinned bin/obscura.exe. Still
-                                         // the default ENGINE (obscura); only the binary location is pinned
-                                         // for the cargo tree. The sibling layout itself is proved live by
-                                         // the Phase 2b proof session (bin/ gladius + obscura, no env set).
-        cmd.env(
-            "GLADIUS_OBSCURA",
-            format!("{}/bin/obscura.exe", env!("CARGO_MANIFEST_DIR")),
-        );
+                                         // Owned-engine resolution: the server resolves the pinned
+                                         // Chromium from its versioned cache
+                                         // (`%LOCALAPPDATA%\gladius\chromium\`, honouring
+                                         // `GLADIUS_CHROMIUM_CACHE`) with no env override, so
+                                         // integration tests set nothing here and exercise the
+                                         // default path end to end.
         let mut child = cmd.spawn().expect("spawn gladius mcp");
         let stdin = child.stdin.take().expect("child stdin");
         let stdout: ChildStdout = child.stdout.take().expect("child stdout");

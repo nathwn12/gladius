@@ -1,4 +1,14 @@
-# Obscura capability record
+# Obscura capability record (HISTORICAL)
+
+> SUPERSEDED by the Chromium engine swap: gladius no longer launches Obscura.
+> The owned engine is now the pinned `chrome-headless-shell` (see
+> `docs/ENGINE.md` and `docs/CHROMIUM.md`). This record is retained for
+> provenance only - every statement below describes the former engine, not
+> current behavior. In particular: JS dialogs are REAL on Chromium (the
+> auto-accept path acts and tools carry typed dialog reports), the
+> `Log.entryAdded` leg is LIVE, `Fetch.enable` interception is gone
+> (`Network.enable` alone observes request starts), and each owned instance
+> owns a private profile that is swept on close.
 
 Owned Obscura engine as the gladius default and only launch. Shipped at HEAD
 `f9f3d6b` (on `43e35d2`) as the default alongside a chrome opt-in; that

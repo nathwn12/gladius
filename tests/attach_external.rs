@@ -6,7 +6,7 @@
 //! - `GLADIUS_BACKEND_CAPS=dom-only` refuses `screenshot` (no rendering
 //!   pipeline) while DOM tools keep working; `upload` needs no rendering
 //!   (DOM CDP only) so it keeps working too - proved live here.
-//! - Default path (neither var set) is the owned Obscura launch: covered by
+//! - Default path (neither var set) is the owned Chromium launch: covered by
 //!   `e2e_mcp` plus the `initialize_reports_default_backend` fast check below
 //!   (no browser).
 
@@ -132,30 +132,67 @@ fn shutdown(c: Client) {
     }
 }
 
-/// Externally started engine: the repo-pinned `bin\obscura.exe`, launched
-/// by the TEST as an independent process (not via gladius). Owned by the
-/// TEST (Drop kills it); gladius must never touch it.
+/// Externally started engine: the pinned `chrome-headless-shell` (resolved
+/// exactly like production: `GLADIUS_CHROMIUM`, else the versioned cache),
+/// launched by the TEST as an independent process (not via gladius) with its
+/// own private profile OUTSIDE the `gladius-<pid>-*` owned pattern. Owned by
+/// the TEST (Drop kills it and sweeps the profile); gladius must never touch
+/// either.
 struct External {
     child: Child,
     pid: u32,
     port: u16,
+    profile: std::path::PathBuf,
+}
+
+fn pinned_chromium_exe() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("GLADIUS_CHROMIUM") {
+        if !p.trim().is_empty() {
+            return std::path::PathBuf::from(p.trim());
+        }
+    }
+    let root = match std::env::var("GLADIUS_CHROMIUM_CACHE") {
+        Ok(v) if !v.trim().is_empty() => std::path::PathBuf::from(v.trim()),
+        _ => std::path::PathBuf::from(
+            std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA for pinned chromium"),
+        )
+        .join("gladius")
+        .join("chromium"),
+    };
+    root.join("155.0.8059.84-5ca590a4")
+        .join("chrome-headless-shell-win64")
+        .join("chrome-headless-shell.exe")
 }
 
 impl External {
     fn start() -> Self {
-        let engine = format!("{}/bin/obscura.exe", env!("CARGO_MANIFEST_DIR"));
+        let exe = pinned_chromium_exe();
+        assert!(
+            exe.is_file(),
+            "pinned chromium missing: {} (provision with scripts/fetch-chromium.ps1)",
+            exe.display()
+        );
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
         let port = listener.local_addr().expect("local addr").port();
         drop(listener);
-        let mut cmd = Command::new(&engine);
+        let profile = std::env::temp_dir().join(format!(
+            "gladius-ext-attach-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&profile).expect("external profile dir");
+        let mut cmd = Command::new(&exe);
         cmd.args([
-            "serve",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "--allow-private-network",
-            "--allow-file-access",
+            "--headless",
+            &format!("--remote-debugging-port={port}"),
+            &format!("--user-data-dir={}", profile.display()),
+            "--no-first-run",
+            "--no-default-browser-check",
+            &format!("--remote-allow-origins=http://127.0.0.1:{port}"),
+            "about:blank",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -165,9 +202,14 @@ impl External {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
-        let child = cmd.spawn().expect("spawn external obscura engine");
+        let child = cmd.spawn().expect("spawn external chromium");
         let pid = child.id();
-        let mut ext = External { child, pid, port };
+        let mut ext = External {
+            child,
+            pid,
+            port,
+            profile,
+        };
         ext.wait_ready();
         ext
     }
@@ -217,6 +259,7 @@ impl Drop for External {
     fn drop(&mut self) {
         self.child.kill().ok();
         let _ = self.child.wait();
+        std::fs::remove_dir_all(&self.profile).ok();
     }
 }
 
@@ -308,7 +351,7 @@ fn profile_dirs(owner_pid: u32) -> Vec<std::path::PathBuf> {
         .unwrap_or_default()
 }
 
-/// `(pid, ppid)` for every live owned-engine process (read-only WMI
+/// `(pid, ppid)` for every live owned-browser process (read-only WMI
 /// query; never kills anything).
 fn engine_parentage() -> Vec<(u32, u32)> {
     let mut q = Command::new("powershell");
@@ -316,7 +359,7 @@ fn engine_parentage() -> Vec<(u32, u32)> {
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "Get-CimInstance Win32_Process -Filter \"Name='obscura.exe'\" | ForEach-Object { \"$($_.ProcessId):$($_.ParentProcessId)\" }",
+        "Get-CimInstance Win32_Process -Filter \"Name='chrome-headless-shell.exe'\" | ForEach-Object { \"$($_.ProcessId):$($_.ParentProcessId)\" }",
     ])
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
@@ -396,8 +439,8 @@ fn attach_over_ws_drives_and_leaves_external_alive() {
         .unwrap_or("");
     assert!(data.starts_with("iVBORw0KGgo"), "real png bytes");
 
-    // gladius created no engine of its own: no owned profile, and no
-    // obscura.exe process parented under the gladius pid.
+    // gladius created no browser of its own: no owned profile, and no
+    // chrome-headless-shell.exe process parented under the gladius pid.
     assert!(
         profile_dirs(gpid).is_empty(),
         "attached gladius owns no profile: {:?}",
@@ -536,10 +579,10 @@ fn dom_only_refuses_screenshot_but_keeps_dom_tools() {
 
 #[test]
 fn initialize_reports_default_backend_without_launching() {
-    // Neither var set: cold handshake reports the owned Obscura render
+    // Neither var set: cold handshake reports the owned Chromium render
     // backend and launches nothing (no navigate here, so no browser spawns).
     let mut c = Client::spawn_with_env(&[]);
-    assert_initialize(&mut c, "obscura", "render");
+    assert_initialize(&mut c, "chromium", "render");
     let pong = c.result("ping", json!({}));
     assert_eq!(pong, json!({}), "ping replies {{}}");
     shutdown(c);

@@ -343,19 +343,19 @@ async fn tool_navigate(browser: &Browser, url: &str) -> Result<Value, ToolErr> {
     // capture here), and a hardcoded 200 lies on every 404. A wrong field is
     // worse than no field, so the envelope is just url + title.
     //
-    // Transient blank-load race (measured on Obscura: the engine
-    // double-fetches documents and the losing request can commit an EMPTY DOM
-    // - empty title, empty body - at the right URL): when the committed page
-    // is non-blank yet title AND body text are both empty, say so in a
-    // `warning` field so the caller can see it (and re-navigate - the flake
-    // is retryable). One extra eval, only on suspicious pages; no retry
-    // magic here.
+    // Transient blank-load race (first measured on the former Obscura
+    // engine, which double-fetched documents so the losing request could
+    // commit an EMPTY DOM - empty title, empty body - at the right URL):
+    // when the committed page is non-blank yet title AND body text are both
+    // empty, say so in a `warning` field so the caller can see it (and
+    // re-navigate - the flake is retryable). One extra eval, only on
+    // suspicious pages; no retry magic here.
     if !title.is_empty() || cur.is_empty() || cur == "about:blank" {
         return Ok(ok_text(json!({"url": cur, "title": title}).to_string()));
     }
     // NOTE: `.length` arrives as an int on some engines but as a float on
-    // Obscura (`42` vs `42.0` number shape), so compare as f64 - `as_i64`
-    // would miss the empty case on Obscura entirely.
+    // others (`42` vs `42.0` number shape), so compare as f64 - `as_i64`
+    // would miss the empty case on float-shaping engines entirely.
     let body_len = browser
         .eval("(((document.body && document.body.innerText) || '') + '').length")
         .await
@@ -1130,8 +1130,8 @@ async fn tool_wait_for(
         // continuous quiet. Never hangs - expiry is the typed timeout.
         let idle_win =
             std::time::Duration::from_millis(idle_ms.unwrap_or(500).clamp(0, 5000).max(0) as u64);
-        // The lazy `Network.enable` / `Fetch.enable` enable is INSIDE the
-        // deadline as well. Each of its CDP calls allows `send_raw`'s 30s
+        // The lazy `Network.enable` enable is INSIDE the
+        // deadline as well. Its CDP call allows `send_raw`'s 30s
         // per-call timeout - double the largest budget this tool accepts
         // (15s) - so with an established session and a peer holding the
         // `Network.enable` response the unwrapped await answered a 100ms
