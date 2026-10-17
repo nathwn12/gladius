@@ -4,34 +4,47 @@
 // gladius-mcp launcher.
 //
 // Published package model (see docs/PUBLISHING.md): this tarball holds ONLY
-// this launcher plus the pinned engine manifest (engine-manifest.json). It
-// holds NO engine bytes, NO `os` field, NO `scripts`/postinstall field.
-// npm 12 blocks dependency install scripts by default (measured
-// `allow-scripts=false`), and npx has no project package.json for
-// `allowScripts` to consult, so a postinstall engine download would silently
-// never run. The engine is therefore acquired on first RUN by the code below.
+// this launcher plus the pinned browser/runtime manifest (engine-manifest.json).
+// It holds NO browser bytes, NO server bytes, NO `os` field, NO
+// `scripts`/postinstall field. npm 12 blocks dependency install scripts by
+// default (measured `allow-scripts=false`), and npx has no project
+// package.json for `allowScripts` to consult, so a postinstall download
+// would silently never run. Everything is therefore acquired on first RUN
+// by the code below.
+//
+// Two provisions, two caches, both verified:
+//   - The server runtime (manifest runtime.archive) downloads from the
+//     tagged GitHub Release, verifies zip sha256+size BEFORE extraction,
+//     extracts atomically (staging dir, then rename) into
+//     %LOCALAPPDATA%\gladius\engine\<serverVersion>-<bundleSha8>\, verifies
+//     the server binary against the manifest, writes a .ready marker, and
+//     is reused on later runs (re-verified each time).
+//   - The browser (manifest browser.asset) downloads from Google's
+//     Chrome-for-Testing endpoint, verifies zip sha256+size BEFORE
+//     extraction, extracts atomically into the owned browser cache
+//     %LOCALAPPDATA%\gladius\chromium\<version>-<zipSha8>\ (the same layout
+//     scripts/fetch-chromium.ps1 provisions), verifies every extracted file
+//     against the manifest (exact set, no extras), writes a .ready marker,
+//     and is reused on later runs (re-verified each time: marker + exe
+//     sha256 + a full name/size walk). Any mismatch refuses and writes
+//     nothing. The browser is NEVER redistributed: it is fetched here, at
+//     provision time, from Google.
+//   - The server (gladius.exe, no args = MCP stdio serve) spawns with
+//     GLADIUS_CHROMIUM pointed at the provisioned browser (the server reads
+//     that variable), unless the user already set it: an explicit
+//     GLADIUS_CHROMIUM wins, and then no browser is provisioned at all.
+//     stdio is inherited. ALL launcher chatter goes to stderr; stdout belongs
+//     to the MCP channel. No stdout writes exist on the run path.
+//   - `--doctor` / `--print-manifest` is the no-network diagnostic: it
+//     prints the manifest plus the resolved cache paths and exits 0. It
+//     returns BEFORE any fetch call (all fetch use lives in
+//     downloadToMemory, reachable only from the ensure* functions, which the
+//     diagnostic path never calls).
 //
 // Builtins only: node:fs, node:path, node:os, node:crypto,
 // node:child_process, node:zlib, and the global fetch (Node >= 22.14).
 // No dependencies, so the published tarball stays tiny and auditable.
 //
-// Run contract:
-//   - Non-Windows refuses at startup with an explicit message (override:
-//     GLADIUS_MCP_ALLOW_NON_WINDOWS=1, for diagnostics only).
-//   - The runtime bundle (manifest runtime.archive) downloads from the
-//     tagged GitHub Release, verifies zip sha256+size BEFORE extraction,
-//     extracts atomically (staging dir, then rename) into
-//     %LOCALAPPDATA%\gladius\engine\<serverVersion>-<bundleSha8>\, verifies
-//     every extracted file against the manifest, writes a .ready marker,
-//     and is reused on later runs (re-verified each time).
-//   - The server (gladius.exe, no args = MCP stdio serve) spawns with
-//     stdio inherited. ALL launcher chatter goes to stderr; stdout belongs
-//     to the MCP channel. No stdout writes exist on the run path.
-//   - `--doctor` / `--print-manifest` is the no-network diagnostic: it
-//     prints the manifest plus the resolved cache path and exits 0. It
-//     returns BEFORE any fetch call (all fetch use lives in
-//     downloadToMemory, reachable only from ensureRuntime, which the
-//     diagnostic path never calls).
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -43,10 +56,13 @@ const { spawn } = require('node:child_process');
 const PKG_DIR = path.dirname(path.dirname(__filename));
 const MANIFEST_PATH = path.join(PKG_DIR, 'engine-manifest.json');
 const PLATFORM_OVERRIDE_ENV = 'GLADIUS_MCP_ALLOW_NON_WINDOWS';
-const CACHE_OVERRIDE_ENV = 'GLADIUS_ENGINE_CACHE';
+const RUNTIME_CACHE_OVERRIDE_ENV = 'GLADIUS_ENGINE_CACHE';
+const BROWSER_CACHE_OVERRIDE_ENV = 'GLADIUS_CHROMIUM_CACHE';
+const BROWSER_PATH_OVERRIDE_ENV = 'GLADIUS_CHROMIUM';
 const DOWNLOAD_TIMEOUT_MS = 15 * 60 * 1000;
-// Staging/extraction guards: the real bundle is ~160 MB in a handful of
-// entries. These caps reject zip bombs, never the real artifact.
+// Staging/extraction guards: the real runtime bundle is small and the real
+// browser zip holds 288 entries / ~290 MB extracted. These caps reject zip
+// bombs, never the real artifacts.
 const MAX_ENTRIES = 4096;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
 const MAX_ENTRY_SIZE = 1 * 1024 * 1024 * 1024;
@@ -86,32 +102,62 @@ function shortHash(sha) {
   return isPlaceholderSha(sha) ? 'unpublished' : sha.toLowerCase().slice(0, 8);
 }
 
-// Resolved engine cache directory. Never throws: the diagnostic path must
+// Resolved runtime cache directory. Never throws: the diagnostic path must
 // print SOMETHING and exit 0 even where provisioning could never run.
-function resolveCacheDir(manifest) {
+function resolveRuntimeDir(manifest) {
   const notes = [];
-  let root = process.env[CACHE_OVERRIDE_ENV];
+  let root = process.env[RUNTIME_CACHE_OVERRIDE_ENV];
   let overridden = Boolean(root);
   if (!root) {
     root = process.env.LOCALAPPDATA;
-    if (!root) notes.push('LOCALAPPDATA is unset; set it or ' + CACHE_OVERRIDE_ENV);
+    if (!root) notes.push('LOCALAPPDATA is unset; set it or ' + RUNTIME_CACHE_OVERRIDE_ENV);
   }
   const leaf = `${manifest.serverVersion}-${shortHash(manifest.runtime.archive.sha256)}`;
   if (!root) return { dir: path.join('<unresolvable>', 'gladius', 'engine', leaf), overridden, notes };
   return { dir: path.join(root, 'gladius', 'engine', leaf), overridden, notes };
 }
 
+// Resolved browser cache directory: the same owned layout
+// scripts/fetch-chromium.ps1 provisions (<version>-<zipSha8>). Never throws,
+// for the same diagnostic reason as above.
+function resolveBrowserDir(manifest) {
+  const notes = [];
+  let root = process.env[BROWSER_CACHE_OVERRIDE_ENV];
+  let overridden = Boolean(root);
+  if (!root) {
+    root = process.env.LOCALAPPDATA;
+    if (!root) notes.push('LOCALAPPDATA is unset; set it or ' + BROWSER_CACHE_OVERRIDE_ENV);
+  }
+  const leaf = `${manifest.browser.version}-${shortHash(manifest.browser.asset.sha256)}`;
+  if (!root) return { dir: path.join('<unresolvable>', 'gladius', 'chromium', leaf), overridden, notes };
+  return { dir: path.join(root, 'gladius', 'chromium', leaf), overridden, notes };
+}
+
 function printDoctor(manifest) {
-  const cache = resolveCacheDir(manifest);
+  const runtime = resolveRuntimeDir(manifest);
+  const browser = resolveBrowserDir(manifest);
   const report = {
     package: manifest.package,
     serverVersion: manifest.serverVersion,
     platform: process.platform,
     node: process.version,
-    cacheDir: cache.dir,
-    cacheOverridden: cache.overridden,
-    cacheNotes: cache.notes,
-    engine: manifest.engine,
+    runtimeCacheDir: runtime.dir,
+    runtimeCacheOverridden: runtime.overridden,
+    runtimeCacheNotes: runtime.notes,
+    browserCacheDir: browser.dir,
+    browserCacheOverridden: browser.overridden,
+    browserCacheNotes: browser.notes,
+    browserPathOverride: process.env[BROWSER_PATH_OVERRIDE_ENV] || null,
+    browser: {
+      project: manifest.browser.project,
+      version: manifest.browser.version,
+      platform: manifest.browser.platform,
+      asset: manifest.browser.asset,
+      root: manifest.browser.root,
+      fileCount: manifest.browser.fileCount,
+      totalSize: manifest.browser.totalSize,
+      filesPinned: Array.isArray(manifest.browser.files) ? manifest.browser.files.length : 0,
+    },
     runtime: manifest.runtime,
     network: 'none: this diagnostic performs no fetch and exits before any download code',
   };
@@ -123,12 +169,14 @@ function usage(exitCode, stream) {
   const text = [
     'usage: gladius-mcp [--doctor | --print-manifest | --help]',
     '',
-    '  (no args)            provision the pinned runtime on first run, then serve MCP over stdio',
-    '  --doctor,            print the pinned manifest and the resolved engine cache',
-    '  --print-manifest     path, perform no network access, exit 0',
+    '  (no args)            provision the pinned runtime + browser on first run, then serve MCP over stdio',
+    '  --doctor,            print the pinned manifest and the resolved cache',
+    '  --print-manifest     paths, perform no network access, exit 0',
     '  --help, -h           print this usage',
     '',
-    'engine cache: ' + path.join('%LOCALAPPDATA%', 'gladius', 'engine', '<serverVersion>-<bundleSha8>') + ` (override: ${CACHE_OVERRIDE_ENV})`,
+    'runtime cache: ' + path.join('%LOCALAPPDATA%', 'gladius', 'engine', '<serverVersion>-<bundleSha8>') + ` (override: ${RUNTIME_CACHE_OVERRIDE_ENV})`,
+    'browser cache: ' + path.join('%LOCALAPPDATA%', 'gladius', 'chromium', '<version>-<zipSha8>') + ` (override: ${BROWSER_CACHE_OVERRIDE_ENV})`,
+    `explicit browser binary (skips browser provisioning): ${BROWSER_PATH_OVERRIDE_ENV}`,
     `platform: windows-x86_64 only (override: ${PLATFORM_OVERRIDE_ENV}=1, diagnostics only)`,
   ].join('\n') + '\n';
   stream.write(text);
@@ -136,11 +184,12 @@ function usage(exitCode, stream) {
 }
 
 // --- minimal zip reader (stored + deflate, builtins only) -----------------
-// The release bundle is an ordinary deflate zip (Compress-Archive). Node has
-// no builtin unzip, and this package is dependency-free by design, so the
-// container parse is hand-rolled here (~120 lines) over zlib.inflateRawSync.
-// Anything outside the bundle's actual shape (encryption, data descriptors,
-// zip64, unknown methods) is an explicit error, never a silent misparse.
+// Both zips (the Compress-Archive runtime bundle, the CfT browser archive)
+// are ordinary deflate zips. Node has no builtin unzip, and this package is
+// dependency-free by design, so the container parse is hand-rolled here
+// (~120 lines) over zlib.inflateRawSync. Anything outside the artifacts'
+// actual shape (encryption, data descriptors, zip64, unknown methods) is an
+// explicit error, never a silent misparse.
 
 const CRC_TABLE = (() => {
   const t = new Int32Array(256);
@@ -269,9 +318,28 @@ function checkFile(filePath, want) {
   return null;
 }
 
+// Walk a cache dir into zip-relative names (forward slashes) with sizes.
+// The browser cache keeps the zip's own tree (root dir included), so the
+// walked names compare directly against the manifest file list.
+function walkFiles(dir) {
+  const out = [];
+  const visit = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) visit(full);
+      else if (e.isFile()) {
+        const rel = path.relative(dir, full).split(path.sep).join('/');
+        out.push({ rel, full, size: fs.statSync(full).size });
+      }
+    }
+  };
+  visit(dir);
+  return out;
+}
+
 // The ONLY fetch call site in this package. The diagnostic path returns
-// before ensureRuntime, so --doctor/--print-manifest provably reach no
-// network: grep `fetch(` — it appears exactly once, here.
+// before the ensure* functions, so --doctor/--print-manifest provably reach
+// no network: grep `fetch(` — it appears exactly once, here.
 async function downloadToMemory(url) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), DOWNLOAD_TIMEOUT_MS);
@@ -300,10 +368,6 @@ async function ensureRuntime(manifest, cacheDir) {
   }
 
   const markerPath = path.join(cacheDir, '.ready');
-  const expected = [
-    rt.server,
-    ...manifest.engine.files,
-  ];
   const reuse = (() => {
     try {
       const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
@@ -312,22 +376,20 @@ async function ensureRuntime(manifest, cacheDir) {
     } catch {
       return false;
     }
-    for (const f of expected) {
-      const bad = checkFile(path.join(cacheDir, f.name), f);
-      if (bad) {
-        log(`cached ${f.name} invalid (${bad}); re-provisioning.`);
-        return false;
-      }
+    const bad = checkFile(path.join(cacheDir, rt.server.name), rt.server);
+    if (bad) {
+      log(`cached ${rt.server.name} invalid (${bad}); re-provisioning.`);
+      return false;
     }
     return true;
   })();
   if (reuse) {
-    log(`engine cache ready (reused): ${cacheDir}`);
+    log(`runtime cache ready (reused): ${cacheDir}`);
     return cacheDir;
   }
 
   const url = `${rt.source}/${rt.archive.name}`;
-  log(`provisioning engine cache: ${cacheDir}`);
+  log(`provisioning runtime cache: ${cacheDir}`);
   log(`downloading ${url} (${rt.archive.size} bytes)`);
   let data;
   try {
@@ -352,10 +414,8 @@ async function ensureRuntime(manifest, cacheDir) {
   try {
     const names = extractZip(data, staging);
     log(`extracted ${names.length} entries`);
-    for (const f of expected) {
-      const bad = checkFile(path.join(staging, f.name), f);
-      if (bad) throw new Error(`extracted ${f.name} invalid (${bad})`);
-    }
+    const bad = checkFile(path.join(staging, rt.server.name), rt.server);
+    if (bad) throw new Error(`extracted ${rt.server.name} invalid (${bad})`);
     fs.renameSync(staging, cacheDir);
     fs.writeFileSync(
       markerPath,
@@ -366,11 +426,143 @@ async function ensureRuntime(manifest, cacheDir) {
     fs.rmSync(cacheDir, { recursive: true, force: true });
     fail(`provisioning failed (${err.message}); wrote nothing.`);
   }
-  log(`engine cache ready (provisioned): ${cacheDir}`);
+  log(`runtime cache ready (provisioned): ${cacheDir}`);
   return cacheDir;
 }
 
-function runServer(cacheDir, manifest) {
+function checkBrowserPin(browser) {
+  if (!browser || typeof browser.version !== 'string' || browser.version.length === 0) {
+    fail('engine manifest has no pinned browser version; refusing to run.');
+  }
+  const asset = browser.asset || {};
+  if (isPlaceholderSha(asset.sha256) || !(asset.size > 0)) {
+    fail('engine manifest has no pinned browser archive hash; refusing to run.');
+  }
+  if (typeof asset.url !== 'string' || !asset.url.startsWith('https://')) {
+    fail('engine manifest has no https browser asset URL; refusing to run.');
+  }
+  if (!Array.isArray(browser.files) || browser.files.length === 0) {
+    fail('engine manifest has no browser file list; refusing to run.');
+  }
+  if (browser.files.length !== browser.fileCount) {
+    fail(`engine manifest browser file list (${browser.files.length}) != fileCount (${browser.fileCount}); refusing to run.`);
+  }
+}
+
+// Re-verification on reuse: the marker must bind this exact pin, the exe
+// (the security-critical file) must match name/size/sha256, and a full
+// name/size walk must equal the manifest set (exact files, no extras).
+// Returns null when good, else a reason.
+function reverifyBrowserCache(dir, browser) {
+  const exeRel = `${browser.root}/chrome-headless-shell.exe`;
+  const exeWant = browser.files.find((f) => f.name === exeRel);
+  if (!exeWant) return `manifest has no entry for ${exeRel}`;
+  const bad = checkFile(path.join(dir, ...exeRel.split('/')), exeWant);
+  if (bad) return `cached ${exeRel} invalid (${bad})`;
+  const want = new Map(browser.files.map((f) => [f.name, f.size]));
+  let total = 0;
+  let count = 0;
+  for (const a of walkFiles(dir)) {
+    if (a.rel === '.ready') continue;
+    const size = want.get(a.rel);
+    if (size === undefined) return `cached file not in manifest: ${a.rel}`;
+    if (a.size !== size) return `cached ${a.rel} size ${a.size} != manifest ${size}`;
+    total += a.size;
+    count++;
+  }
+  if (count !== browser.fileCount) return `cached file count ${count} != manifest ${browser.fileCount}`;
+  if (total !== browser.totalSize) return `cached total size ${total} != manifest ${browser.totalSize}`;
+  return null;
+}
+
+async function ensureBrowser(manifest, cacheDir) {
+  const browser = manifest.browser;
+  checkBrowserPin(browser);
+  const asset = browser.asset;
+
+  const markerPath = path.join(cacheDir, '.ready');
+  const reuse = (() => {
+    let marker;
+    try {
+      marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+    } catch {
+      return false;
+    }
+    if (marker.version !== browser.version) return false;
+    if (String(marker.zipSha256).toLowerCase() !== asset.sha256.toLowerCase()) return false;
+    const reason = reverifyBrowserCache(cacheDir, browser);
+    if (reason) {
+      log(`cached browser invalid (${reason}); re-provisioning.`);
+      return false;
+    }
+    return true;
+  })();
+  if (reuse) {
+    log(`browser cache ready (reused): ${cacheDir}`);
+    return path.join(cacheDir, ...`${browser.root}/chrome-headless-shell.exe`.split('/'));
+  }
+
+  log(`provisioning browser cache: ${cacheDir}`);
+  log(`downloading ${asset.url} (${asset.size} bytes)`);
+  let data;
+  try {
+    data = await downloadToMemory(asset.url);
+  } catch (err) {
+    fail(`cannot provision the pinned browser (${err.message}). The browser is fetched from Google's Chrome-for-Testing endpoint at first run and is never bundled; check network access to ${asset.url}.`);
+  }
+  if (data.length !== asset.size) {
+    fail(`browser download size ${data.length} != manifest ${asset.size}; wrote nothing.`);
+  }
+  const digest = crypto.createHash('sha256').update(data).digest('hex');
+  if (digest !== asset.sha256.toLowerCase()) {
+    fail('browser download sha256 mismatch; wrote nothing.');
+  }
+
+  // Extract into a staging dir, verify EVERY file against the manifest
+  // (exact set, no extras), then rename: the target dir is never observed
+  // half-written.
+  const staging = `${cacheDir}.staging-${process.pid}`;
+  fs.rmSync(staging, { recursive: true, force: true });
+  fs.rmSync(cacheDir, { recursive: true, force: true });
+  fs.mkdirSync(staging, { recursive: true });
+  try {
+    const names = extractZip(data, staging);
+    log(`extracted ${names.length} entries`);
+    const want = new Map(browser.files.map((f) => [f.name, f]));
+    if (names.length !== browser.fileCount) {
+      throw new Error(`extracted file count ${names.length} != manifest ${browser.fileCount}`);
+    }
+    let total = 0;
+    for (const n of names) {
+      const e = want.get(n);
+      if (!e) throw new Error(`extracted file not in manifest: ${n}`);
+      const bad = checkFile(path.join(staging, ...n.split('/')), e);
+      if (bad) throw new Error(`extracted ${n} invalid (${bad})`);
+      total += e.size;
+    }
+    if (total !== browser.totalSize) {
+      throw new Error(`extracted total size ${total} != manifest ${browser.totalSize}`);
+    }
+    const exeRel = `${browser.root}/chrome-headless-shell.exe`;
+    const exeEntry = want.get(exeRel);
+    const exeHash = sha256File(path.join(staging, ...exeRel.split('/')));
+    const exeLen = fs.statSync(path.join(staging, ...exeRel.split('/'))).size;
+    log(`check staged ${exeRel}: computed=${exeHash} expected=${exeEntry.sha256} size=${exeLen} expected-size=${exeEntry.size}`);
+    fs.renameSync(staging, cacheDir);
+    fs.writeFileSync(
+      markerPath,
+      JSON.stringify({ version: browser.version, zipSha256: asset.sha256.toLowerCase() }, null, 2)
+    );
+  } catch (err) {
+    fs.rmSync(staging, { recursive: true, force: true });
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+    fail(`browser provisioning failed (${err.message}); wrote nothing.`);
+  }
+  log(`browser cache ready (provisioned): ${cacheDir}`);
+  return path.join(cacheDir, ...`${browser.root}/chrome-headless-shell.exe`.split('/'));
+}
+
+function runServer(cacheDir, manifest, browserExe) {
   const exe = path.join(cacheDir, manifest.runtime.server.name);
   if (!fs.existsSync(exe)) {
     fail(`server binary missing after provisioning: ${exe}`);
@@ -380,7 +572,9 @@ function runServer(cacheDir, manifest) {
   // MCP channel; the launcher writes nothing to stdout on this path.
   // Ctrl+C reaches both processes on Windows (shared console), so no
   // signal relay is needed; the exit code is forwarded below.
-  const child = spawn(exe, [], { stdio: 'inherit' });
+  const env = { ...process.env };
+  if (browserExe) env[BROWSER_PATH_OVERRIDE_ENV] = browserExe;
+  const child = spawn(exe, [], { stdio: 'inherit', env });
   child.on('error', (err) => fail(`cannot start ${exe}: ${err.message}`));
   child.on('exit', (code, signal) => {
     if (signal) {
@@ -412,12 +606,26 @@ async function main() {
     );
   }
 
-  const cache = resolveCacheDir(manifest);
-  if (cache.dir.startsWith('<unresolvable>')) {
-    fail(`cannot resolve engine cache dir: ${cache.notes.join('; ')}. Set ${CACHE_OVERRIDE_ENV} to an absolute directory.`);
+  const runtime = resolveRuntimeDir(manifest);
+  if (runtime.dir.startsWith('<unresolvable>')) {
+    fail(`cannot resolve runtime cache dir: ${runtime.notes.join('; ')}. Set ${RUNTIME_CACHE_OVERRIDE_ENV} to an absolute directory.`);
   }
-  const ready = await ensureRuntime(manifest, cache.dir);
-  runServer(ready, manifest);
+  const readyRuntime = await ensureRuntime(manifest, runtime.dir);
+
+  // An explicit GLADIUS_CHROMIUM wins: the user's binary is their
+  // responsibility, so no browser is provisioned at all on that path.
+  const override = process.env[BROWSER_PATH_OVERRIDE_ENV];
+  if (override && override.trim() !== '') {
+    log(`using explicit browser from ${BROWSER_PATH_OVERRIDE_ENV}: ${override}`);
+    runServer(readyRuntime, manifest, null);
+    return;
+  }
+  const browser = resolveBrowserDir(manifest);
+  if (browser.dir.startsWith('<unresolvable>')) {
+    fail(`cannot provision the pinned browser: ${browser.notes.join('; ')}. Set ${BROWSER_CACHE_OVERRIDE_ENV} to an absolute directory.`);
+  }
+  const browserExe = await ensureBrowser(manifest, browser.dir);
+  runServer(readyRuntime, manifest, browserExe);
 }
 
 main().catch((err) => fail(err && err.message ? err.message : String(err)));

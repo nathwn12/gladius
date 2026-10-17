@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.1] - 2026-10-17
+
+- Engine swap: Obscura is gone. Gladius drives the owned pinned Chromium
+  (`chrome-headless-shell` `155.0.8059.84`, headless-only, no headed path)
+  provisioned by `scripts/fetch-chromium.ps1` into
+  `%LOCALAPPDATA%\gladius\chromium\` (overridable via
+  `GLADIUS_CHROMIUM_CACHE`, explicit binary via `GLADIUS_CHROMIUM`).
+  `initialize` reports `serverInfo.backend` `chromium`. JS dialogs are real
+  (auto-accepted and reported) and the `console` tool's `Log.entryAdded` leg
+  is live. `scripts/fetch-engine.ps1` is deleted; the former Obscura record
+  is kept for provenance in `docs/OBSCURA-COMPAT.md`.
+- Shipping path matches the new engine: CI provisions the pinned browser
+  (restored from cache per pin, re-verified) instead of Obscura; the release
+  runtime bundle carries only the server plus licences/notices — the browser
+  is fetched from Google's Chrome-for-Testing endpoint at provision time and
+  never bundled; the `gladius-mcp` launcher provisions and verifies both the
+  server runtime and the browser on first run and launches the server with
+  `GLADIUS_CHROMIUM` pointed at the pinned browser.
+
 ## [Unreleased]
 
 - Build provenance: `gladius --version` (also `version`) now reports the crate

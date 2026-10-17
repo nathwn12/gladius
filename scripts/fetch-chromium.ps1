@@ -3,7 +3,7 @@
   Provisions gladius's OWN pinned Chrome-for-Testing headless-shell (win64).
 
 .DESCRIPTION
-  Mirrors scripts/fetch-engine.ps1 in shape and discipline. Resolves one
+  Resolves one
   PINNED Chrome-for-Testing build (a version string, never a channel name),
   downloads the chrome-headless-shell zip, verifies the zip AND every
   extracted file against scripts/chromium-manifest.json (whose sha256 values

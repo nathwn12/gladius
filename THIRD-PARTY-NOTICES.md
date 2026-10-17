@@ -1,17 +1,21 @@
 # Third-party notices
 
-Gladius itself is MIT — see [LICENSE](LICENSE). The distributable release zip
-bundles the following third-party component beside `gladius.exe`:
+Gladius itself is MIT — see [LICENSE](LICENSE). No third-party browser binary
+ships in the release archives: the pinned browser is fetched from Google's
+Chrome-for-Testing endpoint at provision time and never redistributed.
 
-## Obscura browser engine (`obscura.exe`, `obscura-worker.exe`)
+## Chromium via Chrome for Testing (`chrome-headless-shell`, fetched at provision time)
 
-- **What:** the owned headless browser engine gladius drives over CDP
-  (Chrome DevTools Protocol). It is launched windowless beside `gladius.exe`
-  unless `GLADIUS_OBSCURA` points elsewhere or `GLADIUS_CDP_URL` attaches to
-  an external engine instead.
-- **Upstream:** <https://github.com/h4ckf0r0day/obscura>
-- **Release provisioned:** `v0.2.4`, fetched and sha256-verified by
-  [`scripts/fetch-engine.ps1`](scripts/fetch-engine.ps1) (zip, binary, and
-  size pins live in that script).
-- **License:** Apache-2.0, per the upstream project. The full license text is
-  bundled at [`THIRD-PARTY-LICENSES/Apache-2.0.txt`](THIRD-PARTY-LICENSES/Apache-2.0.txt).
+- **What:** the owned headless-only browser gladius drives over CDP
+  (Chrome DevTools Protocol). It is launched windowless from its versioned
+  cache unless `GLADIUS_CHROMIUM` points elsewhere or `GLADIUS_CDP_URL`
+  attaches to an external engine instead.
+- **Upstream:** <https://developer.chrome.com/docs/automation-and-testing/chrome-for-testing>
+  (asset `chrome-headless-shell-win64.zip`, pinned `155.0.8059.84`)
+- **Release provisioned:** `155.0.8059.84`, fetched and sha256-verified by
+  [`scripts/fetch-chromium.ps1`](scripts/fetch-chromium.ps1) (zip, per-file,
+  and size pins live in `scripts/chromium-manifest.json`).
+- **License:** Chromium BSD-style licence. The attribution copy is carried in
+  every runtime bundle at `THIRD-PARTY-LICENSES/LICENSE.headless_shell`
+  (copied from the provisioned, sha-verified browser cache); the browser
+  itself is never bundled.
