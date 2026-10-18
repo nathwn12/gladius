@@ -19,15 +19,33 @@ async fn main() {
         std::process::exit(2);
     }
     let arg = args.first().map(|s| s.as_str());
+    // The serve/selftest futures host every tool chain, including the
+    // browser launch + ws-connect depth. `#[tokio::main]`'s block_on polls
+    // its future on the MAIN thread, whose stack is the 1 MB PE default on
+    // Windows - the launch path sits right at that edge, so a layout shift
+    // (any rebuild) can flip a cold start between run and stack overflow.
+    // Spawn onto a runtime worker (2 MB stack) so the depth has headroom no
+    // rebuild can take away. Observed 2026-10-18: cold `navigate` overflowed
+    // main deterministically on one build and ran clean on the next.
     let code = match arg {
-        None | Some("mcp") => match mcp::serve().await {
-            Ok(()) => 0,
-            Err(e) => {
+        None | Some("mcp") => match tokio::spawn(mcp::serve()).await {
+            Ok(Ok(())) => 0,
+            Ok(Err(e)) => {
                 eprintln!("[gladius] {e}");
                 1
             }
+            Err(e) => {
+                eprintln!("[gladius] serve task failed: {e}");
+                1
+            }
         },
-        Some("selftest") => selftest::run().await,
+        Some("selftest") => match tokio::spawn(selftest::run()).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[gladius] selftest task failed: {e}");
+                1
+            }
+        },
         // Provenance: the crate version plus the commit this binary was built
         // from (`build.rs`), with `-dirty` when the tree was modified at build
         // time. This is the referent a deployed binary can be checked against.

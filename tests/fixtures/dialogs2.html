@@ -1,0 +1,12 @@
+<!doctype html>
+<html>
+<head><title>Gladius Dialog Policy Fixture</title></head>
+<body>
+<h1>DIALOG2_MARKER_55555</h1>
+<button id="alert2" onclick="alert('DLG2_probe-alert');document.getElementById('r').textContent='ALERT_DONE'">FIRE_ALERT</button>
+<button id="confirm2" onclick="document.getElementById('r').textContent='CONFIRM_IS:'+confirm('DLG2_probe-confirm')">FIRE_CONFIRM</button>
+<button id="prompt2" onclick="document.getElementById('r').textContent='PROMPT_IS:'+prompt('DLG2_probe-prompt','default-text')">FIRE_PROMPT</button>
+<div id="r">R:none</div>
+<a id="leave" href="/flip.html">LEAVE_PAGE</a>
+</body>
+</html>

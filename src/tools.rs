@@ -17,12 +17,28 @@ pub fn list() -> Value {
          "inputSchema": {"type": "object", "properties": {
              "element": {"type": "string"}, "text": {"type": "string"}, "submit": {"type": "boolean"}},
              "required": ["element", "text"]}},
-        {"name": "evaluate", "description": "Evaluate a JS expression in the page, await promises",
-         "inputSchema": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]}},
-        {"name": "wait_for", "description": "Wait for a selector/text, a delay, or network idle (max 15s). networkIdle:true waits for a quiet-network window of idleMs (default 500); a page that never goes idle returns the typed timeout.",
+        {"name": "evaluate", "description": "Evaluate a JS expression in the page, await promises. Optional realm routing: target=<CDP targetId> evaluates in that target's realm (page, dedicated/shared worker, service worker); frame=<CDP frameId> evaluates in that iframe's realm (isolated world, works cross-origin). Without either, the active page's main frame. target and frame are mutually exclusive.",
+         "inputSchema": {"type": "object", "properties": {"expression": {"type": "string"}, "target": {"type": "string"}, "frame": {"type": "string"}}, "required": ["expression"]}},
+        {"name": "wait_for", "description": "Wait for a selector/text, a JS expression condition, a delay, or network idle (max 15s). networkIdle:true waits for a quiet-network window of idleMs (default 500); a page that never goes idle returns the typed timeout. expression: polls the active page until the JS evaluates truthy (backoff cadence inside ms); expiry is the typed timeout.",
          "inputSchema": {"type": "object", "properties": {
              "selector": {"type": "string"}, "text": {"type": "string"}, "ms": {"type": "integer"},
-             "networkIdle": {"type": "boolean"}, "idleMs": {"type": "integer"}}}},
+             "networkIdle": {"type": "boolean"}, "idleMs": {"type": "integer"}, "expression": {"type": "string"}}}},
+        {"name": "targets", "description": "List every CDP target with its stable id (pages, workers of all kinds) plus the active page's frame tree (main frame + nested iframes, each with its frameId), or make a page target current. action list (default)|select; select needs target=<targetId> (page targets only; worker realms are reached via evaluate target=).",
+         "inputSchema": {"type": "object", "properties": {
+             "action": {"type": "string"}, "target": {"type": "string"}}}},
+        {"name": "dialog", "description": "JS-dialog policy and record. The reader auto-handles every alert/confirm/prompt/beforeunload with the policy (default accept) so a session never deadlocks; the dialog's own text is recorded. action get (default: last dialog + current policy)|policy (set default: needs accept bool, optional promptText for prompt dialogs).",
+         "inputSchema": {"type": "object", "properties": {
+             "action": {"type": "string"}, "accept": {"type": "boolean"}, "promptText": {"type": "string"}}}},
+        {"name": "history", "description": "Navigation history on the active page: back|forward step one entry, reload replays the current one. Returns the live url+title after the load settle; a step past the boundary is a typed error, never a silent no-op.",
+         "inputSchema": {"type": "object", "properties": {
+             "action": {"type": "string"}}, "required": ["action"]}},
+        {"name": "network", "description": "Observable network: captured requests/responses (method, url, status, resource type, timing) since the Network domain was first enabled, cap 500. action get (default)|drain|clear; filter is a plain substring matched against the url; limit caps returned (default 100).",
+         "inputSchema": {"type": "object", "properties": {
+             "action": {"type": "string"}, "filter": {"type": "string"}, "limit": {"type": "integer"}}}},
+        {"name": "cdp", "description": "Raw CDP escape hatch: send any protocol method with params on the browser-level connection or on one named session. Returns the raw CDP result; a CDP error reply is a tool error (isError), never a protocol error.",
+         "inputSchema": {"type": "object", "properties": {
+             "method": {"type": "string"}, "params": {"type": "object"}, "session": {"type": "string"}},
+             "required": ["method"]}},
         {"name": "console", "description": "Console capture: buffered console messages + uncaught exceptions, each {type,text,url,line,ts}. Ring buffer, cap 200. action get (default)|drain|clear; limit caps returned (default 100).",
          "inputSchema": {"type": "object", "properties": {
              "action": {"type": "string"}, "limit": {"type": "integer"}}}},
@@ -114,15 +130,40 @@ impl From<String> for ToolErr {
 ///   option_not_found reason no_match                         (+ tool, want)
 ///   capability_gated reason dom_only                         (+ tool)
 ///   timeout          reason budget_exceeded                   (+ tool)
-///   invalid_args     reason missing_arg|bad_value|bad_index|unknown_action|unknown_tool|need_option
+///   invalid_args     reason missing_arg|bad_value|bad_index|unknown_action|unknown_tool|need_option|unknown_arg (+ tool, arg?)
 ///   error            fallback, code only (cdp/js-engine failures and anything untyped)
+///
+/// Fail loud: every tool rejects arguments outside its own schema with
+/// `invalid_args`/`unknown_arg` (never silent acceptance) via
+/// `check_unknown` at the top of each dispatch arm.
 ///
 /// Dispatch a tool call. Always returns the MCP result object
 /// (`{"content": [...]}` with optional `isError`); tool failures are NOT
 /// protocol errors.
+/// Fail-loud argument gate: any key outside the tool's own schema is a
+/// typed `invalid_args`/`unknown_arg` error, never a silent ignore. (A
+/// silently ignored `target`/`frame`/`contextId` once routed evaluations to
+/// the wrong realm with no error; that shape must never recur.)
+fn check_unknown(tool: &str, args: &Value, allowed: &[&str]) -> Result<(), ToolErr> {
+    if let Some(obj) = args.as_object() {
+        for k in obj.keys() {
+            if !allowed.contains(&k.as_str()) {
+                return Err(ToolErr::typed(
+                    format!("{tool}: unknown argument '{k}' (not in this tool's schema; rejected, not ignored)"),
+                    json!({"code": "invalid_args", "reason": "unknown_arg", "tool": tool, "arg": k}),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
     let r: Result<Value, ToolErr> = match name {
         "navigate" => {
+            if let Err(e) = check_unknown("navigate", args, &["url"]) {
+                return e.envelope();
+            }
             let url = match args.get("url").and_then(|v| v.as_str()) {
                 Some(u) => u.to_string(),
                 None => return ToolErr::typed(
@@ -132,8 +173,16 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
             };
             tool_navigate(browser, &url).await
         }
-        "snapshot" => tool_snapshot(browser, args.get("mode").and_then(|v| v.as_str())).await,
+        "snapshot" => {
+            if let Err(e) = check_unknown("snapshot", args, &["mode"]) {
+                return e.envelope();
+            }
+            tool_snapshot(browser, args.get("mode").and_then(|v| v.as_str())).await
+        }
         "screenshot" => {
+            if let Err(e) = check_unknown("screenshot", args, &["fullPage"]) {
+                return e.envelope();
+            }
             let full = args
                 .get("fullPage")
                 .and_then(|v| v.as_bool())
@@ -141,6 +190,9 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
             tool_screenshot(browser, full).await
         }
         "click" => {
+            if let Err(e) = check_unknown("click", args, &["element"]) {
+                return e.envelope();
+            }
             let el = match args.get("element").and_then(|v| v.as_str()) {
                 Some(e) => e.to_string(),
                 None => return ToolErr::typed(
@@ -151,6 +203,9 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
             tool_click(browser, &el).await
         }
         "type" => {
+            if let Err(e) = check_unknown("type", args, &["element", "text", "submit"]) {
+                return e.envelope();
+            }
             let (el, text) = match (
                 args.get("element").and_then(|v| v.as_str()),
                 args.get("text").and_then(|v| v.as_str()),
@@ -168,6 +223,9 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
             tool_type(browser, &el, &text, submit).await
         }
         "evaluate" => {
+            if let Err(e) = check_unknown("evaluate", args, &["expression", "target", "frame"]) {
+                return e.envelope();
+            }
             let expr = match args.get("expression").and_then(|v| v.as_str()) {
                 Some(e) => e.to_string(),
                 None => return ToolErr::typed(
@@ -175,9 +233,18 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     json!({"code": "invalid_args", "reason": "missing_arg", "tool": "evaluate"}),
                 ).envelope(),
             };
-            tool_evaluate(browser, &expr).await
+            let target = args.get("target").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let frame = args.get("frame").and_then(|v| v.as_str()).map(|s| s.to_string());
+            tool_evaluate(browser, &expr, target.as_deref(), frame.as_deref()).await
         }
         "wait_for" => {
+            if let Err(e) = check_unknown(
+                "wait_for",
+                args,
+                &["selector", "text", "ms", "networkIdle", "idleMs", "expression"],
+            ) {
+                return e.envelope();
+            }
             let sel = args
                 .get("selector")
                 .and_then(|v| v.as_str())
@@ -192,9 +259,16 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let idle_ms = args.get("idleMs").and_then(|v| v.as_i64());
-            tool_wait_for(browser, sel.as_deref(), text.as_deref(), ms, net_idle, idle_ms).await
+            let expr = args
+                .get("expression")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            tool_wait_for(browser, sel.as_deref(), text.as_deref(), ms, net_idle, idle_ms, expr.as_deref()).await
         }
         "console" => {
+            if let Err(e) = check_unknown("console", args, &["action", "limit"]) {
+                return e.envelope();
+            }
             let action = args
                 .get("action")
                 .and_then(|v| v.as_str())
@@ -204,6 +278,9 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
             tool_console(browser, &action, limit).await
         }
         "upload" => {
+            if let Err(e) = check_unknown("upload", args, &["element", "paths"]) {
+                return e.envelope();
+            }
             let el = match args.get("element").and_then(|v| v.as_str()) {
                 Some(e) => e.to_string(),
                 None => return ToolErr::typed(
@@ -231,6 +308,9 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
             tool_upload(browser, &el, &paths).await
         }
         "fetch_text" => {
+            if let Err(e) = check_unknown("fetch_text", args, &["url"]) {
+                return e.envelope();
+            }
             let url = match args.get("url").and_then(|v| v.as_str()) {
                 Some(u) => u.to_string(),
                 None => return ToolErr::typed(
@@ -244,6 +324,9 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
             }
         }
         "hover" => {
+            if let Err(e) = check_unknown("hover", args, &["element"]) {
+                return e.envelope();
+            }
             let el = match args.get("element").and_then(|v| v.as_str()) {
                 Some(e) => e.to_string(),
                 None => return ToolErr::typed(
@@ -254,6 +337,9 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
             tool_hover(browser, &el).await
         }
         "select" => {
+            if let Err(e) = check_unknown("select", args, &["element", "value", "text"]) {
+                return e.envelope();
+            }
             let el = match args.get("element").and_then(|v| v.as_str()) {
                 Some(e) => e.to_string(),
                 None => return ToolErr::typed(
@@ -272,6 +358,9 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
             tool_select(browser, &el, value.as_deref(), text.as_deref()).await
         }
         "key" => {
+            if let Err(e) = check_unknown("key", args, &["key"]) {
+                return e.envelope();
+            }
             let key = match args.get("key").and_then(|v| v.as_str()) {
                 Some(k) => k.to_string(),
                 None => return ToolErr::typed(
@@ -283,6 +372,9 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
         }
         "viewport" => tool_viewport(browser, args).await,
         "tabs" => {
+            if let Err(e) = check_unknown("tabs", args, &["action", "url", "index"]) {
+                return e.envelope();
+            }
             let action = match args.get("action").and_then(|v| v.as_str()) {
                 Some(a) => a.to_string(),
                 None => return ToolErr::typed(
@@ -297,10 +389,100 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
             let index = args.get("index").and_then(|v| v.as_i64());
             tool_tabs(browser, &action, url.as_deref(), index).await
         }
-        "close" => match browser.close().await {
-            Ok(()) => Ok(ok_text(json!({"ok": true}).to_string())),
-            Err(e) => Err(ToolErr::fallback(e)),
-        },
+        "close" => {
+            if let Err(e) = check_unknown("close", args, &[]) {
+                return e.envelope();
+            }
+            match browser.close().await {
+                Ok(()) => Ok(ok_text(json!({"ok": true}).to_string())),
+                Err(e) => Err(ToolErr::fallback(e)),
+            }
+        }
+        "targets" => {
+            if let Err(e) = check_unknown("targets", args, &["action", "target"]) {
+                return e.envelope();
+            }
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("list")
+                .to_string();
+            let target = args
+                .get("target")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            tool_targets(browser, &action, target.as_deref()).await
+        }
+        "dialog" => {
+            if let Err(e) = check_unknown("dialog", args, &["action", "accept", "promptText"]) {
+                return e.envelope();
+            }
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("get")
+                .to_string();
+            tool_dialog(
+                browser,
+                &action,
+                args.get("accept").and_then(|v| v.as_bool()),
+                args.get("promptText").and_then(|v| v.as_str()),
+            )
+            .await
+        }
+        "history" => {
+            if let Err(e) = check_unknown("history", args, &["action"]) {
+                return e.envelope();
+            }
+            let action = match args.get("action").and_then(|v| v.as_str()) {
+                Some(a) => a.to_string(),
+                None => return ToolErr::typed(
+                    "history: missing required arg 'action'".to_string(),
+                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "history"}),
+                ).envelope(),
+            };
+            tool_history(browser, &action).await
+        }
+        "network" => {
+            if let Err(e) = check_unknown("network", args, &["action", "filter", "limit"]) {
+                return e.envelope();
+            }
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("get")
+                .to_string();
+            let filter = args
+                .get("filter")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let limit = args.get("limit").and_then(|v| v.as_i64());
+            tool_network(browser, &action, filter.as_deref(), limit).await
+        }
+        "cdp" => {
+            if let Err(e) = check_unknown("cdp", args, &["method", "params", "session"]) {
+                return e.envelope();
+            }
+            let method = match args.get("method").and_then(|v| v.as_str()) {
+                Some(m) => m.to_string(),
+                None => return ToolErr::typed(
+                    "cdp: missing required arg 'method'".to_string(),
+                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "cdp"}),
+                ).envelope(),
+            };
+            let params = args.get("params").cloned().unwrap_or(json!({}));
+            if !params.is_object() {
+                return ToolErr::typed(
+                    "cdp: 'params' must be an object".to_string(),
+                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "cdp"}),
+                ).envelope();
+            }
+            let session = args
+                .get("session")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            tool_cdp(browser, &method, params, session).await
+        }
         other => return ToolErr::typed(
             format!("unknown tool: {other}"),
             json!({"code": "invalid_args", "reason": "unknown_tool", "name": other}),
@@ -908,9 +1090,25 @@ async fn submit_enter(browser: &Browser) -> Result<(), String> {
     Ok(())
 }
 
-async fn tool_evaluate(browser: &Browser, expression: &str) -> Result<Value, ToolErr> {
+async fn tool_evaluate(
+    browser: &Browser,
+    expression: &str,
+    target: Option<&str>,
+    frame: Option<&str>,
+) -> Result<Value, ToolErr> {
+    if target.is_some() && frame.is_some() {
+        return Err(ToolErr::typed(
+            "evaluate: 'target' and 'frame' are mutually exclusive (one realm per call)".to_string(),
+            json!({"code": "invalid_args", "reason": "bad_value", "tool": "evaluate"}),
+        ));
+    }
     browser.take_dialog().await;
-    let v = browser.eval(expression).await?;
+    let v = match (target, frame) {
+        (Some(tid), None) => browser.eval_in_target(tid, expression).await?,
+        (None, Some(fid)) => browser.eval_in_frame(fid, expression).await?,
+        (None, None) => browser.eval(expression).await?,
+        _ => unreachable!(),
+    };
     let mut obj = serde_json::Map::new();
     obj.insert("value".to_string(), v);
     // An evaluate that opened a dialog (e.g. `alert(1)`) was auto-accepted
@@ -1056,9 +1254,19 @@ async fn tool_wait_for(
     ms: Option<i64>,
     network_idle: bool,
     idle_ms: Option<i64>,
+    expression: Option<&str>,
 ) -> Result<Value, ToolErr> {
     let budget_ms: i64 = ms.unwrap_or(5000).clamp(0, 15000);
     let budget = std::time::Duration::from_millis(budget_ms.max(0) as u64);
+    // One condition per call: `expression` never combines with
+    // `selector`/`text`. Validated before any waiting so a conflicting call
+    // fails fast instead of burning the budget on the wrong leg.
+    if expression.is_some() && (selector.is_some() || text.is_some()) {
+        return Err(ToolErr::typed(
+            "wait_for: 'expression' is mutually exclusive with 'selector'/'text' (one condition per call)".to_string(),
+            json!({"code": "invalid_args", "reason": "bad_value", "tool": "wait_for"}),
+        ));
+    }
     // ms:0 is a no-op: return immediately without any CDP round-trip. The
     // network-idle path keeps its own zero-budget behavior below, where the
     // lazy enable is inside the deadline like every other await.
@@ -1118,11 +1326,22 @@ async fn tool_wait_for(
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             tokio::time::sleep(remaining.min(std::time::Duration::from_millis(100))).await;
         }
-    } else if !network_idle {
+    } else if !network_idle && expression.is_none() {
         // Legacy bare delay: no condition, just sleep the budget.
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         tokio::time::sleep(remaining).await;
         return Ok(ok_text(json!({"ok": true}).to_string()));
+    }
+    // Predicate form: poll a computed JS condition on the active page with a
+    // backoff cadence inside the same hard deadline. Expiry is the typed
+    // timeout; a throwing condition is a real error (not "not yet true").
+    if let Some(expr) = expression {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match browser.wait_for_expression(expr, remaining).await {
+            Ok(true) => {}
+            Ok(false) => return Err(wait_timeout()),
+            Err(e) => return Err(ToolErr::fallback(e)),
+        }
     }
     if network_idle {
         // Quiet-network window on the REMAINING budget (zero when phase 1
@@ -1398,6 +1617,11 @@ async fn tool_key(browser: &Browser, key: &str) -> Result<Value, ToolErr> {
 /// next to what was requested, so an override the engine accepted but
 /// ignored shows up as `"matched": false` instead of a false success.
 async fn tool_viewport(browser: &Browser, args: &Value) -> Result<Value, ToolErr> {
+    check_unknown(
+        "viewport",
+        args,
+        &["width", "height", "deviceScaleFactor", "mobile", "reset"],
+    )?;
     if args.get("reset").and_then(|v| v.as_bool()).unwrap_or(false) {
         browser.viewport_reset().await?;
         let (w, h, dpr) = browser.viewport_readback().await?;
@@ -1528,5 +1752,190 @@ fn tabs_err(e: String) -> ToolErr {
         )
     } else {
         ToolErr::fallback(e)
+    }
+}
+
+/// `targets`: list every CDP target with its stable id plus the active
+/// page's frame tree, or make a page target current by id.
+async fn tool_targets(
+    browser: &Browser,
+    action: &str,
+    target: Option<&str>,
+) -> Result<Value, ToolErr> {
+    match action {
+        "list" => {
+            // Frames first: it ensures a page session exists (attach), so
+            // the `active` flag below names the tracked page even on a cold
+            // start. Either leg failing is the tool's error.
+            let frames = browser
+                .frame_tree()
+                .await
+                .map_err(targets_err)?
+                .get("frames")
+                .cloned()
+                .unwrap_or(json!([]));
+            let mut merged = browser.targets_all().await.map_err(targets_err)?;
+            if let Some(obj) = merged.as_object_mut() {
+                obj.insert("frames".to_string(), frames);
+            }
+            Ok(ok_text(merged.to_string()))
+        }
+        "select" => {
+            let tid = match target {
+                Some(t) => t,
+                None => {
+                    return Err(ToolErr::typed(
+                        "targets: missing required arg 'target' (CDP targetId)".to_string(),
+                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "targets"}),
+                    ));
+                }
+            };
+            let inner = browser.select_target(tid).await.map_err(targets_err)?;
+            Ok(ok_text(inner.to_string()))
+        }
+        other => Err(ToolErr::typed(
+            format!("targets: unknown action '{other}' (list|select)"),
+            json!({"code": "invalid_args", "reason": "unknown_action", "tool": "targets"}),
+        )),
+    }
+}
+
+/// Engine-originated `targets:` failures (raised in browser.rs, where the
+/// target/session space lives): the prefix before the first detail is
+/// caller-free prose, so re-type exact known shapes here. Select of a
+/// non-page target and unknown ids carry `invalid_target`; attach/frame
+/// failures keep the generic fallback (CDP/js-engine territory).
+fn targets_err(e: String) -> ToolErr {
+    if e.starts_with("targets: no target with id ") {
+        ToolErr::typed(
+            e,
+            json!({"code": "invalid_target", "reason": "not_found", "tool": "targets"}),
+        )
+    } else if e.contains("not a page (select takes page targets") {
+        ToolErr::typed(
+            e,
+            json!({"code": "invalid_target", "reason": "not_select", "tool": "targets"}),
+        )
+    } else {
+        ToolErr::fallback(e)
+    }
+}
+
+/// `dialog`: report the last auto-handled dialog plus the live policy
+/// (`get`), or set the default policy for the next dialog (`policy`).
+async fn tool_dialog(
+    browser: &Browser,
+    action: &str,
+    accept: Option<bool>,
+    prompt_text: Option<&str>,
+) -> Result<Value, ToolErr> {
+    match action {
+        "get" => {
+            let last = match browser.last_dialog().await {
+                Some(d) => json!({"type": d.dtype, "message": d.message, "url": d.url}),
+                None => Value::Null,
+            };
+            let p = browser.dialog_policy_get().await;
+            Ok(ok_text(
+                json!({"dialog": last,
+                       "policy": {"accept": p.accept, "promptText": p.prompt_text}})
+                .to_string(),
+            ))
+        }
+        "policy" => {
+            let a = match accept {
+                Some(v) => v,
+                None => {
+                    return Err(ToolErr::typed(
+                        "dialog: 'policy' needs required arg 'accept' (bool)".to_string(),
+                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "dialog"}),
+                    ));
+                }
+            };
+            let p = browser
+                .dialog_policy_set(a, prompt_text.map(|s| s.to_string()))
+                .await
+                .map_err(ToolErr::fallback)?;
+            Ok(ok_text(
+                json!({"policy": {"accept": p.accept, "promptText": p.prompt_text}})
+                    .to_string(),
+            ))
+        }
+        other => Err(ToolErr::typed(
+            format!("dialog: unknown action '{other}' (get|policy)"),
+            json!({"code": "invalid_args", "reason": "unknown_action", "tool": "dialog"}),
+        )),
+    }
+}
+
+/// `history`: back / forward / reload on the active page.
+async fn tool_history(browser: &Browser, action: &str) -> Result<Value, ToolErr> {
+    match browser.history(action).await {
+        Ok(v) => Ok(ok_text(v.to_string())),
+        Err(e) => Err(history_err(e)),
+    }
+}
+
+/// Engine-originated `history:` failures: unknown actions and boundary
+/// steps are site-known types; CDP failures keep the fallback.
+fn history_err(e: String) -> ToolErr {
+    if e.starts_with("history: unknown action ") {
+        ToolErr::typed(
+            e,
+            json!({"code": "invalid_args", "reason": "unknown_action", "tool": "history"}),
+        )
+    } else if e.contains("(at boundary)") {
+        ToolErr::typed(
+            e,
+            json!({"code": "invalid_target", "reason": "not_found", "tool": "history"}),
+        )
+    } else {
+        ToolErr::fallback(e)
+    }
+}
+
+/// `network`: get / drain / clear the captured request/response ring, with
+/// an optional plain-substring url filter and a return cap.
+async fn tool_network(
+    browser: &Browser,
+    action: &str,
+    filter: Option<&str>,
+    limit: Option<i64>,
+) -> Result<Value, ToolErr> {
+    // Cap the RETURNED slice; the ring itself is NET_CAP (browser.rs).
+    let lim = limit.unwrap_or(100).clamp(1, 500) as usize;
+    match action {
+        "get" => Ok(ok_text(browser.network_get(filter, lim).await.to_string())),
+        "drain" => Ok(ok_text(browser.network_drain(filter, lim).await.to_string())),
+        "clear" => {
+            let n = browser.network_clear().await;
+            Ok(ok_text(json!({"cleared": n, "cap": crate::browser::NET_CAP}).to_string()))
+        }
+        other => Err(ToolErr::typed(
+            format!("network: unknown action '{other}' (get|drain|clear)"),
+            json!({"code": "invalid_args", "reason": "unknown_action", "tool": "network"}),
+        )),
+    }
+}
+
+/// `cdp`: raw protocol escape hatch. `params` defaults to `{}`; `session`
+/// names one attached session (browser-level when absent). The raw CDP
+/// `result` rides back verbatim; a CDP error reply is the tool's `isError`,
+/// never a protocol error.
+async fn tool_cdp(
+    browser: &Browser,
+    method: &str,
+    params: Value,
+    session: Option<String>,
+) -> Result<Value, ToolErr> {
+    if method.trim().is_empty() {
+        return Err(ToolErr::typed(
+            "cdp: missing required arg 'method'".to_string(),
+            json!({"code": "invalid_args", "reason": "missing_arg", "tool": "cdp"}),
+        ));
+    }
+    match browser.cdp_raw(method, params, session).await {
+        Ok(v) => Ok(ok_text(json!({"result": v}).to_string())),
+        Err(e) => Err(ToolErr::fallback(e)),
     }
 }

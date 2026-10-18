@@ -63,6 +63,57 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// A captured CDP network event, shaped `{requestId,method,url,type,status,
+/// mime,failed,errorText,ts}` for the `network` tool. Kept in a bounded ring
+/// (`NET_CAP`); the reader pushes, the tool drains. Empty (and free) until
+/// the Network domain is enabled (lazily, on first network use).
+#[derive(Clone, Debug)]
+pub struct NetEntry {
+    pub request_id: String,
+    pub method: String,
+    pub url: String,
+    pub rtype: String,
+    pub status: Option<i64>,
+    pub mime: String,
+    pub finished: bool,
+    pub failed: bool,
+    pub error_text: String,
+    pub ts: u64,
+}
+
+impl NetEntry {
+    fn json(&self) -> Value {
+        json!({"requestId": self.request_id, "method": self.method,
+               "url": self.url, "type": self.rtype,
+               "status": self.status, "mime": self.mime,
+               "finished": self.finished, "failed": self.failed,
+               "errorText": self.error_text, "ts": self.ts})
+    }
+}
+
+/// Ring cap for captured network entries (stated in the `network` tool
+/// description so agents can reason about depth).
+pub const NET_CAP: usize = 500;
+
+/// Default dialog policy: how the reader auto-handles a page JS dialog.
+/// `accept` answers confirm/beforeunload (and accepts alert); `prompt_text`
+/// is the reply for prompt dialogs when accepting. The page can never wedge:
+// an unhandled dialog blocks the JS thread, so one policy always applies.
+#[derive(Clone, Debug)]
+pub struct DialogPolicy {
+    pub accept: bool,
+    pub prompt_text: String,
+}
+
+impl Default for DialogPolicy {
+    fn default() -> Self {
+        DialogPolicy {
+            accept: true,
+            prompt_text: String::new(),
+        }
+    }
+}
+
 struct Shared {
     sink: AsyncMutex<WsSink>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
@@ -111,6 +162,19 @@ struct Shared {
     /// without the replay a fresh tab would silently revert to the engine
     /// default while the caller still believed the viewport was set.
     viewport: AsyncMutex<Option<Value>>,
+    /// Captured network entries (bounded ring, `NET_CAP`). Pushed by the
+    /// reader on `Network.requestWillBeSent` / `responseReceived` /
+    /// `loadingFinished` / `loadingFailed` once the Network domain is
+    /// enabled; drained by the `network` tool. Empty (and free) until then.
+    net_log: AsyncMutex<VecDeque<NetEntry>>,
+    /// Dialog policy applied by the reader when a JS dialog opens
+    /// (auto-accept is the default, matching the pre-policy behavior).
+    dialog_policy: AsyncMutex<DialogPolicy>,
+    /// Sessions opened for non-active targets (worker/page realms reached
+    /// via target-scoped `evaluate`). `targetId -> sessionId`, reused across
+    /// calls so one target costs one attach. Never the active session: the
+    /// tracked page session is untouched by realm-scoped evaluation.
+    extra_sessions: AsyncMutex<HashMap<String, String>>,
 }
 
 /// Ownership of the engine behind an `Inner` connection.
@@ -234,6 +298,9 @@ fn new_shared(sink: WsSink) -> Arc<Shared> {
         net_notify: tokio::sync::Notify::new(),
         net_enabled: AsyncMutex::new(HashSet::new()),
         viewport: AsyncMutex::new(None),
+        net_log: AsyncMutex::new(VecDeque::new()),
+        dialog_policy: AsyncMutex::new(DialogPolicy::default()),
+        extra_sessions: AsyncMutex::new(HashMap::new()),
     })
 }
 
@@ -912,6 +979,434 @@ impl Browser {
             }
         }
     }
+
+    /// Raw CDP escape hatch: `method` with `params` on the browser-level
+    /// connection (`session` None) or on one named session. Returns the raw
+    /// `result` (events and errors follow the usual CDP shape; a CDP `error`
+    /// reply is the `Err` string, like every other engine call).
+    pub async fn cdp_raw(
+        &self,
+        method: &str,
+        params: Value,
+        session: Option<String>,
+    ) -> Result<Value, String> {
+        let shared = self.shared().await?;
+        if session.is_some() {
+            send_raw(&shared, method, params, session).await
+        } else {
+            send_raw(&shared, method, params, None).await
+        }
+    }
+
+    /// Every CDP target the engine reports (pages, iframes are frames not
+    /// targets, workers of all kinds, background, devtools filtered out),
+    /// in raw CDP order with the tracked active target first when known.
+    /// Stable ids: `targetId` is the engine's own stable handle.
+    pub async fn targets_all(&self) -> Result<Value, String> {
+        let shared = self.shared().await?;
+        let active = shared.target.lock().await.clone();
+        let r = send_raw(&shared, "Target.getTargets", json!({}), None).await?;
+        let infos = r
+            .get("targetInfos")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for t in infos {
+            if t.get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .starts_with("devtools://")
+            {
+                continue;
+            }
+            let tid = t.get("targetId").and_then(|v| v.as_str()).unwrap_or("");
+            out.push(json!({
+                "targetId": tid,
+                "type": t.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+                "url": t.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+                "title": t.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                "active": Some(tid.to_string()) == active,
+            }));
+        }
+        Ok(json!({"targets": out}))
+    }
+
+    /// Frame tree of the ACTIVE page: every frame (main + nested iframes)
+    /// with its CDP `frameId`, parent, url, and name. Flattened from
+    /// `Page.getFrameTree`, document order.
+    pub async fn frame_tree(&self) -> Result<Value, String> {
+        let shared = self.shared().await?;
+        let session = ensure_session(&shared).await?;
+        let r = send_raw(&shared, "Page.getFrameTree", json!({}), Some(session)).await?;
+        let mut frames = Vec::new();
+        if let Some(tree) = r.get("frameTree") {
+            flatten_frames(tree, &mut frames);
+        }
+        Ok(json!({"frames": frames}))
+    }
+
+    /// Make a PAGE target current by its `targetId`: activate + attach, then
+    /// settle like `tabs select`. Non-page targets are NOT selectable as the
+    /// current page (typed error): reach worker realms via target-scoped
+    /// `evaluate` instead.
+    pub async fn select_target(&self, target_id: &str) -> Result<Value, String> {
+        let shared = self.shared().await?;
+        let infos = send_raw(&shared, "Target.getTargets", json!({}), None)
+            .await?
+            .get("targetInfos")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let hit = infos.iter().find(|t| {
+            t.get("targetId").and_then(|v| v.as_str()) == Some(target_id)
+        });
+        let hit = hit.ok_or(format!("targets: no target with id {target_id}"))?;
+        if hit.get("type").and_then(|v| v.as_str()) != Some("page") {
+            let ty = hit.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            return Err(format!(
+                "targets: target {target_id} is type '{ty}', not a page (select takes page targets; use evaluate target= for realms)"
+            ));
+        }
+        let record_url = hit
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let _ = send_raw(
+            &shared,
+            "Target.activateTarget",
+            json!({"targetId": target_id}),
+            None,
+        )
+        .await?;
+        attach_to(&shared, target_id).await?;
+        let expect_page = !record_url.is_empty() && record_url != "about:blank";
+        settle_new_tab(&shared, expect_page).await;
+        tabs_object(&shared).await
+    }
+
+    /// Evaluate `expression` in the realm of an arbitrary CDP TARGET
+    /// (page, dedicated/shared worker, service worker) and return the value
+    /// (or a JS error string), like `eval`. The tracked active page is
+    /// untouched. Routing is type-aware:
+    /// - dedicated/shared workers answer ONLY on their auto-attach
+    ///   event-provided session (recorded by the reader; a direct
+    ///   `Target.attachToTarget` returns a session whose commands hang, so
+    ///   it is never attempted for these types - a miss is a fast typed
+    ///   error, never a 30 s hang);
+    /// - pages, service workers, and everything else attach directly
+    ///   (cached per target).
+    pub async fn eval_in_target(
+        &self,
+        target_id: &str,
+        expression: &str,
+    ) -> Result<Value, String> {
+        let shared = self.shared().await?;
+        let info = send_raw(
+            &shared,
+            "Target.getTargetInfo",
+            json!({"targetId": target_id}),
+            None,
+        )
+        .await
+        .map_err(|e| format!("targets: no target with id {target_id}: {e}"))?;
+        let ttype = info
+            .get("targetInfo")
+            .and_then(|t| t.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if ttype == "worker" || ttype == "shared_worker" {
+            // Bounded wait for the auto-attach event session (the worker may
+            // still be starting, or its event in flight).
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(sid) = shared.extra_sessions.lock().await.get(target_id).cloned() {
+                    return eval_on_session(&shared, &sid, expression).await;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            return Err(format!(
+                "targets: no live session for {ttype} target {target_id} (auto-attach event never landed)"
+            ));
+        }
+        // Reuse the cached direct session for this target when one exists.
+        let sid = {
+            let cached = shared.extra_sessions.lock().await.get(target_id).cloned();
+            match cached {
+                Some(s) => s,
+                None => {
+                    let attached = send_raw(
+                        &shared,
+                        "Target.attachToTarget",
+                        json!({"targetId": target_id, "flatten": true}),
+                        None,
+                    )
+                    .await
+                    .map_err(|e| format!("targets: cannot attach to {target_id}: {e}"))?;
+                    let s = attached
+                        .get("sessionId")
+                        .and_then(|v| v.as_str())
+                        .ok_or("targets: attach returned no sessionId".to_string())?
+                        .to_string();
+                    shared.extra_sessions.lock().await.insert(target_id.to_string(), s.clone());
+                    // Workers never got Runtime enabled: harmless, enables
+                    // exception details on the session.
+                    let _ = send_raw(&shared, "Runtime.enable", json!({}), Some(s.clone())).await;
+                    s
+                }
+            }
+        };
+        eval_on_session(&shared, &sid, expression).await
+    }
+
+    /// Evaluate `expression` in one IFRAME realm: an isolated world is
+    /// created on the named frame (works cross-origin) and the expression
+    /// runs there with `returnByValue` + `awaitPromise`. The tracked active
+    /// page is untouched.
+    pub async fn eval_in_frame(
+        &self,
+        frame_id: &str,
+        expression: &str,
+    ) -> Result<Value, String> {
+        let shared = self.shared().await?;
+        let session = ensure_session(&shared).await?;
+        let world = send_raw(
+            &shared,
+            "Page.createIsolatedWorld",
+            json!({"frameId": frame_id}),
+            Some(session.clone()),
+        )
+        .await
+        .map_err(|e| format!("targets: no frame with id {frame_id}: {e}"))?;
+        let ctx = world
+            .get("executionContextId")
+            .and_then(|v| v.as_u64())
+            .ok_or("targets: isolated world returned no executionContextId".to_string())?;
+        let r = send_raw(
+            &shared,
+            "Runtime.evaluate",
+            json!({"expression": expression, "contextId": ctx,
+                   "returnByValue": true, "awaitPromise": true}),
+            Some(session),
+        )
+        .await?;
+        if let Some(ex) = r.get("exceptionDetails") {
+            return Err(format!("js exception: {ex}"));
+        }
+        let robj = r
+            .get("result")
+            .ok_or("evaluate: no result in response".to_string())?;
+        match robj.get("value") {
+            Some(v) => Ok(v.clone()),
+            None => {
+                let t = robj
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                Err(format!("evaluate: expression returned {t} (no value)"))
+            }
+        }
+    }
+
+    /// Poll `expression` on the active page until it returns truthy, with a
+    /// backoff cadence inside the shared `budget`. Returns Ok(true) once the
+    /// condition holds, Ok(false) on budget expiry (the caller mints the
+    /// typed timeout - this never hangs). A JS exception fails the poll
+    /// immediately (a throwing condition is not "not yet true").
+    pub async fn wait_for_expression(
+        &self,
+        expression: &str,
+        budget: Duration,
+    ) -> Result<bool, String> {
+        let deadline = Instant::now() + budget;
+        let mut wait = Duration::from_millis(50);
+        loop {
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, self.eval(expression)).await {
+                Ok(Ok(v)) => {
+                    if is_truthy(&v) {
+                        return Ok(true);
+                    }
+                }
+                Ok(Err(e)) if e.starts_with("js exception") => return Err(e),
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            tokio::time::sleep(remaining.min(wait)).await;
+            wait = (wait * 2).min(Duration::from_millis(500));
+        }
+    }
+
+    /// Navigation history on the active page: `back` / `forward` step one
+    /// entry via `Page.navigateToHistoryEntry`, `reload` replays the current
+    /// one via `Page.reload`. Returns the live `(url, title)` after the
+    /// event-driven load settle. A missing entry is the caller's typed
+    /// error (never a silent no-op).
+    pub async fn history(&self, action: &str) -> Result<Value, String> {
+        let shared = self.shared().await?;
+        let session = ensure_session(&shared).await?;
+        if action == "reload" {
+            send_raw(&shared, "Page.reload", json!({}), Some(session)).await?;
+            self.wait_for_load(Duration::from_secs(10)).await;
+            return live_url_title(self).await;
+        }
+        if action != "back" && action != "forward" {
+            return Err(format!("history: unknown action '{action}' (back|forward|reload)"));
+        }
+        let h = send_raw(
+            &shared,
+            "Page.getNavigationHistory",
+            json!({}),
+            Some(session.clone()),
+        )
+        .await?;
+        let idx = h.get("currentIndex").and_then(|v| v.as_i64()).unwrap_or(0);
+        let entries = h
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // currentIndex positions INTO entries; its id is the entryId the
+        // navigation command wants. A step past either end is the caller's
+        // typed error, never a silent no-op.
+        let want_idx = if action == "back" { idx - 1 } else { idx + 1 };
+        let entry = if want_idx < 0 {
+            None
+        } else {
+            entries.get(want_idx as usize)
+        };
+        let entry = entry.ok_or(format!("history: no {action} entry (at boundary)"))?;
+        let eid = entry.get("id").and_then(|v| v.as_i64()).ok_or(format!("history: entry has no id"))?;
+        send_raw(
+            &shared,
+            "Page.navigateToHistoryEntry",
+            json!({"entryId": eid}),
+            Some(session),
+        )
+        .await?;
+        self.wait_for_load(Duration::from_secs(10)).await;
+        live_url_title(self).await
+    }
+
+    /// Newest-first? No - oldest-first slice of the network ring: the last
+    /// `limit` entries in arrival order, plus `count`/`total`/`cap` so an
+    /// agent can tell a quiet page (`total: 0`) from a truncated one. The
+    /// Network domain is enabled lazily here (first use pays one round-trip
+    /// per session); `filter` is a plain substring matched against the url.
+    pub async fn network_get(&self, filter: Option<&str>, limit: usize) -> Value {
+        if self.ensure_network().await.is_err() {
+            return json!({"entries": [], "count": 0, "total": 0, "cap": NET_CAP});
+        }
+        let msgs: Vec<NetEntry> = {
+            let guard = self.state.lock().await;
+            match guard.as_ref() {
+                Some(inner) => inner.shared.net_log.lock().await.iter().cloned().collect(),
+                None => Vec::new(),
+            }
+        };
+        let sel: Vec<&NetEntry> = match filter {
+            Some(f) if !f.is_empty() => msgs.iter().filter(|e| e.url.contains(f)).collect(),
+            _ => msgs.iter().collect(),
+        };
+        let total = sel.len();
+        let take = limit.min(total);
+        let slice = &sel[total - take..];
+        json!({"entries": slice.iter().map(|m| m.json()).collect::<Vec<_>>(),
+               "count": take, "total": total, "cap": NET_CAP})
+    }
+
+    /// Atomic take-and-return for `network drain`: the slice AND the removal
+    /// happen under ONE lock acquisition, so arrivals during a drain are
+    /// either returned or kept, never lost. Only the RETURNED entries (the
+    /// last `limit` matching `filter`) are removed; the rest of the ring is
+    /// kept, so a filtered drain never discards unrelated traffic.
+    pub async fn network_drain(&self, filter: Option<&str>, limit: usize) -> Value {
+        if self.ensure_network().await.is_err() {
+            return json!({"entries": [], "count": 0, "total": 0, "cap": NET_CAP, "cleared": 0});
+        }
+        let guard = self.state.lock().await;
+        match guard.as_ref() {
+            Some(inner) => {
+                let mut q = inner.shared.net_log.lock().await;
+                let matches = |e: &NetEntry| match filter {
+                    Some(f) if !f.is_empty() => e.url.contains(f),
+                    _ => true,
+                };
+                let total = q.iter().filter(|e| matches(e)).count();
+                let take = limit.min(total);
+                // Indices (in ring order) of the last `take` matching entries.
+                let mut sel: Vec<usize> = q
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| matches(e))
+                    .map(|(i, _)| i)
+                    .collect();
+                let drop_head = sel.len().saturating_sub(take);
+                sel.drain(..drop_head);
+                let take_set: std::collections::HashSet<usize> = sel.iter().cloned().collect();
+                let messages: Vec<Value> = sel
+                    .iter()
+                    .filter_map(|i| q.get(*i))
+                    .map(|e| e.json())
+                    .collect();
+                let mut kept = VecDeque::with_capacity(q.len() - take_set.len());
+                for (i, e) in q.drain(..).enumerate() {
+                    if !take_set.contains(&i) {
+                        kept.push_back(e);
+                    }
+                }
+                *q = kept;
+                json!({"entries": messages, "count": take,
+                       "total": total, "cap": NET_CAP, "cleared": take})
+            }
+            None => json!({"entries": [], "count": 0,
+                           "total": 0, "cap": NET_CAP, "cleared": 0}),
+        }
+    }
+
+    /// Drain the network ring, returning the number of entries dropped.
+    /// Like every other `network` action, arming the capture first (lazy
+    /// `Network.enable`) so traffic from that point on is observed.
+    pub async fn network_clear(&self) -> usize {
+        let _ = self.ensure_network().await;
+        let guard = self.state.lock().await;
+        match guard.as_ref() {
+            Some(inner) => inner.shared.net_log.lock().await.drain(..).count(),
+            None => 0,
+        }
+    }
+
+    /// Current dialog policy (`{accept, promptText}`).
+    pub async fn dialog_policy_get(&self) -> DialogPolicy {
+        let guard = self.state.lock().await;
+        match guard.as_ref() {
+            Some(inner) => inner.shared.dialog_policy.lock().await.clone(),
+            None => DialogPolicy::default(),
+        }
+    }
+
+    /// Set the dialog policy. Applies to the NEXT dialog the reader
+    /// auto-handles (an already-recorded dialog keeps the policy it ran
+    /// under); returns the applied policy.
+    pub async fn dialog_policy_set(&self, accept: bool, prompt_text: Option<String>) -> Result<DialogPolicy, String> {
+        let shared = self.shared().await?;
+        let mut p = shared.dialog_policy.lock().await;
+        p.accept = accept;
+        if let Some(t) = prompt_text {
+            p.prompt_text = t;
+        }
+        Ok(p.clone())
+    }
 }
 
 impl Drop for Browser {
@@ -920,6 +1415,88 @@ impl Drop for Browser {
             kill_tree(pid);
         }
     }
+}
+
+/// `Runtime.evaluate` on one named session, returning the value (or a JS
+/// error string). Shared by realm-scoped evaluation paths.
+async fn eval_on_session(
+    shared: &Arc<Shared>,
+    session: &str,
+    expression: &str,
+) -> Result<Value, String> {
+    let r = send_raw(
+        shared,
+        "Runtime.evaluate",
+        json!({"expression": expression, "returnByValue": true, "awaitPromise": true}),
+        Some(session.to_string()),
+    )
+    .await?;
+    if let Some(ex) = r.get("exceptionDetails") {
+        return Err(format!("js exception: {ex}"));
+    }
+    let robj = r
+        .get("result")
+        .ok_or("evaluate: no result in response".to_string())?;
+    match robj.get("value") {
+        Some(v) => Ok(v.clone()),
+        None => {
+            let t = robj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            Err(format!("evaluate: expression returned {t} (no value)"))
+        }
+    }
+}
+
+/// Flatten a `Page.getFrameTree` node (with `childFrames`) into document
+/// order: `{frameId, parentId, url, name}` per frame.
+fn flatten_frames(node: &Value, out: &mut Vec<Value>) {
+    if let Some(f) = node.get("frame") {
+        out.push(json!({
+            "frameId": f.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+            "parentId": f.get("parentId").and_then(|v| v.as_str()).unwrap_or(""),
+            "url": f.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+            "name": f.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+        }));
+    }
+    if let Some(kids) = node.get("childFrames").and_then(|v| v.as_array()) {
+        for k in kids {
+            flatten_frames(k, out);
+        }
+    }
+}
+
+/// Truthiness of an evaluated JS value, by the language's own rules: false,
+/// null, undefined-as-error (never reaches here), 0/NaN/""/0n are falsy;
+// empty containers are TRUTHY (JS semantics, not Python's).
+fn is_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0 && !f.is_nan()),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+/// Best-effort live `(url, title)` from the active page after a history step.
+/// Falls back to target-list info when the page will not answer (a committed
+/// history step always answers; the fallback is for a wedged peer).
+async fn live_url_title(browser: &Browser) -> Result<Value, String> {
+    let url = browser
+        .eval("window.location.href")
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    let title = browser
+        .eval("document.title")
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    Ok(json!({"ok": true, "url": url, "title": title}))
 }
 
 /// Owns one pending-map slot for the lifetime of the call that inserted it.
@@ -1065,6 +1642,19 @@ async fn attach_to(shared: &Arc<Shared>, target_id: &str) -> Result<String, Stri
     {
         shared.net_enabled.lock().await.insert(sid.clone());
     }
+    // Session-scoped auto-attach: child targets of this page (dedicated /
+    // shared workers) report their sessions via `Target.attachedToTarget`,
+    // which the reader records for realm-scoped `evaluate`. Best-effort like
+    // the enables above: without it worker realms are unreachable (a direct
+    // `Target.attachToTarget` to a worker returns a session whose commands
+    // hang). `waitForDebuggerOnStart: false` so nothing ever pauses.
+    let _ = send_raw(
+        shared,
+        "Target.setAutoAttach",
+        json!({"autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true}),
+        Some(sid.clone()),
+    )
+    .await;
     // Replay an active device-metrics override onto THIS session. The
     // override is session-scoped, so a new tab / re-attach would otherwise
     // observe (and report) the engine default while the caller still holds
@@ -1385,6 +1975,102 @@ fn log_message(entry: &Value) -> ConsoleMsg {
     }
 }
 
+/// `Network.requestWillBeSent` params -> upsert a `NetEntry` (request leg).
+/// Redirect chains reuse the requestId; the entry keeps the FIRST url/method
+/// and the latest redirect target is appended to the url when it changes.
+async fn record_request(shared: &Arc<Shared>, p: &Value) {
+    let rid = match p.get("requestId").and_then(|r| r.as_str()) {
+        Some(r) => r.to_string(),
+        None => return,
+    };
+    let req = p.get("request").cloned().unwrap_or(Value::Null);
+    let url = req.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
+    let rtype = p.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let ts = p.get("timestamp").and_then(|t| t.as_f64()).map(|t| (t * 1000.0) as u64).unwrap_or_else(now_ms);
+    let mut q = shared.net_log.lock().await;
+    if let Some(e) = q.iter_mut().rev().find(|e| e.request_id == rid) {
+        // Redirect leg: same id, new url - track the landing url.
+        if !url.is_empty() && e.url != url {
+            e.url = url;
+        }
+        return;
+    }
+    let entry = NetEntry {
+        request_id: rid,
+        method,
+        url,
+        rtype,
+        status: None,
+        mime: String::new(),
+        finished: false,
+        failed: false,
+        error_text: String::new(),
+        ts,
+    };
+    if q.len() >= NET_CAP {
+        q.pop_front();
+    }
+    q.push_back(entry);
+}
+
+/// `Network.responseReceived` params -> stamp status/mime on the entry.
+/// Responses without a prior request leg (cached/pushed) gain a minimal row.
+async fn record_response(shared: &Arc<Shared>, p: &Value) {
+    let rid = match p.get("requestId").and_then(|r| r.as_str()) {
+        Some(r) => r.to_string(),
+        None => return,
+    };
+    let resp = p.get("response").cloned().unwrap_or(Value::Null);
+    let status = resp.get("status").and_then(|s| s.as_i64());
+    let mime = resp.get("mimeType").and_then(|m| m.as_str()).unwrap_or("").to_string();
+    let url = resp.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
+    let rtype = p.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let mut q = shared.net_log.lock().await;
+    if let Some(e) = q.iter_mut().rev().find(|e| e.request_id == rid) {
+        if status.is_some() {
+            e.status = status;
+        }
+        if !mime.is_empty() {
+            e.mime = mime;
+        }
+        return;
+    }
+    let entry = NetEntry {
+        request_id: rid,
+        method: String::new(),
+        url,
+        rtype,
+        status,
+        mime,
+        finished: false,
+        failed: false,
+        error_text: String::new(),
+        ts: now_ms(),
+    };
+    if q.len() >= NET_CAP {
+        q.pop_front();
+    }
+    q.push_back(entry);
+}
+
+/// `Network.loadingFinished` / `loadingFailed` params -> close the entry.
+async fn record_finish(shared: &Arc<Shared>, p: &Value) {
+    let rid = match p.get("requestId").and_then(|r| r.as_str()) {
+        Some(r) => r,
+        None => return,
+    };
+    let failed = p.get("errorText").and_then(|e| e.as_str()).is_some_and(|s| !s.is_empty())
+        || p.get("canceled").and_then(|c| c.as_bool()).unwrap_or(false);
+    let error_text = p.get("errorText").and_then(|e| e.as_str()).unwrap_or("").to_string();
+    let mut q = shared.net_log.lock().await;
+    if let Some(e) = q.iter_mut().rev().find(|e| e.request_id == rid) {
+        e.finished = true;
+        e.failed = failed;
+        e.error_text = error_text;
+    }
+}
+
 async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
     while let Some(msg) = stream.next().await {
         let text = match msg {
@@ -1440,27 +2126,69 @@ async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
         // `networkIdle` wait. Finishes wake waiters; the 50 ms poll in
         // `wait_network_idle` is the fallback, so a missed event costs one
         // cadence, never a hang.
+        // Network capture: every request/response leg lands in the bounded
+        // `net_log` ring for the `network` tool, alongside the in-flight
+        // accounting the `networkIdle` wait already keeps. Events arriving
+        // before any `Network.enable` (the domain is lazy) simply never
+        // exist; once enabled, all legs are recorded session-wide.
         if v.get("method").and_then(|m| m.as_str()) == Some("Network.requestWillBeSent") {
-            if let Some(rid) = v
-                .get("params")
-                .and_then(|p| p.get("requestId"))
-                .and_then(|r| r.as_str())
-            {
-                shared.net_inflight.lock().await.insert(rid.to_string());
+            if let Some(p) = v.get("params") {
+                if let Some(rid) = p.get("requestId").and_then(|r| r.as_str()) {
+                    shared.net_inflight.lock().await.insert(rid.to_string());
+                }
+                record_request(&shared, p).await;
+            }
+            continue;
+        }
+        if v.get("method").and_then(|m| m.as_str()) == Some("Network.responseReceived") {
+            if let Some(p) = v.get("params") {
+                record_response(&shared, p).await;
             }
             continue;
         }
         if v.get("method").and_then(|m| m.as_str()) == Some("Network.loadingFinished")
             || v.get("method").and_then(|m| m.as_str()) == Some("Network.loadingFailed")
         {
-            if let Some(rid) = v
-                .get("params")
-                .and_then(|p| p.get("requestId"))
-                .and_then(|r| r.as_str())
-            {
-                shared.net_inflight.lock().await.remove(rid);
+            if let Some(p) = v.get("params") {
+                if let Some(rid) = p.get("requestId").and_then(|r| r.as_str()) {
+                    shared.net_inflight.lock().await.remove(rid);
+                    record_finish(&shared, p).await;
+                }
             }
             shared.net_notify.notify_waiters();
+            continue;
+        }
+        if v.get("method").and_then(|m| m.as_str()) == Some("Target.attachedToTarget") {
+            // Auto-attach (enabled on every page session in `attach_to`)
+            // reports child sessions here - notably dedicated/shared worker
+            // realms, which answer ONLY on their event-provided session: a
+            // direct `Target.attachToTarget` to a worker returns a session id
+            // whose commands hang forever (measured on chrome-headless-shell).
+            // Record targetId -> sessionId so realm-scoped `evaluate` can
+            // route to the live session instead of the dead direct one.
+            if let Some(p) = v.get("params") {
+                let tid = p
+                    .get("targetInfo")
+                    .and_then(|t| t.get("targetId"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                let sid = p.get("sessionId").and_then(|s| s.as_str()).unwrap_or("");
+                if !tid.is_empty() && !sid.is_empty() {
+                    shared.extra_sessions.lock().await.insert(tid.to_string(), sid.to_string());
+                }
+            }
+            continue;
+        }
+        if v.get("method").and_then(|m| m.as_str()) == Some("Target.detachedFromTarget") {
+            // Hygiene: a detached session must never be reused by realm eval.
+            if let Some(p) = v.get("params") {
+                if let Some(tid) = p.get("targetId").and_then(|t| t.as_str()) {
+                    shared.extra_sessions.lock().await.remove(tid);
+                } else if let Some(sid) = p.get("sessionId").and_then(|s| s.as_str()) {
+                    let sid = sid.to_string();
+                    shared.extra_sessions.lock().await.retain(|_, s| *s != sid);
+                }
+            }
             continue;
         }
         // A JS dialog (`alert`/`confirm`/`prompt`/`beforeunload`) blocks the
@@ -1489,13 +2217,24 @@ async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
                 .to_string();
             *shared.dialog.lock().await = Some(DialogRecord {
                 dtype: dtype.clone(),
-                message,
-                url,
+                message: message.clone(),
+                url: url.clone(),
             });
+            // Policy-driven handling: the recorded default accepts
+            // (pre-policy behavior, page unblocked); a dismiss policy
+            // answers `false`/`null` so confirm/prompt/beforeunload observe
+            // the refusal. Prompt text rides along when accepting.
+            let pol = shared.dialog_policy.lock().await.clone();
             let dialog_params = if dtype == "prompt" {
-                json!({"accept": true, "promptText": ""})
-            } else {
+                if pol.accept {
+                    json!({"accept": true, "promptText": pol.prompt_text})
+                } else {
+                    json!({"accept": false})
+                }
+            } else if pol.accept {
                 json!({"accept": true})
+            } else {
+                json!({"accept": false})
             };
             let hid = shared.next_id.fetch_add(1, Ordering::SeqCst);
             let mut envelope = serde_json::Map::new();
