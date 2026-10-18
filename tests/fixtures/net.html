@@ -1,0 +1,11 @@
+<!doctype html>
+<html>
+<head><title>Net fixture</title></head>
+<body>
+<h1>NET_MARKER_66666</h1>
+<button id="fire" onclick="fetch('/api/data?x=1').then(r=>r.json()).then(j=>{document.getElementById('r').textContent='FETCH_GOT:'+j.hello;});var x=new XMLHttpRequest();x.open('GET','/api/xhr?y=2');x.onload=function(){document.getElementById('x').textContent='XHR_GOT:'+x.responseText;};x.send();">FIRE_NET</button>
+<div id="r">R:none</div>
+<div id="x">X:none</div>
+<img id="sub" src="/pixel.png" alt="px">
+</body>
+</html>

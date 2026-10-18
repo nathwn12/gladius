@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head><title>Gladius Realms Fixture</title></head>
+<body>
+<h1 id="marker">REALMS_MARKER_top-67890</h1>
+<script>window.__realmTop = 'top-ready';</script>
+<iframe id="same-frame" src="/child_same.html" name="sameframe"></iframe>
+<!-- cross-origin frame src is injected by the test (second port) -->
+<div id="xframe-holder"></div>
+<div id="worker-status">WORKER:none</div>
+<div id="sw-status">SW:none</div>
+<script>
+try {
+  const w = new Worker('/worker.js');
+  w.onmessage = (e) => { document.getElementById('worker-status').textContent = 'WORKER:' + e.data; };
+  w.postMessage('ping');
+} catch (e) {
+  document.getElementById('worker-status').textContent = 'WORKER:spawn-failed';
+}
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').then((r) => {
+    document.getElementById('sw-status').textContent = 'SW:registered';
+  }).catch((e) => {
+    document.getElementById('sw-status').textContent = 'SW:register-failed';
+  });
+}
+</script>
+</body>
+</html>

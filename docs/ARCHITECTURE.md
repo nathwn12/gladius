@@ -5,7 +5,7 @@
 > Node.js, no Playwright in the runtime path. One static binary, MCP over stdio,
 > lazy browser lifecycle. Research grounding: `docs/RESEARCH.md`.
 
-## 1. Frozen tool contract (v1 - the surface never moves for backend swaps)
+## 1. Frozen tool contract (v2 - additive only; every v1 call is unchanged)
 
 | name | args | returns |
 |---|---|---|
@@ -14,8 +14,8 @@
 | `screenshot` | `fullPage?: bool` (default false) | PNG bytes (base64 `image` part) of viewport / full page; refuses under `dom-only` |
 | `click` | `element: string` (CSS, or AX ref `@eN`) | `{ ok: true }` after click dispatches |
 | `type` | `element: string, text: string, submit?: bool` | `{ ok: true }` after keystrokes (+Enter if submit) |
-| `evaluate` | `expression: string` | JSON-serialised JS result (`undefined` -> tool error, distinct from explicit `null`) |
-| `wait_for` | `selector?, text?, ms?, networkIdle?: bool, idleMs?: number` | `{ ok: true }` when the condition holds or timeout elapses (max 15s) |
+| `evaluate` | `expression: string, target?: string, frame?: string` | JSON-serialised JS result (`undefined` -> tool error, distinct from explicit `null`); `target` (CDP targetId) evaluates in that realm, `frame` (CDP frameId) in that iframe's isolated world |
+| `wait_for` | `selector?, text?, ms?, networkIdle?: bool, idleMs?: number, expression?: string` | `{ ok: true }` when the condition holds or timeout elapses (max 15s); `expression` polls a JS predicate with backoff |
 | `console` | `action?: get\|drain\|clear, limit?: number` | buffered console messages + uncaught exceptions (ring buffer, cap 200) |
 | `upload` | `element: string, paths: string[]` | `{ ok: true }` after setting files on an `<input type=file>` |
 | `fetch_text` | `url: string` | fast path: plain HTTP GET with NO browser; HTML stripped to text (readability-style, no tags) |
@@ -25,6 +25,11 @@
 | `viewport` | `width?: number, height?: number, deviceScaleFactor?: number, mobile?: bool, reset?: bool` | applied metrics + live read-back of `window.innerWidth`/`innerHeight`/`devicePixelRatio` (`matched` false when the engine ignored the override); `reset:true` clears the override |
 | `tabs` | `action: string, url?: string, index?: number` | tab list / mutation result (list, new, close, select) |
 | `close` | - | `{ ok: true }`; reaps the owned browser process tree (or detaches from an attached external engine, leaving it running) |
+| `targets` | `action?: list\|select, target?: string` | every CDP target with its stable id + the active page's frame tree; `select` makes a page target current |
+| `dialog` | `action?: get\|policy, accept?: bool, promptText?: string` | last auto-handled dialog + live policy; `policy` sets the default handling |
+| `history` | `action: back\|forward\|reload` | live url+title after the load settle; boundary steps are typed errors |
+| `network` | `action?: get\|drain\|clear, filter?: string, limit?: number` | captured requests/responses (method/url/status/type/timing, cap 500) |
+| `cdp` | `method: string, params?: object, session?: string` | raw CDP `result`; CDP errors are tool errors |
 
 
 Rules: tools are **dumb primitives** - no planner, no LLM, no judgement-retries in the server
@@ -66,7 +71,7 @@ gladius opened and never kills, never sweeps. `GLADIUS_BACKEND_CAPS` declares `r
 - Transport: **JSON-RPC 2.0 over stdio, newline-delimited** (one message per line) -
   **hand-rolled** in `src/mcp.rs` over `tokio` stdio and `serde_json`: no `rmcp` SDK, no
   external framing crate. STDOUT carries only protocol frames; all logs go to STDERR.
-- Lifecycle: `initialize` -> `tools/list` (exactly the 16 tools above) -> `tools/call` ->
+- Lifecycle: `initialize` -> `tools/list` (exactly the 21 tools above) -> `tools/call` ->
   stdio EOF / `close` -> shutdown.
 - Each `tools/call` response is `{ content: [{ type: "text"|"image", ... }] }` per MCP content
   convention; `screenshot` returns an `image` part (base64 PNG), everything else `text`.

@@ -582,7 +582,7 @@ fn snapshot_structured_blocks() {
 
 #[test]
 fn capabilities_manifest() {
-    // Default backend: count 16, nothing gated, serverInfo untouched.
+    // Default backend: count 21, nothing gated, serverInfo untouched.
     let mut c = Client::spawn();
     let init = c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     assert_eq!(
@@ -594,7 +594,7 @@ fn capabilities_manifest() {
         .get("capabilities")
         .and_then(|cc| cc.get("tools"))
         .expect("capabilities.tools");
-    assert_eq!(caps.get("count"), Some(&json!(16)), "tool count: {init}");
+    assert_eq!(caps.get("count"), Some(&json!(21)), "tool count: {init}");
     assert_eq!(caps.get("gated"), Some(&json!({})), "nothing gated: {init}");
     let listed = c.result("tools/list", json!({}));
     let n = listed
@@ -602,7 +602,7 @@ fn capabilities_manifest() {
         .and_then(|t| t.as_array())
         .expect("tools array")
         .len();
-    assert_eq!(n, 16, "listed tools match the manifest count");
+    assert_eq!(n, 21, "listed tools match the manifest count");
     assert_eq!(
         caps.get("count"),
         Some(&json!(n)),
@@ -624,7 +624,7 @@ fn capabilities_manifest() {
         .expect("capabilities.tools");
     assert_eq!(
         caps2.get("count"),
-        Some(&json!(16)),
+        Some(&json!(21)),
         "dom-only count: {init2}"
     );
     assert_eq!(

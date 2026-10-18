@@ -79,7 +79,7 @@ You get back the page text with tags stripped and scripts dropped.
 
 ## What you get
 
-- An agent that works the page for you: 16 tools to open pages, snapshot structure, click, type, screenshot, and read the console (docs/ARCHITECTURE.md).
+- An agent that works the page for you: 21 tools to open pages, snapshot structure, click, type, screenshot, read the console, target frames and workers, wait on JS predicates, handle dialogs, walk history, read the network, and drive raw CDP (docs/ARCHITECTURE.md).
 - The same browser every run: pinned chrome-headless-shell, hash-verified and provisioned on first run, shown by --doctor (docs/CHROMIUM.md).
 - A small local footprint: one native binary over stdio that starts the browser only when the first tool call needs it (docs/ARCHITECTURE.md).
 - Errors you can act on: typed tool errors, buffered console messages plus uncaught exceptions, and a headless-only engine with no silent fallback (docs/ENGINE.md).

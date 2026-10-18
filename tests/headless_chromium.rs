@@ -3,7 +3,7 @@
 //! from the versioned cache with no env override) and proves one property of
 //! the launch contract. Each test owns its server process(es) and reaps them.
 //!
-//! - `headless_owned_e2e_navigate_snapshot_screenshot`: initialize lists 16
+//! - `headless_owned_e2e_navigate_snapshot_screenshot`: initialize lists 21
 //!   tools; navigate a local file; snapshot returns a non-empty tree with the
 //!   marker; screenshot returns PNG bytes (base64 PNG signature,
 //!   non-trivial size); the UA reads `HeadlessChrome/` (the shell artifact).
@@ -343,7 +343,7 @@ fn headless_owned_e2e_navigate_snapshot_screenshot() {
         .iter()
         .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
         .collect();
-    assert_eq!(names.len(), 16, "exactly the 16 tools: {names:?}");
+    assert_eq!(names.len(), 21, "exactly the 21 tools: {names:?}");
 
     let nav = c.call(
         "navigate",

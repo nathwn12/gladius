@@ -4,6 +4,50 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.3.0] - 2026-10-18
+
+- Full-fledged browser tooling: 16 tools -> 21, schemas backward-compatible
+  (every addition is optional; existing callers are unaffected).
+- New `targets` tool: every CDP target with its stable id (pages, workers of
+  all kinds) plus the active page's frame tree (main + nested iframes, each
+  with its frameId), and `select` to make a page target current by id.
+- Target-scoped `evaluate`: optional `target` (CDP targetId: page,
+  dedicated/shared worker, service worker) and `frame` (CDP frameId:
+  isolated-world eval, works cross-origin) route `Runtime.evaluate` to that
+  realm; the tracked active page is untouched. Worker realms answer ONLY on
+  their auto-attach event session (a direct attach returns a session whose
+  commands hang on this engine, measured): page sessions auto-attach
+  (session-scoped `Target.setAutoAttach`, no pausing) and the reader records
+  `Target.attachedToTarget` targetId -> sessionId for the route.
+- Fail loud: unknown arguments are rejected with typed
+  `invalid_args`/`unknown_arg` on every tool (new reason in the closed code
+  set), never silently ignored - the shape that once routed evaluations to
+  the wrong realm with no error.
+- `wait_for` gains an `expression` predicate form: polls a computed JS
+  condition on the active page with backoff inside the shared hard deadline;
+  expiry is the typed timeout, a throwing condition is a real error.
+- New `dialog` tool: policy (`accept` + optional `promptText`, default
+  accept) applied by the reader's auto-handler plus the last recorded dialog
+  (`type`/`message`/`url`). Covers alert/confirm/prompt/beforeunload; a
+  session can never deadlock on a dialog. beforeunload needs sticky
+  activation to fire on this engine (trusted input first).
+- New `history` tool: back/forward/reload on the active page, returning the
+  live url+title after the load settle; a step past the boundary is a typed
+  error, never a silent no-op.
+- New `network` tool: observable capture (method/url/status/resource type/
+  timing, cap 500) with get/drain/clear and a url-substring filter. The
+  Network domain arms lazily on first `network` use (any action, including
+  `clear`); drain removes only the returned entries.
+- New `cdp` tool: raw `{method, params, session?}` escape hatch returning the
+  raw CDP result; a CDP error reply is a tool error, never a protocol error.
+- Main-thread stack: `mcp`/`selftest` now run on a runtime worker instead of
+  the 1 MB PE main-thread stack the block_on polled them on (a cold launch
+  overflowed main deterministically on one build and ran clean on the next;
+  the depth, not the code, was at the edge).
+- Version bump 0.2.1 -> 0.3.0 (`Cargo.toml` + `npm/package.json` in step).
+  NOT published: the harness keeps consuming `gladius-mcp@latest` until an
+  owner-named publish happens.
+
 ## [0.2.1] - 2026-10-17
 
 - Engine swap: Obscura is gone. Gladius drives the owned pinned Chromium
