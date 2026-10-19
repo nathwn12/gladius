@@ -1,6 +1,8 @@
-# gladius
-
-**Stop walking pages by hand. Give your agent a browser it can drive.**
+<p align="center">
+  <img src="assets/icon.svg" width="120" height="120" alt="gladius icon" />
+</p>
+<h1 align="center">gladius</h1>
+<p align="center"><strong>Stop walking pages by hand. Give your agent a browser it can drive.</strong></p>
 
 ## Install
 
@@ -98,3 +100,11 @@ You get back the page text with tags stripped and scripts dropped.
 - Issues: https://github.com/nathwn12/gladius/issues
 - License: MIT, see [LICENSE](LICENSE)
 - Docs: [browser pin](docs/CHROMIUM.md), [engine notes](docs/ENGINE.md), [changelog](CHANGELOG.md)
+
+<!-- nathwn12 house footer: identical in every repo. Do not edit. -->
+<p align="center">
+  <a href="https://github.com/nathwn12"><img src="assets/signature.svg" width="96" alt="nathwn12" /></a>
+</p>
+<p align="center">
+  <sub>Built by <a href="https://github.com/nathwn12">nathwn12</a> · <a href="https://github.com/nathwn12?tab=repositories">All projects</a></sub>
+</p>
