@@ -9,7 +9,7 @@
 ```powershell
 npx -y gladius-mcp@latest --doctor
 ```
-You need Node 22.14 or newer on Windows x64 first. The first run provisions the pinned server runtime (0.2.1) plus the pinned chrome-headless-shell browser (155.0.8059.84), both hash-verified, then `--doctor` prints the manifest with the resolved cache paths and exits 0.
+You need Node 22.14 or newer on Windows x64 first. Your first real serve run provisions the pinned server runtime (0.3.0) plus the pinned chrome-headless-shell browser (155.0.8059.84), both hash-verified, while `--doctor` only prints the manifest with the resolved cache paths and exits 0 without downloading anything.
 
 ### Or let your AI install it
 
@@ -39,7 +39,7 @@ Wire the server into your MCP client config:
 
 Pin an exact version instead of `@latest`:
 ```powershell
-npx gladius-mcp@latest --doctor
+npx gladius-mcp@0.3.0 --doctor
 ```
 Point the launcher at a browser you already hold to skip the browser download. Set `GLADIUS_CHROMIUM` to your chrome-headless-shell binary before you start the server:
 ```powershell
@@ -86,6 +86,26 @@ You get back the page text with tags stripped and scripts dropped.
 - A small local footprint: one native binary over stdio that starts the browser only when the first tool call needs it (docs/ARCHITECTURE.md).
 - Errors you can act on: typed tool errors, buffered console messages plus uncaught exceptions, and a headless-only engine with no silent fallback (docs/ENGINE.md).
 
+## Configure it
+
+Run with no flags to provision the pinned runtime plus browser on first run, then serve MCP over stdio. The flags, from `gladius-mcp --help`, are:
+
+- `--doctor`, `--print-manifest`: print the pinned manifest with the resolved cache paths and exit 0. Default: neither set. Both perform no network access.
+- `--help`, `-h`: print usage. Any other flag prints usage and exits 2.
+
+You override paths and platform handling with four env vars:
+
+- `GLADIUS_CHROMIUM`: your explicit chrome-headless-shell binary. Default unset, so the launcher provisions the pinned browser. When you set it to a non-empty path, browser provisioning is skipped.
+- `GLADIUS_ENGINE_CACHE`: runtime cache root. Default the OS local-app-data directory, giving a `gladius\engine\<serverVersion>-<bundleSha8>` folder under it.
+- `GLADIUS_CHROMIUM_CACHE`: browser cache root. Default the OS local-app-data directory, giving a `gladius\chromium\<version>-<zipSha8>` folder under it.
+- `GLADIUS_MCP_ALLOW_NON_WINDOWS`: set it to `1` to bypass the Windows-only gate for diagnostics. Default unset, so other platforms are refused. The server runtime still runs on Windows x64 only.
+
+Pin an exact version instead of `@latest`:
+
+```powershell
+npx gladius-mcp@0.3.0 --doctor
+```
+
 ## Requirements
 
 - Node 22.14 or newer (package engines, checked with `node --version`).
@@ -98,8 +118,8 @@ You get back the page text with tags stripped and scripts dropped.
 - Package: https://www.npmjs.com/package/gladius-mcp
 - Releases: https://github.com/nathwn12/gladius/releases
 - Issues: https://github.com/nathwn12/gladius/issues
-- License: MIT, see [LICENSE](LICENSE)
 - Docs: [browser pin](docs/CHROMIUM.md), [engine notes](docs/ENGINE.md), [changelog](CHANGELOG.md)
+- License: MIT, see [LICENSE](LICENSE)
 
 <!-- nathwn12 house footer: identical in every repo. Do not edit. -->
 <p align="center">
