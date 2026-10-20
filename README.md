@@ -35,12 +35,9 @@ Wire the server into your MCP client config:
 }
 ```
 
-### Offline or pinned
+### Overrides
 
-Pin an exact version instead of `@latest`:
-```powershell
-npx gladius-mcp@0.4.0 --doctor
-```
+Use `npx gladius-mcp@latest` for installs. A pinned version is only installable while its GitHub release still exists; the one-release policy deletes older releases, so pinned versions are not a supported long-term install.
 Point the launcher at a browser you already hold to skip the browser download. Set `GLADIUS_CHROMIUM` to your chrome-headless-shell binary before you start the server:
 ```powershell
 $env:GLADIUS_CHROMIUM = "<path-to-your-chrome-headless-shell-binary>"
@@ -103,11 +100,7 @@ You override paths and platform handling with four env vars:
 - `GLADIUS_CHROMIUM_CACHE`: browser cache root. Default the OS local-app-data directory, giving a `gladius\chromium\<version>-<zipSha8>` folder under it.
 - `GLADIUS_MCP_ALLOW_NON_WINDOWS`: set it to `1` to bypass the Windows-only gate for diagnostics. Default unset, so other platforms are refused. The server runtime still runs on Windows x64 only.
 
-Pin an exact version instead of `@latest`:
-
-```powershell
-npx gladius-mcp@0.4.0 --doctor
-```
+Use `npx gladius-mcp@latest` for installs. A pinned version is only installable while its GitHub release still exists; the one-release policy deletes older releases, so pinned versions are not a supported long-term install.
 
 ## Requirements
 
