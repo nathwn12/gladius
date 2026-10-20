@@ -193,12 +193,18 @@ fn guard_bites_known_ambient_resolutions() {
     // that cannot fail proves nothing - if any sample below ever scans
     // clean, the guard is vacuous and this test fails.
     let bad_samples = [
-        ("playwright cache", "resolve the newest ms-playwright chromium revision"),
+        (
+            "playwright cache",
+            "resolve the newest ms-playwright chromium revision",
+        ),
         ("playwright", "find the newest playwright chromium revision"),
         ("puppeteer cache", "resolve from .cache/puppeteer/chrome"),
         ("system edge", "launch msedge headless from its install dir"),
         ("system brave", "launch brave.exe from Program Files"),
-        ("full chrome zip", "download chrome-win64.zip for headed use"),
+        (
+            "full chrome zip",
+            "download chrome-win64.zip for headed use",
+        ),
         ("bare chrome exe", "launch chrome.exe from PATH"),
         (
             "per-user chrome path",

@@ -1,23 +1,22 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Stdio;
 use std::sync::{
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio::process::Command;
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    connect_async,
     tungstenite::{
-        Message,
-        client::IntoClientRequest,
-        handshake::client::Request as WsRequest,
-        http::Uri as TungsteniteHttpUri,
+        client::IntoClientRequest, handshake::client::Request as WsRequest,
+        http::Uri as TungsteniteHttpUri, Message,
     },
+    MaybeTlsStream, WebSocketStream,
 };
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -31,6 +30,10 @@ pub struct DialogRecord {
     pub dtype: String,
     pub message: String,
     pub url: String,
+    /// Policy the record ran under: true when the reader accepted the
+    /// dialog, false when it dismissed it. The tool notes report this
+    /// verbatim (accepted only when accepted, dismissed when dismissed).
+    pub accepted: bool,
 }
 
 /// A buffered console message (`console.*` call or uncaught exception),
@@ -120,6 +123,11 @@ struct Shared {
     next_id: AtomicU64,
     session: AsyncMutex<Option<String>>,
     target: AsyncMutex<Option<String>>,
+    /// Reader-liveness flag: set when the WS reader loop exits (the engine
+    /// connection is gone). `ensure_session` fails fast on it instead of
+    /// sending into a dead socket; the cached session/target are cleared at
+    /// the same time so nothing reuses them.
+    dead: AtomicBool,
     /// Latest auto-handled dialog (drained by each acting tool before it
     /// runs, so a record found afterwards belongs to that action).
     dialog: AsyncMutex<Option<DialogRecord>>,
@@ -290,6 +298,7 @@ fn new_shared(sink: WsSink) -> Arc<Shared> {
         next_id: AtomicU64::new(1),
         session: AsyncMutex::new(None),
         target: AsyncMutex::new(None),
+        dead: AtomicBool::new(false),
         dialog: AsyncMutex::new(None),
         load_notify: tokio::sync::Notify::new(),
         tab_order: AsyncMutex::new(Vec::new()),
@@ -346,7 +355,9 @@ async fn resolve_ws_url(raw: &str) -> Result<String, String> {
             .unwrap_or("")
             .to_string();
         if ws.is_empty() {
-            return Err(format!("cdp {ver_url}: no webSocketDebuggerUrl in response"));
+            return Err(format!(
+                "cdp {ver_url}: no webSocketDebuggerUrl in response"
+            ));
         }
         return Ok(ws);
     }
@@ -473,7 +484,10 @@ impl Browser {
     }
 
     /// Send a raw CDP command. If `attach` is true, ensure a page session exists
-    /// and send with the `sessionId` field.
+    /// and send with the `sessionId` field. Session-scoped sends are
+    /// single-shot: a session-death error invalidates the cached
+    /// session/target and surfaces a typed stale_session; the next call
+    /// re-attaches and recovers. No automatic resend.
     pub async fn command(
         &self,
         method: &str,
@@ -481,12 +495,10 @@ impl Browser {
         attach: bool,
     ) -> Result<Value, String> {
         let shared = self.shared().await?;
-        let session = if attach {
-            Some(ensure_session(&shared).await?)
-        } else {
-            None
-        };
-        send_raw(&shared, method, params, session).await
+        if attach {
+            return send_session(&shared, method, params).await.map(|(_, v)| v);
+        }
+        send_raw(&shared, method, params, None).await
     }
 
     /// Runtime.evaluate helper returning the value (or a JS error string).
@@ -531,12 +543,10 @@ impl Browser {
     /// acknowledged, though the tool reports the live read-back instead).
     pub async fn viewport_set(&self, params: Value) -> Result<Value, String> {
         let shared = self.shared().await?;
-        let session = ensure_session(&shared).await?;
-        let r = send_raw(
+        let (_, r) = send_session(
             &shared,
             "Emulation.setDeviceMetricsOverride",
             params.clone(),
-            Some(session),
         )
         .await?;
         *shared.viewport.lock().await = Some(params);
@@ -548,17 +558,12 @@ impl Browser {
     /// new tab also gets the engine default.
     pub async fn viewport_reset(&self) -> Result<Value, String> {
         let shared = self.shared().await?;
-        let session = ensure_session(&shared).await?;
         // Pre-clear size: the settle target below.
         let before = self.viewport_readback().await.ok();
         *shared.viewport.lock().await = None;
-        let r = send_raw(
-            &shared,
-            "Emulation.clearDeviceMetricsOverride",
-            json!({}),
-            Some(session),
-        )
-        .await;
+        let r = send_session(&shared, "Emulation.clearDeviceMetricsOverride", json!({}))
+            .await
+            .map(|(_, v)| v);
         // Settle: on later-created targets the size update can lag the
         // acknowledgement (measured on Chromium: stale size but fresh DPR
         // immediately after clear, correct size within 1s). Poll briefly
@@ -604,9 +609,494 @@ impl Browser {
         Ok((w as i64, h as i64, dpr))
     }
 
+    /// Trusted main-frame pointer move: `Input.dispatchMouseEvent mouseMoved`
+    /// at main-frame viewport CSS px (`x`, `y`). Main frame only (G4a); frame
+    /// routing is G4b follow-up work.
+    pub async fn mouse_move(&self, x: f64, y: f64) -> Result<(), String> {
+        self.command(
+            "Input.dispatchMouseEvent",
+            json!({"type": "mouseMoved", "x": x, "y": y}),
+            true,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Trusted main-frame left click at main-frame viewport CSS px: `mouseMoved`
+    /// then `mousePressed` (left, buttons:1, clickCount:1) then `mouseReleased`
+    /// (left, buttons:0, clickCount:1). Coordinates are main-frame viewport CSS
+    /// px (CDP `Input.dispatchMouseEvent` convention); modifiers default to 0
+    /// (no Alt/Ctrl/Meta/Shift - key combos are G4b, never smuggled here).
+    pub async fn mouse_click(&self, x: f64, y: f64) -> Result<(), String> {
+        self.command(
+            "Input.dispatchMouseEvent",
+            json!({"type": "mouseMoved", "x": x, "y": y}),
+            true,
+        )
+        .await?;
+        self.command(
+            "Input.dispatchMouseEvent",
+            json!({"type": "mousePressed", "x": x, "y": y,
+                   "button": "left", "buttons": 1, "clickCount": 1}),
+            true,
+        )
+        .await?;
+        self.command(
+            "Input.dispatchMouseEvent",
+            json!({"type": "mouseReleased", "x": x, "y": y,
+                   "button": "left", "buttons": 0, "clickCount": 1}),
+            true,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Trusted text insertion into the focused editable: `Input.insertText`.
+    /// Dispatches to the main-frame focused node (input/textarea/contenteditable
+    /// focused by the `type` preflight). Generates real trusted `input` events
+    /// (`isTrusted:true`); never touches `.value`/synthetic events itself.
+    /// Main frame only (G4a); IME composition edge cases are residual (see
+    /// `tool_type`).
+    pub async fn insert_text(&self, text: &str) -> Result<(), String> {
+        self.command("Input.insertText", json!({"text": text}), true)
+            .await
+            .map(|_| ())
+    }
+
+    /// G4b verifier: OOPIF session mapping - the `(targetId, sessionId)`
+    /// pair whose `DOM.getDocument` root `frameId` matches `frame_id`
+    /// (probed across cached extra sessions), or None when no session owns
+    /// the frame's document (same-process frames live in the page session;
+    /// unmapped/unknown frames never silently fall back to the main frame).
+    /// On the pinned chrome-headless-shell no tested origin (127.0.0.1 vs
+    /// localhost) produces a separate iframe target at all (verified live:
+    /// `Target.getTargets` lists only the page), so this returns None there
+    /// and every frame action takes the page-session path; where an engine
+    /// DOES map an OOPIF, callers route the leaf realm work into it.
+    pub async fn oop_session_for_frame(&self, frame_id: &str) -> Option<(String, String)> {
+        for (tid, sid) in self.extra_pairs().await {
+            if let Ok(doc) = self
+                .cdp_raw("DOM.getDocument", json!({"depth": 0}), Some(sid.clone()))
+                .await
+            {
+                if doc
+                    .get("root")
+                    .and_then(|r| r.get("frameId"))
+                    .and_then(|v| v.as_str())
+                    == Some(frame_id)
+                {
+                    return Some((tid, sid));
+                }
+            }
+        }
+        None
+    }
+
+    /// G4b: cached non-active target sessions (`targetId -> sessionId`) for the
+    /// OOPIF probe (frame actions never silently fall back to the main frame:
+    /// when the owner/document chain is unreachable on the page session, the
+    /// caller probes these sessions for the frame's document instead).
+    async fn extra_pairs(&self) -> Vec<(String, String)> {
+        let guard = self.state.lock().await;
+        match guard.as_ref() {
+            Some(inner) => inner
+                .shared
+                .extra_sessions
+                .lock()
+                .await
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// G4b verifier: OOPIF target mapping kept for error prose (the target
+    /// whose session owns the frame's document). See `oop_session_for_frame`
+    /// for the probe and the pinned-engine result.
+    pub async fn oop_target_for_frame(&self, frame_id: &str) -> Option<String> {
+        self.oop_session_for_frame(frame_id).await.map(|(t, _)| t)
+    }
+
+    /// G4b verifier: evaluate `expression` on one NAMED session (a mapped
+    /// OOPIF target session), returning the value (or a JS error string).
+    /// The tracked active page is untouched. Used for leaf-realm work
+    /// (preflight, focus, selection, rect reads) when the frame is an OOPIF
+    /// with a mapped session; the owner chain, hit-test and dispatch stay on
+    /// the page session, whose visual surface owns the coordinates.
+    pub async fn eval_in_session(&self, session: &str, expression: &str) -> Result<Value, String> {
+        let r = self
+            .cdp_raw(
+                "Runtime.evaluate",
+                json!({"expression": expression, "returnByValue": true, "awaitPromise": true}),
+                Some(session.to_string()),
+            )
+            .await?;
+        if let Some(ex) = r.get("exceptionDetails") {
+            return Err(format!("js exception: {ex}"));
+        }
+        let robj = r
+            .get("result")
+            .ok_or("evaluate: no result in response".to_string())?;
+        match robj.get("value") {
+            Some(v) => Ok(v.clone()),
+            None => {
+                let t = robj
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                Err(format!("evaluate: expression returned {t} (no value)"))
+            }
+        }
+    }
+
+    /// G4b verifier: `upload` through a mapped OOPIF session's own DOM
+    /// document (`DOM.enable` -> `getDocument` -> `querySelector` ->
+    /// `setFileInputFiles`, all on `session`). Same-process frames never
+    /// reach here (their nodes resolve on the page session); an unmapped
+    /// frame is the caller's typed error, never a main-frame upload.
+    pub async fn upload_in_session(
+        &self,
+        session: &str,
+        selector: &str,
+        paths: &[String],
+    ) -> Result<usize, String> {
+        let sid = session.to_string();
+        self.cdp_raw("DOM.enable", json!({}), Some(sid.clone()))
+            .await?;
+        let doc = self
+            .cdp_raw("DOM.getDocument", json!({"depth": 0}), Some(sid.clone()))
+            .await?;
+        let root = doc
+            .get("root")
+            .and_then(|r| r.get("nodeId"))
+            .and_then(|n| n.as_i64())
+            .ok_or("upload: no document node in frame session".to_string())?;
+        let found = self
+            .cdp_raw(
+                "DOM.querySelector",
+                json!({"nodeId": root, "selector": selector}),
+                Some(sid.clone()),
+            )
+            .await?;
+        let node = found.get("nodeId").and_then(|n| n.as_i64()).unwrap_or(0);
+        if node == 0 {
+            return Err(format!("upload: element not found: {selector}"));
+        }
+        self.cdp_raw(
+            "DOM.setFileInputFiles",
+            json!({"nodeId": node, "files": paths}),
+            Some(sid),
+        )
+        .await?;
+        Ok(paths.len())
+    }
+
+    /// G4b verifier: frontend `nodeId`s of every iframe owner in the chain
+    /// from `frame_id` up to (not including) the main frame, on the page
+    /// session (`DOM.getFrameOwner` -> `pushNodesByBackendIdsToFrontend`
+    /// after a pierced `getDocument`, the snapshot path's own bridge: this
+    /// engine's `getFrameOwner` yields only a `backendNodeId`). Used to stamp
+    /// the true owners for the parent-side hit-test, so a covering overlay or
+    /// a DIFFERENT iframe can never pass as the requested frame.
+    pub async fn frame_owner_nodes(&self, frame_id: &str) -> Result<Vec<i64>, String> {
+        let parents = self
+            .frame_parents()
+            .await
+            .map_err(|e| format!("targets: no frame with id {frame_id}: {e}"))?;
+        if !parents.contains_key(frame_id) {
+            return Err(format!("targets: no frame with id {frame_id}"));
+        }
+        self.command("DOM.enable", json!({}), true).await?;
+        let _ = self
+            .command("DOM.getDocument", json!({"depth": 0, "pierce": true}), true)
+            .await?;
+        let mut out = Vec::new();
+        let mut cur = frame_id.to_string();
+        loop {
+            let parent = parents.get(&cur).cloned().unwrap_or_default();
+            if parent.is_empty() {
+                break;
+            }
+            let owner = self
+                .command("DOM.getFrameOwner", json!({"frameId": cur}), true)
+                .await
+                .map_err(|e| format!("targets: no frame with id {cur}: {e}"))?;
+            let backend = owner
+                .get("backendNodeId")
+                .and_then(|v| v.as_i64())
+                .ok_or(format!(
+                    "targets: no frame with id {cur}: getFrameOwner returned no node"
+                ))?;
+            // The owner may also surface a direct nodeId on other engines.
+            if let Some(nid) = owner
+                .get("nodeId")
+                .and_then(|v| v.as_i64())
+                .filter(|n| *n != 0)
+            {
+                out.push(nid);
+            } else {
+                let pushed = self
+                    .command(
+                        "DOM.pushNodesByBackendIdsToFrontend",
+                        json!({"backendNodeIds": [backend]}),
+                        true,
+                    )
+                    .await
+                    .map_err(|e| format!("targets: no frame with id {cur}: {e}"))?;
+                let nid = pushed
+                    .get("nodeIds")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                if nid == 0 {
+                    return Err(format!(
+                        "targets: no frame with id {cur}: owner has no node"
+                    ));
+                }
+                out.push(nid);
+            }
+            cur = parent;
+        }
+        Ok(out)
+    }
+
+    /// G4b: `frameId -> parentId` map for the active page's frame tree.
+    async fn frame_parents(&self) -> Result<HashMap<String, String>, String> {
+        let tree = self.frame_tree().await?;
+        let mut out = HashMap::new();
+        if let Some(frames) = tree.get("frames").and_then(|v| v.as_array()) {
+            for f in frames {
+                let id = f.get("frameId").and_then(|v| v.as_str()).unwrap_or("");
+                let parent = f.get("parentId").and_then(|v| v.as_str()).unwrap_or("");
+                if !id.is_empty() {
+                    out.insert(id.to_string(), parent.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// G4b: resolve a frame-owner node to a `Runtime.callFunctionOn` object id
+    /// on the page session (owner `nodeId` preferred, `backendNodeId` via
+    /// `DOM.requestNode` fallback).
+    async fn owner_object_id(&self, owner: &Value, frame_id: &str) -> Result<String, String> {
+        let nid = owner.get("nodeId").and_then(|v| v.as_i64()).unwrap_or(0);
+        if nid != 0 {
+            let res = self
+                .command("DOM.resolveNode", json!({"nodeId": nid}), true)
+                .await
+                .map_err(|e| format!("targets: no frame with id {frame_id}: {e}"))?;
+            return res
+                .get("object")
+                .and_then(|o| o.get("objectId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or(format!(
+                    "targets: no frame with id {frame_id}: resolveNode returned no objectId"
+                ));
+        }
+        let backend = owner
+            .get("backendNodeId")
+            .and_then(|v| v.as_i64())
+            .ok_or(format!(
+                "targets: no frame with id {frame_id}: getFrameOwner returned no node"
+            ))?;
+        let res = self
+            .command("DOM.resolveNode", json!({"backendNodeId": backend}), true)
+            .await
+            .map_err(|e| format!("targets: no frame with id {frame_id}: {e}"))?;
+        let oid = res
+            .get("object")
+            .and_then(|o| o.get("objectId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or(format!(
+                "targets: no frame with id {frame_id}: resolveNode returned no objectId"
+            ))?;
+        // `requestNode` path is only needed when the owner has no direct
+        // nodeId; resolveNode already yields a usable object id here.
+        Ok(oid)
+    }
+
+    /// G4b verifier: per-level viewport points from `frame_id` up to the main
+    /// frame. Each entry is `(parent realm, x, y)`: the point in that
+    /// parent's viewport CSS px, from the immediate parent out to the main
+    /// frame (`None` = the main frame). Leaf rect is read in the target
+    /// realm; for each ancestor frame the parent contributes
+    /// `owner_rect.left/top + paddingLeft + borderLeftWidth` (JS rect chain:
+    /// `DOM.getFrameOwner` -> backendNodeId -> resolveNode ->
+    /// getBoundingClientRect; never getContentQuads for iframe nodes). Each
+    /// owner is scrolled into view in its parent before its rect is read, so
+    /// every level's point is on-screen in its own realm.
+    pub async fn frame_chain_points(
+        &self,
+        frame_id: &str,
+        x: f64,
+        y: f64,
+    ) -> Result<Vec<(Option<String>, f64, f64)>, String> {
+        let parents = self
+            .frame_parents()
+            .await
+            .map_err(|e| format!("targets: no frame with id {frame_id}: {e}"))?;
+        if !parents.contains_key(frame_id) {
+            return Err(format!("targets: no frame with id {frame_id}"));
+        }
+        self.command("DOM.enable", json!({}), true).await?;
+        let mut levels = Vec::new();
+        let (mut ax, mut ay) = (x, y);
+        let mut cur = frame_id.to_string();
+        loop {
+            let parent = parents.get(&cur).cloned().unwrap_or_default();
+            if parent.is_empty() {
+                break;
+            }
+            let owner = self
+                .command("DOM.getFrameOwner", json!({"frameId": cur}), true)
+                .await
+                .map_err(|e| format!("targets: no frame with id {cur}: {e}"))?;
+            let oid = self.owner_object_id(&owner, &cur).await?;
+            // Scroll the owner into view in the parent realm first, then read
+            // its content-origin metrics (rect + padding + border).
+            let _ = self
+                .command(
+                    "Runtime.callFunctionOn",
+                    json!({"objectId": oid,
+                           "functionDeclaration": "function(){try{this.scrollIntoView({block:'center',inline:'center'});}catch(e){}}",
+                           "returnByValue": true}),
+                    true,
+                )
+                .await;
+            let m = self
+                .command(
+                    "Runtime.callFunctionOn",
+                    json!({"objectId": oid,
+                           "functionDeclaration": "function(){const r=this.getBoundingClientRect();const cs=getComputedStyle(this);const f=(k)=>{const v=parseFloat(cs[k]);return isNaN(v)?0:v;};return {left:r.left,top:r.top,pl:f('paddingLeft'),bl:f('borderLeftWidth'),pt:f('paddingTop'),bt:f('borderTopWidth')};}",
+                           "returnByValue": true}),
+                    true,
+                )
+                .await
+                .map_err(|e| format!("targets: no frame with id {cur}: {e}"))?;
+            let v = m.get("result").and_then(|r| r.get("value")).ok_or(format!(
+                "targets: no frame with id {cur}: owner has no layout box"
+            ))?;
+            let num = |k: &str| v.get(k).and_then(|n| n.as_f64()).unwrap_or(0.0);
+            ax += num("left") + num("pl") + num("bl");
+            ay += num("top") + num("pt") + num("bt");
+            let _ = self
+                .command("Runtime.releaseObject", json!({"objectId": oid}), true)
+                .await;
+            // The main frame is the one whose own parent is "".
+            let parent_is_main = parents.get(&parent).map(|g| g.is_empty()).unwrap_or(true);
+            if parent_is_main {
+                levels.push((None, ax, ay));
+            } else {
+                levels.push((Some(parent.clone()), ax, ay));
+            }
+            cur = parent;
+        }
+        Ok(levels)
+    }
+
+    /// G4b: the page-session `nodeId` of `document.querySelector(selector)`
+    /// evaluated in the FRAME's isolated world. The frame realm's own object
+    /// (`Runtime.evaluate` without `returnByValue` -> `objectId`) is exact -
+    /// never a main-frame query - but the page-session DOM agent hands out no
+    /// frontend id for it directly (`DOM.requestNode` returns 0 and
+    /// `describeNode` reports `nodeId` 0 with only a `backendNodeId`, verified
+    /// live on chrome-headless-shell; the pierced root `querySelector` and
+    /// the owner `contentDocument` chain are likewise empty on this engine).
+    /// The working bridge is the snapshot path's own:
+    /// `DOM.getDocument` (pierce) + `DOM.pushNodesByBackendIdsToFrontend`.
+    /// A miss (null result, unknown frame, detached/OOPIF object the page
+    /// session cannot resolve) is an error the caller types - never a
+    /// main-frame node.
+    pub async fn frame_query_node(&self, frame_id: &str, selector: &str) -> Result<i64, String> {
+        let lit =
+            serde_json::to_string(selector).map_err(|e| format!("upload: bad selector: {e}"))?;
+        let world = self
+            .command(
+                "Page.createIsolatedWorld",
+                json!({"frameId": frame_id}),
+                true,
+            )
+            .await
+            .map_err(|e| format!("targets: no frame with id {frame_id}: {e}"))?;
+        let ctx = world
+            .get("executionContextId")
+            .and_then(|v| v.as_u64())
+            .ok_or(format!(
+            "targets: no frame with id {frame_id}: isolated world returned no executionContextId"
+        ))?;
+        let r = self
+            .command(
+                "Runtime.evaluate",
+                json!({"expression": format!("document.querySelector({lit})"), "contextId": ctx}),
+                true,
+            )
+            .await
+            .map_err(|e| format!("targets: no frame with id {frame_id}: {e}"))?;
+        if let Some(ex) = r.get("exceptionDetails") {
+            return Err(format!("js exception: {ex}"));
+        }
+        let oid = r
+            .get("result")
+            .and_then(|o| o.get("objectId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let oid = match oid {
+            Some(o) => o,
+            None => {
+                return Err(format!(
+                    "upload: element not found in frame {frame_id}: {selector}"
+                ))
+            }
+        };
+        let desc = self
+            .command("DOM.describeNode", json!({"objectId": oid}), true)
+            .await
+            .map_err(|e| format!("upload: frame {frame_id} node is not reachable from the page session (out-of-process or detached): {e}"))?;
+        let backend = desc
+            .get("node")
+            .and_then(|n| n.get("backendNodeId"))
+            .and_then(|v| v.as_i64())
+            .ok_or(format!(
+                "upload: element not found in frame {frame_id}: {selector}"
+            ))?;
+        // Snapshot bridge: document first (pierce so iframe nodes resolve),
+        // then backend ids to frontend node ids.
+        self.command("DOM.enable", json!({}), true).await?;
+        let _ = self
+            .command("DOM.getDocument", json!({"depth": 0, "pierce": true}), true)
+            .await?;
+        let pushed = self
+            .command(
+                "DOM.pushNodesByBackendIdsToFrontend",
+                json!({"backendNodeIds": [backend]}),
+                true,
+            )
+            .await
+            .map_err(|e| format!("upload: frame {frame_id} node is not reachable from the page session (out-of-process or detached): {e}"))?;
+        let nid = pushed
+            .get("nodeIds")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        if nid == 0 {
+            return Err(format!(
+                "upload: element not found in frame {frame_id}: {selector}"
+            ));
+        }
+        Ok(nid)
+    }
+
     pub async fn tabs_new(&self, url: Option<&str>) -> Result<Value, String> {
         let shared = self.shared().await?;
-        let open_url = url.filter(|u| !u.trim().is_empty()).unwrap_or("about:blank");
+        let open_url = url
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or("about:blank");
         let created = send_raw(
             &shared,
             "Target.createTarget",
@@ -779,7 +1269,7 @@ impl Browser {
                 Engine::Owned {
                     _profile: profile,
                     #[cfg(windows)]
-                    _job: job,
+                        _job: job,
                     mut child,
                     pid,
                 } => {
@@ -794,11 +1284,10 @@ impl Browser {
                     // assertion) instead of racing grandchildren still
                     // holding files.
                     let _ = child.start_kill();
-                    let exited =
-                        tokio::time::timeout(Duration::from_secs(2), child.wait())
-                            .await
-                            .map(|r| r.is_ok())
-                            .unwrap_or(false);
+                    let exited = tokio::time::timeout(Duration::from_secs(2), child.wait())
+                        .await
+                        .map(|r| r.is_ok())
+                        .unwrap_or(false);
                     #[cfg(windows)]
                     let job_cover = job.is_some();
                     #[cfg(not(windows))]
@@ -839,7 +1328,9 @@ impl Browser {
                     *shared.session.lock().await = None;
                     *shared.target.lock().await = None;
                     reader.abort();
-                    eprintln!("[gladius] detach: external engine left running (not owned) {cdp_url}");
+                    eprintln!(
+                        "[gladius] detach: external engine left running (not owned) {cdp_url}"
+                    );
                 }
             }
         }
@@ -870,8 +1361,7 @@ impl Browser {
             // evals, but an unwrapped `send_raw` allows 30s per call, so a
             // stalled peer would turn a short cap into 30s+.
             let remaining = deadline.saturating_duration_since(Instant::now());
-            match tokio::time::timeout(remaining, self.eval("document.readyState")).await
-            {
+            match tokio::time::timeout(remaining, self.eval("document.readyState")).await {
                 Ok(Ok(Value::String(s))) if s == "complete" => return,
                 _ => {}
             }
@@ -928,8 +1418,7 @@ impl Browser {
                 let mut q = inner.shared.console.lock().await;
                 let total = q.len();
                 let take = limit.min(total);
-                let messages: Vec<Value> =
-                    q.iter().skip(total - take).map(|m| m.json()).collect();
+                let messages: Vec<Value> = q.iter().skip(total - take).map(|m| m.json()).collect();
                 let cleared = q.drain(..).count();
                 json!({"messages": messages, "count": take,
                        "total": total, "cap": CONSOLE_CAP, "cleared": cleared})
@@ -950,11 +1439,12 @@ impl Browser {
     /// `Fetch.enable` interception is used.
     pub async fn ensure_network(&self) -> Result<(), String> {
         let shared = self.shared().await?;
-        let session = ensure_session(&shared).await?;
-        if shared.net_enabled.lock().await.contains(&session) {
-            return Ok(());
+        if let Some(s) = shared.session.lock().await.clone() {
+            if shared.net_enabled.lock().await.contains(&s) {
+                return Ok(());
+            }
         }
-        send_raw(&shared, "Network.enable", json!({}), Some(session.clone())).await?;
+        let (session, _) = send_session(&shared, "Network.enable", json!({})).await?;
         shared.net_enabled.lock().await.insert(session);
         Ok(())
     }
@@ -963,13 +1453,21 @@ impl Browser {
     /// in-flight request set stays empty for `idle`, false on `budget`
     /// expiry (the caller reports its typed timeout - this never hangs,
     /// even when the page never goes idle). No browser yet is trivially
-    /// idle.
-    pub async fn wait_network_idle(&self, idle: Duration, budget: Duration) -> bool {
+    /// idle. The session pin is checked on every iteration before sleeping
+    /// and before accepting idle: a vanished/changed session ends the wait
+    /// at once with the stale-session message instead of burning the
+    /// budget on a corpse.
+    pub async fn wait_network_idle(
+        &self,
+        idle: Duration,
+        budget: Duration,
+        pinned: &mut Option<String>,
+    ) -> Result<bool, String> {
         let shared = {
             let guard = self.state.lock().await;
             match guard.as_ref() {
                 Some(inner) => inner.shared.clone(),
-                None => return true,
+                None => return Ok(true),
             }
         };
         let deadline = Instant::now() + budget;
@@ -978,16 +1476,22 @@ impl Browser {
         // still wakes this waiter.
         tokio::pin!(let notified = shared.net_notify.notified(););
         loop {
+            if let Some(msg) = self.check_session_pin(pinned).await {
+                return Err(msg);
+            }
             if shared.net_inflight.lock().await.is_empty() {
                 let qs = *quiet_start.get_or_insert_with(Instant::now);
                 if qs.elapsed() >= idle {
-                    return true;
+                    if let Some(msg) = self.check_session_pin(pinned).await {
+                        return Err(msg);
+                    }
+                    return Ok(true);
                 }
             } else {
                 quiet_start = None;
             }
             if Instant::now() >= deadline {
-                return false;
+                return Ok(false);
             }
             let remain = deadline.saturating_duration_since(Instant::now());
             tokio::select! {
@@ -1056,13 +1560,34 @@ impl Browser {
     /// `Page.getFrameTree`, document order.
     pub async fn frame_tree(&self) -> Result<Value, String> {
         let shared = self.shared().await?;
-        let session = ensure_session(&shared).await?;
-        let r = send_raw(&shared, "Page.getFrameTree", json!({}), Some(session)).await?;
+        let (_, r) = send_session(&shared, "Page.getFrameTree", json!({})).await?;
         let mut frames = Vec::new();
         if let Some(tree) = r.get("frameTree") {
             flatten_frames(tree, &mut frames);
         }
         Ok(json!({"frames": frames}))
+    }
+
+    /// Full Accessibility tree of the active page (optionally scoped to one
+    /// frame via its CDP `frameId`). Callers enable the domain first; the
+    /// returned shape is the raw `Accessibility.getFullAXTree` result
+    /// (`{nodes: [...]}`). Same-process iframes are covered by the engine;
+    /// OOPIF subtrees may need a separate session and are a documented
+    /// follow-up (the caller surfaces the engine error instead of faking).
+    pub async fn ax_tree(&self, frame_id: Option<&str>) -> Result<Value, String> {
+        let shared = self.shared().await?;
+        let (session, _) = send_session(&shared, "Accessibility.enable", json!({})).await?;
+        let mut params = json!({});
+        if let Some(fid) = frame_id {
+            params["frameId"] = json!(fid);
+        }
+        send_raw(
+            &shared,
+            "Accessibility.getFullAXTree",
+            params,
+            Some(session),
+        )
+        .await
     }
 
     /// Make a PAGE target current by its `targetId`: activate + attach, then
@@ -1077,9 +1602,9 @@ impl Browser {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        let hit = infos.iter().find(|t| {
-            t.get("targetId").and_then(|v| v.as_str()) == Some(target_id)
-        });
+        let hit = infos
+            .iter()
+            .find(|t| t.get("targetId").and_then(|v| v.as_str()) == Some(target_id));
         let hit = hit.ok_or(format!("targets: no target with id {target_id}"))?;
         if hit.get("type").and_then(|v| v.as_str()) != Some("page") {
             let ty = hit.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1116,11 +1641,7 @@ impl Browser {
     ///   error, never a 30 s hang);
     /// - pages, service workers, and everything else attach directly
     ///   (cached per target).
-    pub async fn eval_in_target(
-        &self,
-        target_id: &str,
-        expression: &str,
-    ) -> Result<Value, String> {
+    pub async fn eval_in_target(&self, target_id: &str, expression: &str) -> Result<Value, String> {
         let shared = self.shared().await?;
         let info = send_raw(
             &shared,
@@ -1171,7 +1692,11 @@ impl Browser {
                         .and_then(|v| v.as_str())
                         .ok_or("targets: attach returned no sessionId".to_string())?
                         .to_string();
-                    shared.extra_sessions.lock().await.insert(target_id.to_string(), s.clone());
+                    shared
+                        .extra_sessions
+                        .lock()
+                        .await
+                        .insert(target_id.to_string(), s.clone());
                     // Workers never got Runtime enabled: harmless, enables
                     // exception details on the session.
                     let _ = send_raw(&shared, "Runtime.enable", json!({}), Some(s.clone())).await;
@@ -1186,18 +1711,12 @@ impl Browser {
     /// created on the named frame (works cross-origin) and the expression
     /// runs there with `returnByValue` + `awaitPromise`. The tracked active
     /// page is untouched.
-    pub async fn eval_in_frame(
-        &self,
-        frame_id: &str,
-        expression: &str,
-    ) -> Result<Value, String> {
+    pub async fn eval_in_frame(&self, frame_id: &str, expression: &str) -> Result<Value, String> {
         let shared = self.shared().await?;
-        let session = ensure_session(&shared).await?;
-        let world = send_raw(
+        let (_, world) = send_session(
             &shared,
             "Page.createIsolatedWorld",
             json!({"frameId": frame_id}),
-            Some(session.clone()),
         )
         .await
         .map_err(|e| format!("targets: no frame with id {frame_id}: {e}"))?;
@@ -1205,12 +1724,11 @@ impl Browser {
             .get("executionContextId")
             .and_then(|v| v.as_u64())
             .ok_or("targets: isolated world returned no executionContextId".to_string())?;
-        let r = send_raw(
+        let (_, r) = send_session(
             &shared,
             "Runtime.evaluate",
             json!({"expression": expression, "contextId": ctx,
                    "returnByValue": true, "awaitPromise": true}),
-            Some(session),
         )
         .await?;
         if let Some(ex) = r.get("exceptionDetails") {
@@ -1231,6 +1749,42 @@ impl Browser {
         }
     }
 
+    /// Currently cached active session id, if any (None before the first
+    /// attach or after the session was invalidated). Read-only; used by
+    /// polling waits to pin the wait to its page.
+    pub async fn active_session(&self) -> Option<String> {
+        let guard = self.state.lock().await;
+        match guard.as_ref() {
+            Some(inner) => inner.shared.session.lock().await.clone(),
+            None => None,
+        }
+    }
+
+    /// Session-continuity pin for polling waits: a wait belongs to the
+    /// page it started on. `pinned` starts empty and latches the first
+    /// live session seen (the check runs only after a successful send, so
+    /// an empty latch plus an empty cache means the session died in
+    /// flight). When the cached session later vanishes or changes (target
+    /// closed/crashed, re-attach elsewhere), the wait must stop at once
+    /// instead of migrating onto a fresh page and burning its budget
+    /// there. Returns the stale-session message on a break.
+    pub async fn check_session_pin(&self, pinned: &mut Option<String>) -> Option<String> {
+        let cur = self.active_session().await;
+        match (pinned.clone(), cur) {
+            (None, Some(c)) => {
+                *pinned = Some(c);
+                None
+            }
+            (Some(_), None) | (None, None) => Some(
+                "stale session: wait_for stopped: the page session went away mid-wait; the wait is not retried; re-issue it after recovery".to_string(),
+            ),
+            (Some(p), Some(c)) if p != c => Some(
+                "stale session: wait_for stopped: the page session changed mid-wait (re-attached elsewhere); the wait is not retried; re-issue it after recovery".to_string(),
+            ),
+            _ => None,
+        }
+    }
+
     /// Poll `expression` on the active page until it returns truthy, with a
     /// backoff cadence inside the shared `budget`. Returns Ok(true) once the
     /// condition holds, Ok(false) on budget expiry (the caller mints the
@@ -1243,6 +1797,7 @@ impl Browser {
     ) -> Result<bool, String> {
         let deadline = Instant::now() + budget;
         let mut wait = Duration::from_millis(50);
+        let mut pinned: Option<String> = None;
         loop {
             if Instant::now() >= deadline {
                 return Ok(false);
@@ -1250,11 +1805,20 @@ impl Browser {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match tokio::time::timeout(remaining, self.eval(expression)).await {
                 Ok(Ok(v)) => {
+                    // Session continuity first: a truthy result on a
+                    // replacement session must not satisfy the original wait.
+                    if let Some(msg) = self.check_session_pin(&mut pinned).await {
+                        return Err(msg);
+                    }
                     if is_truthy(&v) {
                         return Ok(true);
                     }
                 }
                 Ok(Err(e)) if e.starts_with("js exception") => return Err(e),
+                // Session death is not "not yet true": fail fast so polling
+                // waits surface the typed stale_session instead of burning
+                // the budget on a corpse.
+                Ok(Err(e)) if e.starts_with("stale session: ") => return Err(e),
                 _ => {}
             }
             if Instant::now() >= deadline {
@@ -1273,22 +1837,17 @@ impl Browser {
     /// error (never a silent no-op).
     pub async fn history(&self, action: &str) -> Result<Value, String> {
         let shared = self.shared().await?;
-        let session = ensure_session(&shared).await?;
         if action == "reload" {
-            send_raw(&shared, "Page.reload", json!({}), Some(session)).await?;
+            send_session(&shared, "Page.reload", json!({})).await?;
             self.wait_for_load(Duration::from_secs(10)).await;
             return live_url_title(self).await;
         }
         if action != "back" && action != "forward" {
-            return Err(format!("history: unknown action '{action}' (back|forward|reload)"));
+            return Err(format!(
+                "history: unknown action '{action}' (back|forward|reload)"
+            ));
         }
-        let h = send_raw(
-            &shared,
-            "Page.getNavigationHistory",
-            json!({}),
-            Some(session.clone()),
-        )
-        .await?;
+        let (_, h) = send_session(&shared, "Page.getNavigationHistory", json!({})).await?;
         let idx = h.get("currentIndex").and_then(|v| v.as_i64()).unwrap_or(0);
         let entries = h
             .get("entries")
@@ -1305,12 +1864,14 @@ impl Browser {
             entries.get(want_idx as usize)
         };
         let entry = entry.ok_or(format!("history: no {action} entry (at boundary)"))?;
-        let eid = entry.get("id").and_then(|v| v.as_i64()).ok_or(format!("history: entry has no id"))?;
-        send_raw(
+        let eid = entry
+            .get("id")
+            .and_then(|v| v.as_i64())
+            .ok_or("history: entry has no id".to_string())?;
+        send_session(
             &shared,
             "Page.navigateToHistoryEntry",
             json!({"entryId": eid}),
-            Some(session),
         )
         .await?;
         self.wait_for_load(Duration::from_secs(10)).await;
@@ -1417,7 +1978,11 @@ impl Browser {
     /// Set the dialog policy. Applies to the NEXT dialog the reader
     /// auto-handles (an already-recorded dialog keeps the policy it ran
     /// under); returns the applied policy.
-    pub async fn dialog_policy_set(&self, accept: bool, prompt_text: Option<String>) -> Result<DialogPolicy, String> {
+    pub async fn dialog_policy_set(
+        &self,
+        accept: bool,
+        prompt_text: Option<String>,
+    ) -> Result<DialogPolicy, String> {
         let shared = self.shared().await?;
         let mut p = shared.dialog_policy.lock().await;
         p.accept = accept;
@@ -1591,26 +2156,103 @@ async fn send_raw_with_timeout(
     }
 }
 
+/// Session-death class: these CDP error shapes mean the cached page
+/// session is gone (closed/crashed target, dropped session state, dead
+/// execution context) and must be invalidated — never reused, never
+/// retried.
+fn is_session_death(error: &str) -> bool {
+    let l = error.to_lowercase();
+    l.contains("session with given id")
+        || l.contains("cannot find context")
+        || l.contains("target closed")
+        || l.contains("execution context was destroyed")
+}
+
+/// Drop the cached active session/target: a dead session must never be
+/// reused. The next `ensure_session` re-attaches (creating a page when the
+/// farm is empty).
+async fn invalidate_session(shared: &Arc<Shared>) {
+    *shared.session.lock().await = None;
+    *shared.target.lock().await = None;
+}
+
+/// Session-scoped send, exactly once. Ensures a page session and sends;
+/// on a send failure the cached session is dropped on ANY session-death
+/// class error (it must never be reused), but the command is NEVER resent:
+/// a lost response could otherwise duplicate a mutating command. A
+/// session-death failure returns a `stale session: ...` error stating the
+/// command may or may not have executed — the caller repeats it only by
+/// choice, and the next call re-attaches (creating a page when none
+/// exists) and recovers. Returns the session the send used, plus the result.
+async fn send_session(
+    shared: &Arc<Shared>,
+    method: &str,
+    params: Value,
+) -> Result<(String, Value), String> {
+    let session = match ensure_session(shared).await {
+        Ok(s) => s,
+        // A re-attach that fails with session death (closing target still
+        // listed, crashed renderer) is the same corpse: surface it typed
+        // instead of letting polling waits burn their budget on it.
+        Err(e) if is_session_death(&e) => {
+            return Err(format!(
+                "stale session: {method} may or may not have executed; not retried; the next call re-attaches and repeats only if you choose ({e})"
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    match send_raw(shared, method, params, Some(session.clone())).await {
+        Ok(v) => Ok((session, v)),
+        Err(e) => {
+            if !is_session_death(&e) {
+                return Err(e);
+            }
+            invalidate_session(shared).await;
+            Err(format!(
+                "stale session: {method} may or may not have executed; not retried; the next call re-attaches and repeats only if you choose ({e})"
+            ))
+        }
+    }
+}
+
 async fn ensure_session(shared: &Arc<Shared>) -> Result<String, String> {
+    // A dead reader means a dead socket: fail fast instead of sending into
+    // it (the cached session/target were cleared when the reader exited).
+    if shared.dead.load(Ordering::SeqCst) {
+        return Err("cdp: engine connection closed (reader exited)".to_string());
+    }
     if let Some(s) = shared.session.lock().await.clone() {
         return Ok(s);
     }
     // Oldest tab first, so a fresh session lands on the opener.
     // (ordered_targets already filters to page targets.)
     let infos = ordered_targets(shared).await?;
-    let mut target_id: Option<String> = infos
-        .first()
-        .and_then(|t| t.get("targetId"))
+    // Try every candidate in order: a listed target can be mid-close (its
+    // closeTarget ack races its detach), so a refused attach must fall
+    // through to the next tab, never fail the whole ensure.
+    let mut last_err: Option<String> = None;
+    for t in &infos {
+        if let Some(tid) = t.get("targetId").and_then(|v| v.as_str()) {
+            match attach_to(shared, tid).await {
+                Ok(sid) => return Ok(sid),
+                Err(e) => last_err = Some(e),
+            }
+        }
+    }
+    if !infos.is_empty() {
+        return Err(last_err.unwrap_or_else(|| "cdp: no page target available".to_string()));
+    }
+    let created = send_raw(
+        shared,
+        "Target.createTarget",
+        json!({"url": "about:blank"}),
+        None,
+    )
+    .await?;
+    let target_id: Option<String> = created
+        .get("targetId")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    if target_id.is_none() {
-        let created = send_raw(shared, "Target.createTarget", json!({"url": "about:blank"}), None)
-            .await?;
-        target_id = created
-            .get("targetId")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-    }
     let tid = target_id.ok_or("cdp: no page target available".to_string())?;
     let sid = attach_to(shared, &tid).await?;
     Ok(sid)
@@ -1762,16 +2404,26 @@ async fn tabs_object(shared: &Arc<Shared>) -> Result<Value, String> {
                 (u, ti)
             } else {
                 (
-                    t.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    t.get("title").and_then(|v| v.as_str())
+                    t.get("url")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    t.get("title")
+                        .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),
                 )
             }
         } else {
             (
-                t.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                t.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                t.get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                t.get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             )
         };
         tabs.push(json!({
@@ -1937,7 +2589,10 @@ fn console_message(params: &Value) -> ConsoleMsg {
             .and_then(|u| u.as_str())
             .unwrap_or("")
             .to_string(),
-        line: frame.get("lineNumber").and_then(|l| l.as_i64()).unwrap_or(-1),
+        line: frame
+            .get("lineNumber")
+            .and_then(|l| l.as_i64())
+            .unwrap_or(-1),
         ts: params
             .get("timestamp")
             .and_then(|t| t.as_f64())
@@ -1948,7 +2603,10 @@ fn console_message(params: &Value) -> ConsoleMsg {
 
 /// `Runtime.exceptionThrown` params -> ConsoleMsg (type `error`).
 fn exc_message(params: &Value) -> ConsoleMsg {
-    let d = params.get("exceptionDetails").cloned().unwrap_or(Value::Null);
+    let d = params
+        .get("exceptionDetails")
+        .cloned()
+        .unwrap_or(Value::Null);
     let mut text = d
         .get("text")
         .and_then(|t| t.as_str())
@@ -1965,7 +2623,11 @@ fn exc_message(params: &Value) -> ConsoleMsg {
     ConsoleMsg {
         mtype: "error".to_string(),
         text,
-        url: d.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string(),
+        url: d
+            .get("url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .to_string(),
         line: d.get("lineNumber").and_then(|l| l.as_i64()).unwrap_or(-1),
         ts: now_ms(),
     }
@@ -1984,8 +2646,15 @@ fn log_message(entry: &Value) -> ConsoleMsg {
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_string(),
-        url: entry.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string(),
-        line: entry.get("lineNumber").and_then(|l| l.as_i64()).unwrap_or(-1),
+        url: entry
+            .get("url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .to_string(),
+        line: entry
+            .get("lineNumber")
+            .and_then(|l| l.as_i64())
+            .unwrap_or(-1),
         ts: entry
             .get("timestamp")
             .and_then(|t| t.as_f64())
@@ -2003,10 +2672,26 @@ async fn record_request(shared: &Arc<Shared>, p: &Value) {
         None => return,
     };
     let req = p.get("request").cloned().unwrap_or(Value::Null);
-    let url = req.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
-    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("").to_string();
-    let rtype = p.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
-    let ts = p.get("timestamp").and_then(|t| t.as_f64()).map(|t| (t * 1000.0) as u64).unwrap_or_else(now_ms);
+    let url = req
+        .get("url")
+        .and_then(|u| u.as_str())
+        .unwrap_or("")
+        .to_string();
+    let method = req
+        .get("method")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let rtype = p
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    let ts = p
+        .get("timestamp")
+        .and_then(|t| t.as_f64())
+        .map(|t| (t * 1000.0) as u64)
+        .unwrap_or_else(now_ms);
     let mut q = shared.net_log.lock().await;
     if let Some(e) = q.iter_mut().rev().find(|e| e.request_id == rid) {
         // Redirect leg: same id, new url - track the landing url.
@@ -2042,9 +2727,21 @@ async fn record_response(shared: &Arc<Shared>, p: &Value) {
     };
     let resp = p.get("response").cloned().unwrap_or(Value::Null);
     let status = resp.get("status").and_then(|s| s.as_i64());
-    let mime = resp.get("mimeType").and_then(|m| m.as_str()).unwrap_or("").to_string();
-    let url = resp.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string();
-    let rtype = p.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+    let mime = resp
+        .get("mimeType")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let url = resp
+        .get("url")
+        .and_then(|u| u.as_str())
+        .unwrap_or("")
+        .to_string();
+    let rtype = p
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
     let mut q = shared.net_log.lock().await;
     if let Some(e) = q.iter_mut().rev().find(|e| e.request_id == rid) {
         if status.is_some() {
@@ -2079,9 +2776,16 @@ async fn record_finish(shared: &Arc<Shared>, p: &Value) {
         Some(r) => r,
         None => return,
     };
-    let failed = p.get("errorText").and_then(|e| e.as_str()).is_some_and(|s| !s.is_empty())
+    let failed = p
+        .get("errorText")
+        .and_then(|e| e.as_str())
+        .is_some_and(|s| !s.is_empty())
         || p.get("canceled").and_then(|c| c.as_bool()).unwrap_or(false);
-    let error_text = p.get("errorText").and_then(|e| e.as_str()).unwrap_or("").to_string();
+    let error_text = p
+        .get("errorText")
+        .and_then(|e| e.as_str())
+        .unwrap_or("")
+        .to_string();
     let mut q = shared.net_log.lock().await;
     if let Some(e) = q.iter_mut().rev().find(|e| e.request_id == rid) {
         e.finished = true;
@@ -2193,19 +2897,39 @@ async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
                     .unwrap_or("");
                 let sid = p.get("sessionId").and_then(|s| s.as_str()).unwrap_or("");
                 if !tid.is_empty() && !sid.is_empty() {
-                    shared.extra_sessions.lock().await.insert(tid.to_string(), sid.to_string());
+                    shared
+                        .extra_sessions
+                        .lock()
+                        .await
+                        .insert(tid.to_string(), sid.to_string());
                 }
             }
             continue;
         }
         if v.get("method").and_then(|m| m.as_str()) == Some("Target.detachedFromTarget") {
             // Hygiene: a detached session must never be reused by realm eval.
+            // Plus active invalidation: when the detach names the TRACKED
+            // page target/session (closed/crashed tab, dropped socket state),
+            // clear the cached active session/target so the next command
+            // re-attaches instead of failing on the corpse until process
+            // restart. Either id form (targetId or session-only) invalidates
+            // when it names the active one.
             if let Some(p) = v.get("params") {
-                if let Some(tid) = p.get("targetId").and_then(|t| t.as_str()) {
-                    shared.extra_sessions.lock().await.remove(tid);
-                } else if let Some(sid) = p.get("sessionId").and_then(|s| s.as_str()) {
-                    let sid = sid.to_string();
-                    shared.extra_sessions.lock().await.retain(|_, s| *s != sid);
+                let tid = p.get("targetId").and_then(|t| t.as_str());
+                let sid = p.get("sessionId").and_then(|s| s.as_str());
+                if let Some(t) = tid {
+                    shared.extra_sessions.lock().await.remove(t);
+                } else if let Some(s) = sid {
+                    let s = s.to_string();
+                    shared.extra_sessions.lock().await.retain(|_, v| *v != s);
+                }
+                let active_target = shared.target.lock().await.clone();
+                let active_session = shared.session.lock().await.clone();
+                let names_active = tid.is_some_and(|t| Some(t) == active_target.as_deref())
+                    || sid.is_some_and(|s| Some(s) == active_session.as_deref());
+                if names_active {
+                    *shared.session.lock().await = None;
+                    *shared.target.lock().await = None;
                 }
             }
             continue;
@@ -2234,16 +2958,19 @@ async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
                 .and_then(|u| u.as_str())
                 .unwrap_or("")
                 .to_string();
+            // Policy-driven handling: the recorded default accepts
+            // (pre-policy behavior, page unblocked); a dismiss policy
+            // answers `false`/`null` so confirm/prompt/beforeunload observe
+            // the refusal. Prompt text rides along when accepting. The
+            // record keeps the policy it ran under so the tool notes stay
+            // truthful (accepted only when accepted).
+            let pol = shared.dialog_policy.lock().await.clone();
             *shared.dialog.lock().await = Some(DialogRecord {
                 dtype: dtype.clone(),
                 message: message.clone(),
                 url: url.clone(),
+                accepted: pol.accept,
             });
-            // Policy-driven handling: the recorded default accepts
-            // (pre-policy behavior, page unblocked); a dismiss policy
-            // answers `false`/`null` so confirm/prompt/beforeunload observe
-            // the refusal. Prompt text rides along when accepting.
-            let pol = shared.dialog_policy.lock().await.clone();
             let dialog_params = if dtype == "prompt" {
                 if pol.accept {
                     json!({"accept": true, "promptText": pol.prompt_text})
@@ -2258,10 +2985,7 @@ async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
             let hid = shared.next_id.fetch_add(1, Ordering::SeqCst);
             let mut envelope = serde_json::Map::new();
             envelope.insert("id".to_string(), json!(hid));
-            envelope.insert(
-                "method".to_string(),
-                json!("Page.handleJavaScriptDialog"),
-            );
+            envelope.insert("method".to_string(), json!("Page.handleJavaScriptDialog"));
             envelope.insert("params".to_string(), dialog_params);
             if let Some(s) = v.get("sessionId").and_then(|s| s.as_str()) {
                 envelope.insert("sessionId".to_string(), json!(s));
@@ -2277,6 +3001,15 @@ async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
             }
         }
     }
+    // The stream ended (the engine went away or the socket dropped): mark
+    // the engine dead and clear the cached session/target (+ realm cache)
+    // so no later call reuses the corpse. `ensure_session` fails fast on
+    // the flag; `close()` still reaps/aborts as before. The RAII
+    // pending-map guard is untouched (late responses still route to no one).
+    shared.dead.store(true, Ordering::SeqCst);
+    *shared.session.lock().await = None;
+    *shared.target.lock().await = None;
+    shared.extra_sessions.lock().await.clear();
 }
 
 /// Startup deadline for the owned-engine readiness poll (default 30s).
@@ -2388,12 +3121,10 @@ fn find_chromium() -> Result<std::path::PathBuf, String> {
                 std::path::PathBuf::from(local.trim()).join("gladius/chromium")
             }
             _ => {
-                return Err(
-                    "chromium browser not found: LOCALAPPDATA is unset and \
+                return Err("chromium browser not found: LOCALAPPDATA is unset and \
                      GLADIUS_CHROMIUM_CACHE is unset; set one of them or run \
                      scripts/fetch-chromium.ps1 to provision the pinned browser"
-                        .to_string(),
-                );
+                    .to_string());
             }
         },
     };
@@ -3116,9 +3847,7 @@ mod job {
             };
             if AssignProcessToJobObject(job, proc) == 0 {
                 CloseHandle(job);
-                eprintln!(
-                    "[gladius] job: AssignProcessToJobObject failed, no hard-kill cover"
-                );
+                eprintln!("[gladius] job: AssignProcessToJobObject failed, no hard-kill cover");
                 return None;
             }
             eprintln!("[gladius] job: browser armed with KILL_ON_JOB_CLOSE");
@@ -3175,7 +3904,12 @@ mod tests {
         let reader = tokio::spawn(reader_loop(stream, shared.clone()));
         let mut std_cmd = std::process::Command::new("powershell");
         std_cmd
-            .args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 120"])
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 120",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -3215,9 +3949,7 @@ mod tests {
 
     impl TestRig {
         async fn shutdown(self) {
-            let TestRig {
-                browser, tasks, ..
-            } = self;
+            let TestRig { browser, tasks, .. } = self;
             let _ = browser.close().await;
             for t in tasks {
                 t.abort();
@@ -3281,6 +4013,424 @@ mod tests {
         rig.shutdown().await;
     }
 
+    /// Single-send policy pin (pure): the session-death class covers the
+    /// strict session-gone shape, the ambiguous shapes, and nothing else —
+    /// every member invalidates the corpse, and NONE of them resends.
+    #[test]
+    fn session_death_class_covers_gone_and_ambiguous_only() {
+        for e in [
+            "cdp error: {\"code\":-32001,\"message\":\"Session with given id not found\"}",
+            "SESSION WITH GIVEN ID NOT FOUND",
+            "cdp error: {\"message\":\"No session with given id\"}",
+            "cdp error: Cannot find context with specified id",
+            "cdp error: {\"message\":\"Target closed.\"}",
+            "cdp error: {\"message\":\"Execution context was destroyed.\"}",
+        ] {
+            assert!(is_session_death(e), "must invalidate on: {e}");
+        }
+        for e in [
+            "ws send: broken pipe",
+            "cdp: response timeout",
+            "cdp: response channel closed",
+            "targets: no target with id T9",
+        ] {
+            assert!(!is_session_death(e), "must not treat as session death: {e}");
+        }
+    }
+
+    /// Scripted fake CDP engine for the single-send proofs: the attach flow
+    /// is canned, and the FIRST `Page.enable` / `Runtime.evaluate` carrying
+    /// non-empty params fails with `first_error` (the attach flow's own
+    /// `{}` enables always succeed, so the scripted failure lands exactly
+    /// on the command under test). Every method seen is counted (`+params`
+    /// marks non-empty params).
+    struct ScriptedFake {
+        ws_url: String,
+        methods: Arc<Mutex<Vec<String>>>,
+        event_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Value>>>>,
+        eval_script: Arc<Mutex<std::collections::VecDeque<Value>>>,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    async fn scripted_fake(first_error: Option<String>) -> ScriptedFake {
+        let methods = Arc::new(Mutex::new(Vec::<String>::new()));
+        let pending_err = Arc::new(Mutex::new(first_error));
+        let eval_script: Arc<Mutex<std::collections::VecDeque<Value>>> =
+            Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let event_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Value>>>> =
+            Arc::new(Mutex::new(None));
+        let sid_ctr = Arc::new(AtomicU64::new(1));
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let port = ln.local_addr().expect("loopback addr").port();
+        let m = methods.clone();
+        let etx = event_tx.clone();
+        let escript = eval_script.clone();
+        let srv = tokio::spawn(async move {
+            while let Ok((s, _)) = ln.accept().await {
+                let m = m.clone();
+                let pending_err = pending_err.clone();
+                let sid_ctr = sid_ctr.clone();
+                let etx = etx.clone();
+                let escript = escript.clone();
+                tokio::spawn(async move {
+                    let ws = match tokio_tungstenite::accept_async(s).await {
+                        Ok(w) => w,
+                        Err(_) => return,
+                    };
+                    let (mut sink, mut stream) = ws.split();
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+                    *etx.lock().unwrap() = Some(tx);
+                    let escript = escript.clone();
+                    loop {
+                        tokio::select! {
+                            msg = stream.next() => {
+                                let Some(msg) = msg else { break };
+                                if !handle_fake_msg(msg, &mut sink, &m, &pending_err, &sid_ctr, &escript).await {
+                                    break;
+                                }
+                            }
+                            ev = rx.recv() => {
+                                match ev {
+                                    Some(v) => {
+                                        use futures_util::SinkExt;
+                                        let _ = sink.send(Message::Text(v.to_string().into())).await;
+                                    }
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        ScriptedFake {
+            ws_url: format!("ws://127.0.0.1:{port}/"),
+            methods,
+            event_tx,
+            eval_script,
+            tasks: vec![srv],
+        }
+    }
+
+    /// Queue scripted `Runtime.evaluate` boolean results (falsy/truthy legs
+    /// of the pin tests). Unscripted evaluates answer boolean false.
+    fn script_evals(fake: &ScriptedFake, vals: Vec<bool>) {
+        *fake.eval_script.lock().unwrap() = vals.into_iter().map(Value::Bool).collect();
+    }
+
+    /// One scripted-fake request/response step. Returns false when the
+    /// connection should close.
+    async fn handle_fake_msg(
+        msg: Result<Message, tokio_tungstenite::tungstenite::Error>,
+        sink: &mut (impl futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+                  + Unpin),
+        m: &Arc<Mutex<Vec<String>>>,
+        pending_err: &Arc<Mutex<Option<String>>>,
+        sid_ctr: &Arc<AtomicU64>,
+        escript: &Arc<Mutex<std::collections::VecDeque<Value>>>,
+    ) -> bool {
+        use futures_util::SinkExt;
+        let text = match msg {
+            Ok(Message::Text(t)) => t.to_string(),
+            Ok(Message::Binary(b)) => String::from_utf8_lossy(&b).into_owned(),
+            _ => return true,
+        };
+        let v: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => return true,
+        };
+        let id = match v.get("id").and_then(|i| i.as_u64()) {
+            Some(i) => i,
+            None => return true,
+        };
+        let method = v
+            .get("method")
+            .and_then(|mm| mm.as_str())
+            .unwrap_or("")
+            .to_string();
+        let has_params = v
+            .get("params")
+            .is_some_and(|p| p.as_object().is_some_and(|o| !o.is_empty()));
+        m.lock().unwrap().push(if has_params {
+            format!("{method}+params")
+        } else {
+            method.clone()
+        });
+        if (method == "Page.enable" || method == "Runtime.evaluate") && has_params {
+            let err_msg = pending_err.lock().unwrap().take();
+            if let Some(msg) = err_msg {
+                let _ = sink
+                    .send(Message::Text(
+                        json!({"id": id, "error": {"code": -32000, "message": msg}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await;
+                return true;
+            }
+        }
+        let result = match method.as_str() {
+            "Target.getTargets" => json!({"targetInfos": [
+                {"targetId": "T1", "type": "page",
+                 "url": "about:blank", "title": "fake"}
+            ]}),
+            "Target.attachToTarget" => {
+                let n = sid_ctr.fetch_add(1, Ordering::SeqCst);
+                json!({"sessionId": format!("S{n}")})
+            }
+            "Runtime.evaluate" => {
+                // Scripted per-call results first (falsy/truthy legs of the
+                // pin tests), then the steady falsy default.
+                escript
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .map(|v| json!({"result": {"type": "boolean", "value": v}}))
+                    .unwrap_or_else(|| json!({"result": {"type": "boolean", "value": false}}))
+            }
+            _ => json!({}),
+        };
+        let _ = sink
+            .send(Message::Text(
+                json!({"id": id, "result": result}).to_string().into(),
+            ))
+            .await;
+        true
+    }
+
+    fn probe_enables(fake: &ScriptedFake) -> usize {
+        fake.methods
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|mm| mm.as_str() == "Page.enable+params")
+            .count()
+    }
+
+    /// Single-send proof: on a session-death error the command goes out
+    /// exactly once, the corpse is dropped, and the caller gets the typed
+    /// stale-session error — whose prose owns the ambiguity ("may or may
+    /// not have executed", never "not sent"). The next call re-attaches
+    /// and recovers. Covers the strict session-gone shape AND the
+    /// ambiguous shapes: both send exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_death_sends_once_then_recovers() {
+        for msg in [
+            "Session with given id not found",
+            "Cannot find context with specified id",
+            "Target closed.",
+        ] {
+            let fake = scripted_fake(Some(msg.to_string())).await;
+            let inner = attach(&fake.ws_url).await.expect("attach over ws");
+            let b = wrap_attached(inner);
+            let before = probe_enables(&fake);
+            let r = b.command("Page.enable", json!({"probe": true}), true).await;
+            let e = r.expect_err("session death must surface, never silently resend");
+            assert!(
+                e.starts_with("stale session: "),
+                "typed stale-session error, got: {e}"
+            );
+            assert!(
+                e.contains("may or may not have executed") && !e.contains("not sent"),
+                "prose owns the ambiguity, got: {e}"
+            );
+            assert_eq!(
+                probe_enables(&fake) - before,
+                1,
+                "single send on session death ({msg}): the command went out exactly once"
+            );
+            assert!(
+                b.shared()
+                    .await
+                    .expect("shared")
+                    .session
+                    .lock()
+                    .await
+                    .is_none(),
+                "the corpse is invalidated ({msg})"
+            );
+            // The next call re-attaches and recovers.
+            let r2 = b.command("Page.enable", json!({"probe": true}), true).await;
+            assert!(r2.is_ok(), "next call recovers on a fresh session: {r2:?}");
+            b.close().await.expect("detach close");
+            for t in fake.tasks {
+                t.abort();
+            }
+        }
+    }
+
+    fn probe_evals(fake: &ScriptedFake) -> usize {
+        fake.methods
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|mm| mm.as_str() == "Runtime.evaluate+params")
+            .count()
+    }
+
+    /// Expression polls fail fast on session death: `wait_for_expression`
+    /// returns the stale-session error after a single eval instead of
+    /// polling the corpse until the budget burns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_expression_fails_fast_on_stale_session() {
+        let fake = scripted_fake(Some("Session with given id not found".to_string())).await;
+        let inner = attach(&fake.ws_url).await.expect("attach over ws");
+        let b = wrap_attached(inner);
+        let t0 = Instant::now();
+        let r = b.wait_for_expression("true", Duration::from_secs(10)).await;
+        let dt = t0.elapsed();
+        let e = r.expect_err("stale session must surface, never poll on");
+        assert!(
+            e.starts_with("stale session: "),
+            "typed stale-session error, got: {e}"
+        );
+        assert_eq!(
+            probe_evals(&fake),
+            1,
+            "a single eval, no polling on a corpse"
+        );
+        assert!(
+            dt < Duration::from_secs(2),
+            "prompt, not budget-burn: took {dt:?}"
+        );
+        b.close().await.expect("detach close");
+        for t in fake.tasks {
+            t.abort();
+        }
+    }
+
+    /// Expression continuity: a truthy result on a REPLACEMENT session must
+    /// not satisfy the original wait. Falsy polls latch S1; a mid-wait
+    /// detach re-attaches (S2) and the replacement answers truthy — the pin
+    /// must trip with stale_session instead of reporting success. Pre-fix
+    /// this returned ok on the wrong page.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_expression_rejects_truthy_on_replacement_session() {
+        let fake = scripted_fake(None).await;
+        script_evals(&fake, vec![false, false, false, true]);
+        let inner = attach(&fake.ws_url).await.expect("attach over ws");
+        let b = wrap_attached(inner);
+        let etx = fake.event_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if let Some(tx) = etx.lock().unwrap().clone() {
+                let _ = tx.send(json!({"method": "Target.detachedFromTarget",
+                    "params": {"sessionId": "S1", "targetId": "T1"}}));
+            }
+        });
+        let t0 = Instant::now();
+        let r = b.wait_for_expression("true", Duration::from_secs(10)).await;
+        let dt = t0.elapsed();
+        let e = r.expect_err("truthy on a replacement session must not satisfy the wait");
+        assert!(
+            e.starts_with("stale session: "),
+            "typed stale-session error, got: {e}"
+        );
+        assert!(
+            dt < Duration::from_secs(2),
+            "prompt, not budget burn: took {dt:?}"
+        );
+        b.close().await.expect("detach close");
+        for t in fake.tasks {
+            t.abort();
+        }
+    }
+
+    /// Wait continuity: a mid-wait detach stops the poll at once instead
+    /// of migrating onto the re-attached page. The engine answers every
+    /// evaluate falsy; 200ms into the wait a detachedFromTarget for the
+    /// live session lands: the next poll re-attaches elsewhere and the pin
+    /// trips. Pre-fix this burns the whole budget on the fresh page.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_expression_stops_on_mid_wait_detach() {
+        let fake = scripted_fake(None).await;
+        let inner = attach(&fake.ws_url).await.expect("attach over ws");
+        let b = wrap_attached(inner);
+        // Establish the session the wait pins (first poll latches S1).
+        assert!(b.eval("false").await.is_ok(), "session established");
+        // Detach it mid-wait: the reader clears the cache, the next poll
+        // re-attaches (S2) and the pin must trip instead of migrating.
+        let etx = fake.event_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if let Some(tx) = etx.lock().unwrap().clone() {
+                let _ = tx.send(json!({"method": "Target.detachedFromTarget",
+                    "params": {"sessionId": "S1", "targetId": "T1"}}));
+            }
+        });
+        let t0 = Instant::now();
+        let r = b
+            .wait_for_expression("false", Duration::from_secs(10))
+            .await;
+        let dt = t0.elapsed();
+        let e = r.expect_err("mid-wait detach must surface, never migrate");
+        assert!(
+            e.starts_with("stale session: "),
+            "typed stale-session error, got: {e}"
+        );
+        assert!(
+            dt < Duration::from_secs(2),
+            "prompt, not budget burn: took {dt:?}"
+        );
+        b.close().await.expect("detach close");
+        for t in fake.tasks {
+            t.abort();
+        }
+    }
+
+    /// Network-idle continuity: a dead session mid-wait stops the poll at
+    /// once instead of burning the budget. One request is held in flight
+    /// forever (no quiet window can complete); 200ms into the wait a
+    /// detachedFromTarget for the live session lands. Pre-fix this polled
+    /// until the budget expired and reported timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_network_idle_stops_on_dead_session() {
+        let fake = scripted_fake(None).await;
+        let inner = attach(&fake.ws_url).await.expect("attach over ws");
+        let b = wrap_attached(inner);
+        // Establish the session the wait pins (S1).
+        assert!(b.eval("1").await.is_ok(), "session established");
+        // Hold one request in flight forever: without session death this
+        // never goes idle.
+        b.shared()
+            .await
+            .expect("shared")
+            .net_inflight
+            .lock()
+            .await
+            .insert("R1-held".to_string());
+        // Detach it mid-wait: the reader clears the cache.
+        let etx = fake.event_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if let Some(tx) = etx.lock().unwrap().clone() {
+                let _ = tx.send(json!({"method": "Target.detachedFromTarget",
+                    "params": {"sessionId": "S1", "targetId": "T1"}}));
+            }
+        });
+        let t0 = Instant::now();
+        let mut pinned = None;
+        let r = b
+            .wait_network_idle(Duration::from_secs(5), Duration::from_secs(10), &mut pinned)
+            .await;
+        let dt = t0.elapsed();
+        let e = r.expect_err("dead session must surface, never burn budget");
+        assert!(
+            e.starts_with("stale session: "),
+            "typed stale-session error, got: {e}"
+        );
+        assert!(
+            dt < Duration::from_secs(2),
+            "prompt, not budget burn: took {dt:?}"
+        );
+        b.close().await.expect("detach close");
+        for t in fake.tasks {
+            t.abort();
+        }
+    }
+
     /// F5 proof: `wait_for_load(100ms)` against a never-answering peer must
     /// return in ~100ms, not after `send_raw`'s 30s per-call timeout. Pre-fix
     /// the eval is unwrapped, so this blocks ~30s and fails the bound below.
@@ -3288,9 +4438,7 @@ mod tests {
     async fn wait_for_load_respects_cap_on_dead_peer() {
         let rig = rig().await;
         let t0 = Instant::now();
-        rig.browser
-            .wait_for_load(Duration::from_millis(100))
-            .await;
+        rig.browser.wait_for_load(Duration::from_millis(100)).await;
         let dt = t0.elapsed();
         assert!(
             dt < Duration::from_secs(10),
@@ -3408,7 +4556,9 @@ mod tests {
                                 let n = ctr.fetch_add(1, Ordering::SeqCst);
                                 json!({"sessionId": format!("S{n}")})
                             }
-                            "Runtime.evaluate" => json!({"result": {"type": "string", "value": "fake"}}),
+                            "Runtime.evaluate" => {
+                                json!({"result": {"type": "string", "value": "fake"}})
+                            }
                             _ => json!({}),
                         };
                         let _ = ws
@@ -3429,7 +4579,7 @@ mod tests {
         let s1 = shared.session.lock().await.clone().expect("S1 tracked");
         assert_eq!(
             enable_sessions.lock().unwrap().as_slice(),
-            &[s1.clone()],
+            std::slice::from_ref(&s1),
             "first enable on the first session"
         );
         // Stale accounting from the old session must not survive the switch.
@@ -3504,7 +4654,8 @@ mod tests {
                 let rest = rig.browser.console_get(200).await;
                 assert_eq!(drain_count(&rest), 0, "ring must be empty at the end");
                 assert_eq!(
-                    returned, N as usize,
+                    returned,
+                    N as usize,
                     "atomic drain lost {} of {N} messages",
                     N as usize - returned
                 );
@@ -3606,7 +4757,9 @@ mod tests {
                                  "url": "about:blank", "title": "fake"}
                             ]}),
                             "Target.attachToTarget" => json!({"sessionId": "S1"}),
-                            "Runtime.evaluate" => json!({"result": {"type": "string", "value": "fake"}}),
+                            "Runtime.evaluate" => {
+                                json!({"result": {"type": "string", "value": "fake"}})
+                            }
                             _ => json!({}),
                         };
                         let _ = ws
@@ -3687,7 +4840,12 @@ mod tests {
     async fn external_sleeper() -> (u32, tokio::process::Child) {
         let mut std_cmd = std::process::Command::new("powershell");
         std_cmd
-            .args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 120"])
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 120",
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -3696,7 +4854,9 @@ mod tests {
             use std::os::windows::process::CommandExt;
             std_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
-        let child = Command::from(std_cmd).spawn().expect("spawn external sleeper");
+        let child = Command::from(std_cmd)
+            .spawn()
+            .expect("spawn external sleeper");
         let pid = child.id().expect("external sleeper pid");
         (pid, child)
     }
@@ -3755,8 +4915,7 @@ mod tests {
         // Canary: a dir only a sweep would remove. Nothing in the
         // attach+close path deletes anything, so survival proves the
         // ownership rule.
-        let canary =
-            std::env::temp_dir().join(format!("gladius-2147483646-canary-{}", ext_pid));
+        let canary = std::env::temp_dir().join(format!("gladius-2147483646-canary-{ext_pid}"));
         std::fs::create_dir_all(&canary).expect("plant canary");
         let inner = attach(&fake.ws_url).await.expect("attach");
         assert!(
@@ -3799,8 +4958,14 @@ mod tests {
     #[test]
     fn backend_caps_parse_accepts_only_known_values() {
         assert_eq!(parse_backend_caps("render").unwrap(), BackendCaps::Render);
-        assert_eq!(parse_backend_caps("dom-only").unwrap(), BackendCaps::DomOnly);
-        assert_eq!(parse_backend_caps("  DOM-ONLY ").unwrap(), BackendCaps::DomOnly);
+        assert_eq!(
+            parse_backend_caps("dom-only").unwrap(),
+            BackendCaps::DomOnly
+        );
+        assert_eq!(
+            parse_backend_caps("  DOM-ONLY ").unwrap(),
+            BackendCaps::DomOnly
+        );
         assert!(parse_backend_caps("").is_err());
         assert!(parse_backend_caps("bogus").is_err());
     }
@@ -3882,11 +5047,7 @@ mod tests {
             Some("about:blank"),
             "about:blank last: {argv:?}"
         );
-        for flag in [
-            "--headless",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ] {
+        for flag in ["--headless", "--no-first-run", "--no-default-browser-check"] {
             let n = argv.iter().filter(|a| a.as_str() == flag).count();
             assert_eq!(n, 1, "flag {flag} must appear exactly once: {argv:?}");
         }
@@ -3940,11 +5101,8 @@ mod tests {
     /// that never falls back to any ambient, shared, or system browser.
     #[test]
     fn chromium_resolution_order_and_missing_error() {
-        let (_lock, _env) = EnvGuard::hold(&[
-            "GLADIUS_CHROMIUM",
-            "GLADIUS_CHROMIUM_CACHE",
-            "LOCALAPPDATA",
-        ]);
+        let (_lock, _env) =
+            EnvGuard::hold(&["GLADIUS_CHROMIUM", "GLADIUS_CHROMIUM_CACHE", "LOCALAPPDATA"]);
         // Explicit override pointing nowhere: names the script.
         std::env::set_var(
             "GLADIUS_CHROMIUM",

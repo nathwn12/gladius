@@ -123,6 +123,122 @@ fn is_error(v: &Value) -> bool {
     v.get("isError").is_some()
 }
 
+/// Live `outputSchema` table for one client (`tools/list`, no browser needed).
+fn schemas_map(c: &mut Client) -> std::collections::HashMap<String, Value> {
+    let listed = c.result("tools/list", json!({}));
+    let mut m = std::collections::HashMap::new();
+    for t in listed
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
+        if let Some(n) = t.get("name").and_then(|n| n.as_str()) {
+            if let Some(s) = t.get("outputSchema") {
+                m.insert(n.to_string(), s.clone());
+            }
+        }
+    }
+    assert_eq!(m.len(), 22, "22 outputSchemas listed");
+    m
+}
+
+fn json_type_ok(v: &Value, t: &str) -> bool {
+    match t {
+        "string" => v.is_string(),
+        "boolean" => v.is_boolean(),
+        "integer" => v.is_i64() || v.is_u64(),
+        "number" => v.is_number(),
+        "array" => v.is_array(),
+        "object" => v.is_object(),
+        "null" => v.is_null(),
+        _ => true,
+    }
+}
+
+/// G2b: a success `structuredContent` validates against its tool
+/// `outputSchema`. Plain object schema: every `required` key exists with the
+/// right top-level type (a `{}` property or one missing from `properties`
+/// accepts any type). `anyOf`/`oneOf` (snapshot AX/text, targets
+/// list/select): at least one branch's required keys/types hold. Optional
+/// fields are ignored.
+fn assert_required(tool: &str, sc: &Value, schema: &Value) {
+    assert!(
+        sc.is_object(),
+        "{tool} structuredContent is an object: {sc}"
+    );
+    let props = schema.get("properties").and_then(|p| p.as_object());
+    let holds = |keys: &[Value]| -> bool {
+        keys.iter().all(|k| {
+            let key = k.as_str().unwrap_or("");
+            match sc.get(key) {
+                None => false,
+                Some(v) => {
+                    let want = props
+                        .and_then(|p| p.get(key))
+                        .and_then(|p| p.get("type"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+                    want.is_empty() || json_type_ok(v, want)
+                }
+            }
+        })
+    };
+    let top: Vec<Value> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut branches: Vec<&Value> = Vec::new();
+    for k in ["anyOf", "oneOf"] {
+        if let Some(arr) = schema.get(k).and_then(|a| a.as_array()) {
+            branches.extend(arr.iter());
+        }
+    }
+    if branches.is_empty() {
+        for k in &top {
+            let key = k.as_str().unwrap_or("");
+            let v = sc.get(key).unwrap_or_else(|| {
+                panic!("{tool} structuredContent missing required '{key}': {sc}")
+            });
+            let want = props
+                .and_then(|p| p.get(key))
+                .and_then(|p| p.get("type"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            if !want.is_empty() {
+                assert!(
+                    json_type_ok(v, want),
+                    "{tool} required '{key}' type {want}: {sc}"
+                );
+            }
+        }
+        return;
+    }
+    assert!(
+        branches.iter().any(|b| {
+            let keys: Vec<Value> = b
+                .get("required")
+                .and_then(|r| r.as_array())
+                .cloned()
+                .unwrap_or_default();
+            !keys.is_empty() && holds(&keys)
+        }),
+        "{tool} structuredContent matches no anyOf/oneOf branch: {sc}"
+    );
+}
+
+/// No success-only keys may leak onto a tool error envelope.
+fn assert_no_success_keys(v: &Value) {
+    let sc = structured(v);
+    for k in [
+        "ok", "value", "result", "url", "tabs", "nodes", "messages", "entries", "text", "bytes",
+        "policy", "readback", "targets", "frames", "cap", "mode", "chars", "files",
+    ] {
+        assert!(sc.get(k).is_none(), "error has no success key '{k}': {v}");
+    }
+}
+
 fn shutdown(c: Client) {
     drop(c.stdin);
     let mut child = c.child;
@@ -171,18 +287,6 @@ fn find_ref(snap: &str, needle: &str) -> String {
         }
     }
     panic!("no ref found for {needle:?} in snapshot:\n{snap}");
-}
-
-/// `{"value":"eN"}` evaluate text -> `@eN`.
-fn value_to_ref(t: &str) -> String {
-    let id: String = t
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect::<String>()
-        .trim_start_matches("value")
-        .to_string();
-    assert!(!id.is_empty() && id != "NOREF", "stamped ref present: {t}");
-    format!("@{id}")
 }
 
 /// Refs (`@eN`) carried by the human text block, in order (node lines only).
@@ -356,27 +460,40 @@ fn error_codes_not_actionable() {
         "hover-hidden code"
     );
 
-    // Ref paths: hidden click and non-select select.
+    // Ref paths (G3b AX semantics): the default snapshot stamps no hidden
+    // node, so the hidden ref comes from the legacy table; a fresh default
+    // snapshot drops that table and the old ref is a typed stale_ref.
+    // Non-select select still types not_select.
     let snap = content_text(&c.call("snapshot", json!({})));
-    let rhid_raw = content_text(&c.call(
-        "evaluate",
-        json!({"expression": "document.getElementById('hidden-box').dataset.gladiusRef || 'NOREF'"}),
-    ));
-    let rhid = value_to_ref(&rhid_raw);
+    assert!(
+        !snap
+            .lines()
+            .any(|l| l.starts_with("- ") && l.contains("HIDDEN")),
+        "default carries no hidden node line:\n{snap}"
+    );
+    let leg = content_text(&c.call("snapshot", json!({"mode": "legacy"})));
+    assert!(
+        leg.lines()
+            .any(|l| l.starts_with("- ") && l.contains("HIDDEN")),
+        "legacy still stamps the hidden node:\n{leg}"
+    );
+    let rhid = find_ref(&leg, "\"HIDDEN\"");
+    let _ = c.call("snapshot", json!({}));
     let hidr = c.call("click", json!({"element": rhid}));
-    assert!(is_error(&hidr), "click hidden-by-ref isError: {hidr}");
+    assert!(is_error(&hidr), "click old-hidden-ref isError: {hidr}");
     assert_eq!(
         content_text(&hidr),
-        format!("click: {rhid} not visible or not clickable"),
-        "click-hidden-ref prose byte-identical"
+        format!("stale ref: click: unknown ref {rhid} (no such ref; take a fresh snapshot)"),
+        "click-old-hidden-ref prose byte-identical"
     );
     assert_eq!(
         structured(&hidr),
-        json!({"code": "not_actionable", "reason": "hidden",
+        json!({"code": "stale_ref", "reason": "unknown",
                "tool": "click", "ref": rhid}),
-        "click-hidden-ref code"
+        "click-old-hidden-ref code"
     );
-    let rbtn = find_ref(&snap, "CLICK_ME");
+    let snap2 = content_text(&c.call("snapshot", json!({})));
+    let rbtn = find_ref(&snap2, "CLICK_ME");
     let nsel = c.call("select", json!({"element": rbtn, "value": "r"}));
     assert!(is_error(&nsel), "select non-select isError: {nsel}");
     assert_eq!(
@@ -582,7 +699,8 @@ fn snapshot_structured_blocks() {
 
 #[test]
 fn capabilities_manifest() {
-    // Default backend: count 21, nothing gated, serverInfo untouched.
+    // Default backend: exact tools-only capabilities; count 22, nothing
+    // gated under serverInfo; backend/caps extras remain in serverInfo.
     let mut c = Client::spawn();
     let init = c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     assert_eq!(
@@ -590,45 +708,59 @@ fn capabilities_manifest() {
         Some(&json!("2025-06-18")),
         "protocolVersion echo"
     );
-    let caps = init
-        .get("capabilities")
-        .and_then(|cc| cc.get("tools"))
-        .expect("capabilities.tools");
-    assert_eq!(caps.get("count"), Some(&json!(21)), "tool count: {init}");
-    assert_eq!(caps.get("gated"), Some(&json!({})), "nothing gated: {init}");
+    assert_eq!(
+        init.get("capabilities"),
+        Some(&json!({"tools": {"listChanged": false}})),
+        "exact tools-only capabilities: {init}"
+    );
+    let info = init.get("serverInfo").expect("serverInfo present");
+    assert_eq!(info.get("count"), Some(&json!(22)), "tool count: {init}");
+    assert_eq!(info.get("gated"), Some(&json!({})), "nothing gated: {init}");
     let listed = c.result("tools/list", json!({}));
     let n = listed
         .get("tools")
         .and_then(|t| t.as_array())
         .expect("tools array")
         .len();
-    assert_eq!(n, 21, "listed tools match the manifest count");
+    assert_eq!(n, 22, "listed tools match the serverInfo count");
     assert_eq!(
-        caps.get("count"),
+        info.get("count"),
         Some(&json!(n)),
-        "manifest count is derived"
+        "serverInfo count is derived"
     );
     assert_eq!(
         init.get("serverInfo").and_then(|s| s.get("name")),
         Some(&json!("gladius")),
         "serverInfo name untouched: {init}"
     );
+    assert_eq!(
+        init.get("serverInfo").and_then(|s| s.get("backend")),
+        Some(&json!("chromium")),
+        "serverInfo backend: {init}"
+    );
+    assert_eq!(
+        init.get("serverInfo").and_then(|s| s.get("caps")),
+        Some(&json!("render")),
+        "serverInfo caps: {init}"
+    );
     shutdown(c);
 
     // dom-only backend: screenshot gated, and the refusal is typed.
     let mut d = Client::spawn_extra(&[("GLADIUS_BACKEND_CAPS", "dom-only")]);
     let init2 = d.result("initialize", json!({"protocolVersion": "2025-06-18"}));
-    let caps2 = init2
-        .get("capabilities")
-        .and_then(|cc| cc.get("tools"))
-        .expect("capabilities.tools");
     assert_eq!(
-        caps2.get("count"),
-        Some(&json!(21)),
+        init2.get("capabilities"),
+        Some(&json!({"tools": {"listChanged": false}})),
+        "exact tools-only capabilities: {init2}"
+    );
+    let info2 = init2.get("serverInfo").expect("serverInfo present");
+    assert_eq!(
+        info2.get("count"),
+        Some(&json!(22)),
         "dom-only count: {init2}"
     );
     assert_eq!(
-        caps2.get("gated"),
+        info2.get("gated"),
         Some(&json!({"screenshot": "requires caps: render"})),
         "screenshot gated: {init2}"
     );
@@ -636,6 +768,11 @@ fn capabilities_manifest() {
         init2.get("serverInfo").and_then(|s| s.get("name")),
         Some(&json!("gladius")),
         "serverInfo name untouched: {init2}"
+    );
+    assert_eq!(
+        init2.get("serverInfo").and_then(|s| s.get("caps")),
+        Some(&json!("dom-only")),
+        "serverInfo caps: {init2}"
     );
     let shot = d.call("screenshot", json!({}));
     assert!(is_error(&shot), "dom-only screenshot refuses: {shot}");
@@ -903,16 +1040,19 @@ fn capabilities_invalid_caps() {
     let mut c = Client::spawn_extra(&[("GLADIUS_BACKEND_CAPS", "invalid")]);
     let init = c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     assert_eq!(
+        init.get("capabilities"),
+        Some(&json!({"tools": {"listChanged": false}})),
+        "exact tools-only capabilities: {init}"
+    );
+    assert_eq!(
         init.get("serverInfo").and_then(|s| s.get("caps")),
         Some(&json!("invalid")),
         "invalid caps reported: {init}"
     );
-    let caps = init
-        .get("capabilities")
-        .and_then(|cc| cc.get("tools"))
-        .expect("capabilities.tools");
+    let info = init.get("serverInfo").expect("serverInfo present");
+    assert_eq!(info.get("count"), Some(&json!(22)), "tool count: {init}");
     assert_eq!(
-        caps.get("gated"),
+        info.get("gated"),
         Some(&json!({"screenshot": "requires caps: render"})),
         "invalid caps gate screenshot: {init}"
     );
@@ -981,6 +1121,322 @@ fn upload_ref_disabled_reports_ref() {
                "tool": "upload", "element": "#disabled-btn"}),
         "upload-disabled-selector code"
     );
+
+    finish(c);
+}
+
+/// One-shot localhost HTTP server for browser-free fetch_text (std only).
+fn serve_once(body: &'static str) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind localhost");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        for _ in 0..4 {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            use std::io::Read;
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use std::io::Write;
+            let _ = s.write_all(resp.as_bytes());
+        }
+    });
+    port
+}
+
+#[test]
+fn success_close_fetch_browser_free() {
+    // No browser needed: close works with no engine, fetch_text uses a
+    // loopback HTTP server (plain HTTP, no browser).
+    let mut c = Client::spawn();
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+    let schemas = schemas_map(&mut c);
+    let closed = c.call("close", json!({}));
+    assert!(closed.get("isError").is_none(), "close ok: {closed}");
+    assert_eq!(
+        content_text(&closed),
+        "{\"ok\":true}",
+        "close text byte-identical"
+    );
+    assert_eq!(
+        structured(&closed),
+        json!({"ok": true}),
+        "close structuredContent"
+    );
+    assert_required("close", &structured(&closed), &schemas["close"]);
+
+    let port = serve_once(
+        "<!doctype html><html><body><h1>FETCH_G2B marker-123</h1><script>var hidden_xyz=1;</script></body></html>",
+    );
+    let fetched = c.call(
+        "fetch_text",
+        json!({"url": format!("http://127.0.0.1:{port}/")}),
+    );
+    assert!(fetched.get("isError").is_none(), "fetch_text ok: {fetched}");
+    let t = content_text(&fetched);
+    assert!(t.contains("FETCH_G2B marker-123"), "fetch body: {t}");
+    assert!(!t.contains('<'), "fetch strips tags: {t}");
+    let sc = structured(&fetched);
+    assert_eq!(
+        sc.get("text").and_then(|v| v.as_str()),
+        Some(t.as_str()),
+        "fetch structured text matches prose"
+    );
+    assert!(
+        sc.get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .contains(&port.to_string()),
+        "fetch structured url: {sc}"
+    );
+    assert_eq!(
+        sc.get("chars").and_then(|v| v.as_i64()),
+        Some(t.chars().count() as i64),
+        "fetch structured chars"
+    );
+    assert_required("fetch_text", &structured(&fetched), &schemas["fetch_text"]);
+    shutdown(c);
+}
+
+#[test]
+fn success_snapshot_structured_equals_block2() {
+    let mut c = launch_on_fixture();
+    let schemas = schemas_map(&mut c);
+    let snap = c.call("snapshot", json!({}));
+    assert!(!is_error(&snap), "snapshot ok: {snap}");
+    let blocks = snap
+        .get("content")
+        .and_then(|cc| cc.as_array())
+        .expect("content array");
+    assert_eq!(blocks.len(), 2, "AX snapshot two blocks");
+    let b2 = blocks[1].get("text").and_then(|t| t.as_str()).unwrap_or("");
+    let parsed: Value = serde_json::from_str(b2).expect("block2 parses");
+    assert_eq!(structured(&snap), parsed, "structuredContent equals block2");
+    for k in ["url", "title", "truncated", "nodes"] {
+        assert!(
+            structured(&snap).get(k).is_some(),
+            "snapshot structured has '{k}'"
+        );
+    }
+    assert_required("snapshot", &structured(&snap), &schemas["snapshot"]);
+    // Text mode: single prose block + structured {mode,text}.
+    let txt = c.call("snapshot", json!({"mode": "text"}));
+    assert!(!is_error(&txt), "text snapshot ok: {txt}");
+    let tblocks = txt
+        .get("content")
+        .and_then(|cc| cc.as_array())
+        .expect("content array");
+    assert_eq!(tblocks.len(), 1, "text mode one block");
+    let prose = content_text(&txt);
+    let sc = structured(&txt);
+    assert_eq!(sc.get("mode"), Some(&json!("text")), "text structured mode");
+    assert_eq!(
+        sc.get("text").and_then(|v| v.as_str()),
+        Some(prose.as_str()),
+        "text structured text matches prose"
+    );
+    assert_required("snapshot", &structured(&txt), &schemas["snapshot"]);
+    finish(c);
+}
+
+#[test]
+fn success_screenshot_image_text_structured() {
+    let mut c = launch_on_fixture();
+    let schemas = schemas_map(&mut c);
+    let shot = c.call("screenshot", json!({}));
+    assert!(!is_error(&shot), "screenshot ok: {shot}");
+    let blocks = shot
+        .get("content")
+        .and_then(|cc| cc.as_array())
+        .expect("content array");
+    assert_eq!(blocks.len(), 2, "screenshot image + text: {shot}");
+    assert_eq!(
+        blocks[0].get("type").and_then(|t| t.as_str()),
+        Some("image"),
+        "first block image"
+    );
+    let data = blocks[0].get("data").and_then(|d| d.as_str()).unwrap_or("");
+    assert!(data.len() > 1000, "non-empty png base64");
+    let t2 = blocks[1].get("text").and_then(|t| t.as_str()).unwrap_or("");
+    assert!(!t2.contains("iVBORw0KGgo"), "no base64 in text block");
+    let meta: Value = serde_json::from_str(t2).expect("text block parses");
+    assert_eq!(
+        meta.get("mimeType"),
+        Some(&json!("image/png")),
+        "text mimeType"
+    );
+    let n = meta
+        .get("bytes")
+        .and_then(|v| v.as_i64())
+        .expect("bytes present");
+    assert!(n > 1000, "bytes plausible: {n}");
+    assert_eq!(structured(&shot), meta, "structured equals text meta");
+    assert!(
+        !structured(&shot).to_string().contains("iVBORw0KGgo"),
+        "no base64 in structuredContent"
+    );
+    assert_required("screenshot", &structured(&shot), &schemas["screenshot"]);
+    finish(c);
+}
+
+#[test]
+fn success_shapes_validate_errors_clean() {
+    let mut c = launch_on_fixture();
+    let schemas = schemas_map(&mut c);
+    // Every JSON-text success parses and its structuredContent equals it.
+    for (name, args) in [
+        ("navigate", json!({"url": fixture_url()})),
+        ("history", json!({"action": "reload"})),
+        ("tabs", json!({"action": "list"})),
+        ("targets", json!({"action": "list"})),
+        ("dialog", json!({"action": "get"})),
+        ("network", json!({"action": "get"})),
+        ("console", json!({"action": "get"})),
+        ("evaluate", json!({"expression": "1+1"})),
+        ("wait_for", json!({"ms": 0})),
+        ("viewport", json!({"width": 800, "height": 600})),
+    ] {
+        let r = c.call(name, args);
+        assert!(!is_error(&r), "{name} ok: {r}");
+        let t = content_text(&r);
+        let parsed: Value =
+            serde_json::from_str(&t).unwrap_or_else(|_| panic!("{name} text parses: {t}"));
+        assert_eq!(
+            structured(&r),
+            parsed,
+            "{name} structured equals text parse"
+        );
+        assert_required(name, &structured(&r), &schemas[name]);
+    }
+    // upload success shape (fixture has no file input; add one live).
+    let existing = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")).replace('\\', "/");
+    c.call("evaluate", json!({"expression": "document.body.insertAdjacentHTML('beforeend', '<input type=file id=upfile>'); 'added'"}));
+    let up = c.call("upload", json!({"element": "#upfile", "paths": [existing]}));
+    assert!(!is_error(&up), "upload ok: {up}");
+    let ut = content_text(&up);
+    let uparsed: Value = serde_json::from_str(&ut).expect("upload text parses");
+    assert_eq!(structured(&up), uparsed, "upload structured equals text");
+    assert_eq!(uparsed.get("ok"), Some(&json!(true)), "upload ok");
+    assert_required("upload", &structured(&up), &schemas["upload"]);
+    // Errors never gain success keys.
+    let bad = c.call("no-such-tool-xyz", json!({}));
+    assert!(is_error(&bad), "unknown tool isError");
+    assert_no_success_keys(&bad);
+    finish(c);
+}
+
+/// G2b: the six interaction/escape-hatch tools carry explicit
+/// structured-success assertions: text parses, `structuredContent` equals
+/// the parse, the `outputSchema` required keys/types hold, no `isError` —
+/// plus an error path proving no success keys leak.
+#[test]
+fn success_interaction_tools_structured() {
+    let mut c = launch_on_fixture();
+    let schemas = schemas_map(&mut c);
+
+    // click on the fixture toggle.
+    let clk = c.call("click", json!({"element": "#toggle"}));
+    assert!(!is_error(&clk), "click ok: {clk}");
+    assert_eq!(
+        structured(&clk),
+        serde_json::from_str::<Value>(&content_text(&clk)).expect("click text parses"),
+        "click structured equals text"
+    );
+    assert_required("click", &structured(&clk), &schemas["click"]);
+    let clk_miss = c.call("click", json!({"element": "#no-such-element-xyz"}));
+    assert!(is_error(&clk_miss), "click miss isError: {clk_miss}");
+    assert_no_success_keys(&clk_miss);
+
+    // type into the fixture input.
+    let typ = c.call("type", json!({"element": "#name", "text": "hello-42"}));
+    assert!(!is_error(&typ), "type ok: {typ}");
+    assert_eq!(
+        structured(&typ),
+        serde_json::from_str::<Value>(&content_text(&typ)).expect("type text parses"),
+        "type structured equals text"
+    );
+    assert_required("type", &structured(&typ), &schemas["type"]);
+    let typ_miss = c.call(
+        "type",
+        json!({"element": "#no-such-element-xyz", "text": "x"}),
+    );
+    assert!(is_error(&typ_miss), "type miss isError: {typ_miss}");
+    assert_no_success_keys(&typ_miss);
+
+    // hover the fixture toggle (visible target).
+    let hov = c.call("hover", json!({"element": "#toggle"}));
+    assert!(!is_error(&hov), "hover ok: {hov}");
+    assert_eq!(
+        structured(&hov),
+        serde_json::from_str::<Value>(&content_text(&hov)).expect("hover text parses"),
+        "hover structured equals text"
+    );
+    assert_required("hover", &structured(&hov), &schemas["hover"]);
+    let hov_hid = c.call("hover", json!({"element": "#hidden-box"}));
+    assert!(is_error(&hov_hid), "hover hidden isError: {hov_hid}");
+    assert_eq!(
+        structured(&hov_hid).get("code"),
+        Some(&json!("not_actionable")),
+        "hover hidden code: {hov_hid}"
+    );
+    assert_no_success_keys(&hov_hid);
+
+    // select the Green option by value.
+    let sel = c.call("select", json!({"element": "#color", "value": "g"}));
+    assert!(!is_error(&sel), "select ok: {sel}");
+    assert_eq!(
+        structured(&sel),
+        serde_json::from_str::<Value>(&content_text(&sel)).expect("select text parses"),
+        "select structured equals text"
+    );
+    assert_required("select", &structured(&sel), &schemas["select"]);
+    let sel_bad = c.call(
+        "select",
+        json!({"element": "#color", "value": "no-such-opt-xyz"}),
+    );
+    assert!(is_error(&sel_bad), "select bad-option isError: {sel_bad}");
+    assert_eq!(
+        structured(&sel_bad).get("code"),
+        Some(&json!("option_not_found")),
+        "select bad-option code: {sel_bad}"
+    );
+    assert_no_success_keys(&sel_bad);
+
+    // key press on the focused element (Escape is a safe no-op here).
+    let key = c.call("key", json!({"key": "Escape"}));
+    assert!(!is_error(&key), "key ok: {key}");
+    assert_eq!(
+        structured(&key),
+        serde_json::from_str::<Value>(&content_text(&key)).expect("key text parses"),
+        "key structured equals text"
+    );
+    assert_required("key", &structured(&key), &schemas["key"]);
+    let key_bad = c.call("key", json!({"key": "not-a-real-key-xyz"}));
+    assert!(is_error(&key_bad), "key unknown isError: {key_bad}");
+    assert_eq!(
+        structured(&key_bad).get("code"),
+        Some(&json!("invalid_args")),
+        "key unknown code: {key_bad}"
+    );
+    assert_no_success_keys(&key_bad);
+
+    // cdp escape hatch on a read-only browser-level method.
+    let cdp = c.call("cdp", json!({"method": "Browser.getVersion"}));
+    assert!(!is_error(&cdp), "cdp ok: {cdp}");
+    assert_eq!(
+        structured(&cdp),
+        serde_json::from_str::<Value>(&content_text(&cdp)).expect("cdp text parses"),
+        "cdp structured equals text"
+    );
+    assert_required("cdp", &structured(&cdp), &schemas["cdp"]);
+    let cdp_bad = c.call("cdp", json!({"method": "NoSuchDomain.noSuchMethod"}));
+    assert!(is_error(&cdp_bad), "cdp bad-method isError: {cdp_bad}");
+    assert_no_success_keys(&cdp_bad);
 
     finish(c);
 }

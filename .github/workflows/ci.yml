@@ -6,6 +6,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   build:
     runs-on: windows-latest
@@ -19,7 +25,21 @@ jobs:
       # major the repo's other workflows already use. v4 is Node-20 and the
       # runner annotates its deprecation.
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to the crate MSRV (1.88.0, same as rust-toolchain.toml and the
+      # release workflow), with the fmt + clippy components the gates need.
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt, clippy
+      # Cargo registry + build cache (keyed on the lockfile): keeps the
+      # typical run inside the <5 min budget.
+      - name: restore cargo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-1.88.0-${{ hashFiles('Cargo.lock') }}
       # Read the pinned browser version + zip sha256 out of the integrity
       # root (scripts/chromium-manifest.json) so the cache key below names
       # the exact pin: it changes if and only if the pin changes.
@@ -53,5 +73,10 @@ jobs:
           path: ${{ runner.temp }}\gladius-chromium
           key: chromium-win64-${{ steps.browser-pin.outputs.version }}-${{ steps.browser-pin.outputs.sha256 }}
       - run: powershell -ExecutionPolicy Bypass -File scripts/fetch-chromium.ps1
-      - run: cargo build --locked
+      # Gates (same set as the G6 gate list, cheapest first).
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo build --release --locked
       - run: cargo test --locked
+      # End-to-end against the just-provisioned browser.
+      - run: target\release\gladius.exe selftest

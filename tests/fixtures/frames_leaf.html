@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head><title>Gladius Nested Leaf</title></head>
+<body>
+<h1>LEAF_MARKER_66666</h1>
+<button id="n-btn">NESTED_CLICK_ME</button>
+<p id="n-result">NEST_NOT_CLICKED</p>
+<p id="n-events"></p>
+<p id="n-trusted"></p>
+<script>
+// Recorder state mirrored into DOM (isolated worlds share DOM, not JS globals).
+window.__nClickEvents = [];
+window.__nClickTrusted = [];
+(function () {
+  var b = document.getElementById('n-btn');
+  ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function (t) {
+    b.addEventListener(t, function (e) {
+      window.__nClickEvents.push(t);
+      window.__nClickTrusted.push(!!e.isTrusted);
+      if (t === 'click') document.getElementById('n-result').textContent = 'NEST_CLICKED_OK';
+      document.getElementById('n-events').textContent = window.__nClickEvents.join(',');
+      document.getElementById('n-trusted').textContent = JSON.stringify(window.__nClickTrusted);
+    });
+  });
+})();
+</script>
+<div id="n-hover" style="margin-top:20px; padding:10px; border:1px solid #999;">NESTED_HOVER_ME</div>
+<p id="n-hover-result">NEST_NOT_HOVERED</p>
+<script>
+(function () {
+  var h = document.getElementById('n-hover');
+  h.addEventListener('mouseover', function () { document.getElementById('n-hover-result').textContent = 'NEST_HOVERED_OK'; });
+})();
+</script>
+</body>
+</html>

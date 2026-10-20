@@ -1,0 +1,65 @@
+<!doctype html>
+<html>
+<head><title>Gladius Frames Child</title></head>
+<body>
+<h1>FRAMES_CHILD_MARKER_44444</h1>
+<button id="f-btn">FRAME_CLICK_ME</button>
+<p id="f-result">FRAME_NOT_CLICKED</p>
+<p id="f-events"></p>
+<p id="f-trusted"></p>
+<script>
+// Recorder state is mirrored into DOM nodes (#f-events, #f-trusted): action
+// tools evaluate in an isolated world whose `window` is NOT the frame's main
+// world, so main-world JS expandos are invisible to them while the shared DOM
+// reads fine.
+window.__fClickEvents = [];
+window.__fClickTrusted = [];
+(function () {
+  var b = document.getElementById('f-btn');
+  ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function (t) {
+    b.addEventListener(t, function (e) {
+      window.__fClickEvents.push(t);
+      window.__fClickTrusted.push(!!e.isTrusted);
+      if (t === 'click') document.getElementById('f-result').textContent = 'FRAME_CLICKED_OK';
+      document.getElementById('f-events').textContent = window.__fClickEvents.join(',');
+      document.getElementById('f-trusted').textContent = JSON.stringify(window.__fClickTrusted);
+    });
+  });
+})();
+</script>
+<input id="f-input" type="text" value="FRAME-AAA-BEFORE">
+<p id="f-type-trusted"></p>
+<p id="f-type-count">0</p>
+<script>
+(function () {
+  var i = document.getElementById('f-input');
+  i.addEventListener('input', function (e) {
+    document.getElementById('f-type-trusted').textContent = String(!!e.isTrusted);
+    var c = document.getElementById('f-type-count');
+    c.textContent = String((parseInt(c.textContent || '0', 10) || 0) + 1);
+  });
+})();
+</script>
+<div id="f-hover" style="margin-top:20px; padding:10px; border:1px solid #999;">FRAME_HOVER_ME</div>
+<p id="f-hover-result">FRAME_NOT_HOVERED</p>
+<script>
+(function () {
+  var h = document.getElementById('f-hover');
+  h.addEventListener('mouseover', function () { document.getElementById('f-hover-result').textContent = 'FRAME_HOVERED_OK'; });
+})();
+</script>
+<select id="f-select">
+<option value="a">Alpha</option>
+<option value="b">Beta</option>
+<option value="c">Gamma</option>
+</select>
+<p id="f-select-result">FRAME_SELECT_NONE</p>
+<script>
+(function () {
+  var s = document.getElementById('f-select');
+  s.addEventListener('change', function () { document.getElementById('f-select-result').textContent = 'FRAME_SELECTED:' + s.value; });
+})();
+</script>
+<input id="f-file" type="file">
+</body>
+</html>

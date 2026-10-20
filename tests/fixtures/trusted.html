@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head><title>Gladius Trusted Fixture</title></head>
+<body>
+<h1 id="marker">GLADIUS_TRUSTED_MARKER_67890</h1>
+<button id="trusted-btn">TRUSTED_CLICK_ME</button>
+<p id="trusted-result">NOT_CLICKED</p>
+<script>
+window.__clickEvents = [];
+window.__clickTrusted = [];
+(function () {
+  var b = document.getElementById('trusted-btn');
+  ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach(function (t) {
+    b.addEventListener(t, function (e) {
+      window.__clickEvents.push(t);
+      window.__clickTrusted.push(!!e.isTrusted);
+      if (t === 'click') document.getElementById('trusted-result').textContent = 'CLICKED_OK';
+    });
+  });
+})();
+</script>
+<div id="occl-wrap" style="position:relative; margin-top:40px;">
+<button id="victim" onclick="document.getElementById('victim-result').textContent='VICTIM_CLICKED'">VICTIM</button>
+<div id="cover" style="position:absolute; left:0; top:0; width:200px; height:60px; background:rgba(255,0,0,0.9); z-index:10;">COVER</div>
+</div>
+<p id="victim-result">NOT_CLICKED</p>
+<input id="t-input" type="text" value="AAA-BEFORE">
+<script>
+window.__typeTrusted = null;
+window.__typeCount = 0;
+(function () {
+  var i = document.getElementById('t-input');
+  i.addEventListener('input', function (e) { window.__typeTrusted = !!e.isTrusted; window.__typeCount++; });
+})();
+</script>
+<div id="ce" contenteditable="true" style="border:1px solid #999; padding:8px;">CE_BEFORE <b id="ce-bold">BOLD_PART</b> tail</div>
+<p id="ce-sibling">SIBLING_KEEP</p>
+<script>
+window.__ceTrusted = null;
+(function () {
+  var ce = document.getElementById('ce');
+  ce.addEventListener('input', function (e) { window.__ceTrusted = !!e.isTrusted; });
+})();
+</script>
+<input id="f-file" type="file">
+<input id="f-date" type="date" value="">
+</body>
+</html>

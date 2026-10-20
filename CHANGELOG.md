@@ -4,75 +4,61 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [0.3.0] - 2026-10-18
-
-- Full-fledged browser tooling: 16 tools -> 21, schemas backward-compatible
-  (every addition is optional; existing callers are unaffected).
-- New `targets` tool: every CDP target with its stable id (pages, workers of
-  all kinds) plus the active page's frame tree (main + nested iframes, each
-  with its frameId), and `select` to make a page target current by id.
-- Target-scoped `evaluate`: optional `target` (CDP targetId: page,
-  dedicated/shared worker, service worker) and `frame` (CDP frameId:
-  isolated-world eval, works cross-origin) route `Runtime.evaluate` to that
-  realm; the tracked active page is untouched. Worker realms answer ONLY on
-  their auto-attach event session (a direct attach returns a session whose
-  commands hang on this engine, measured): page sessions auto-attach
-  (session-scoped `Target.setAutoAttach`, no pausing) and the reader records
-  `Target.attachedToTarget` targetId -> sessionId for the route.
-- Fail loud: unknown arguments are rejected with typed
-  `invalid_args`/`unknown_arg` on every tool (new reason in the closed code
-  set), never silently ignored - the shape that once routed evaluations to
-  the wrong realm with no error.
-- `wait_for` gains an `expression` predicate form: polls a computed JS
-  condition on the active page with backoff inside the shared hard deadline;
-  expiry is the typed timeout, a throwing condition is a real error.
-- New `dialog` tool: policy (`accept` + optional `promptText`, default
-  accept) applied by the reader's auto-handler plus the last recorded dialog
-  (`type`/`message`/`url`). Covers alert/confirm/prompt/beforeunload; a
-  session can never deadlock on a dialog. beforeunload needs sticky
-  activation to fire on this engine (trusted input first).
-- New `history` tool: back/forward/reload on the active page, returning the
-  live url+title after the load settle; a step past the boundary is a typed
-  error, never a silent no-op.
-- New `network` tool: observable capture (method/url/status/resource type/
-  timing, cap 500) with get/drain/clear and a url-substring filter. The
-  Network domain arms lazily on first `network` use (any action, including
-  `clear`); drain removes only the returned entries.
-- New `cdp` tool: raw `{method, params, session?}` escape hatch returning the
-  raw CDP result; a CDP error reply is a tool error, never a protocol error.
-- Main-thread stack: `mcp`/`selftest` now run on a runtime worker instead of
-  the 1 MB PE main-thread stack the block_on polled them on (a cold launch
-  overflowed main deterministically on one build and ran clean on the next;
-  the depth, not the code, was at the edge).
-- Version bump 0.2.1 -> 0.3.0 (`Cargo.toml` + `npm/package.json` in step).
-  NOT published: the harness keeps consuming `gladius-mcp@latest` until an
-  owner-named publish happens.
-
-## [0.2.1] - 2026-10-17
-
-- Engine swap: Obscura is gone. Gladius drives the owned pinned Chromium
-  (`chrome-headless-shell` `155.0.8059.84`, headless-only, no headed path)
-  provisioned by `scripts/fetch-chromium.ps1` into
-  `%LOCALAPPDATA%\gladius\chromium\` (overridable via
-  `GLADIUS_CHROMIUM_CACHE`, explicit binary via `GLADIUS_CHROMIUM`).
-  `initialize` reports `serverInfo.backend` `chromium`. JS dialogs are real
-  (auto-accepted and reported) and the `console` tool's `Log.entryAdded` leg
-  is live. `scripts/fetch-engine.ps1` is deleted; the former Obscura record
-  is kept for provenance in `docs/OBSCURA-COMPAT.md`.
-- Shipping path matches the new engine: CI provisions the pinned browser
-  (restored from cache per pin, re-verified) instead of Obscura; the release
-  runtime bundle carries only the server plus licences/notices — the browser
-  is fetched from Google's Chrome-for-Testing endpoint at provision time and
-  never bundled; the `gladius-mcp` launcher provisions and verifies both the
-  server runtime and the browser on first run and launches the server with
-  `GLADIUS_CHROMIUM` pointed at the pinned browser.
-
-## [Unreleased]
+## [0.4.0] - 2026-10-20
 
 > Note: entries below marked "Pre-0.2.1 (Obscura era)" describe the former
 > engine and are superseded by `[0.2.1]` (owned pinned Chromium); the former
 > record is kept for provenance in `docs/OBSCURA-COMPAT.md`. Unmarked entries
-> describe the current Chromium engine.
+> describe the current Chromium engine. (`Cargo.toml`/`npm/package.json` stay
+> at 0.3.0 until the X2 version bump; this entry collects everything shipped
+> since `[0.3.0]`.)
+
+- MCP protocol truth: strict JSON-RPC 2.0 framing over stdio (batch,
+  method-less, scalar, malformed, and invalid-id frames rejected with
+  -32700/-32600/-32601), the 2025-06-18/2025-11-25/2026-07-28 version matrix
+  (modern `resultType: complete`, legacy without), `server/discover`, a
+  `serverInfo.count` derived from the real tool list, and a per-request
+  execution lock with call cancellation/supersede. No browser runs before
+  the first tool call needs it.
+- AX snapshot by default: the real Accessibility tree (one line per
+  actionable node with a stable `@eN` ref) is the default `snapshot`;
+  `mode:"legacy"` keeps the old DOM heuristic, `mode:"text"` is text-only.
+  Hidden/ignored subtrees stay out (an old ref to one is a typed
+  `stale_ref`, never a silent click); shadow refs resolve but acting through
+  the main-document resolver is a typed error. `snapshot`/`evaluate` take
+  `frame=` to scope into an iframe's realm (isolated world, works
+  cross-origin); `targets` lists every target plus the frame tree.
+- Trusted input: `click` dispatches a real CDP pointer sequence
+  (`mouseMoved`/`mousePressed`/`mouseReleased`, `isTrusted:true`) after
+  scroll-into-view, an `elementFromPoint` hit-test, and a 120 ms
+  navigation-settle watch; `type` focuses + select-alls, then trusted
+  `Input.insertText` (the seed is replaced, never appended). Occluded,
+  hidden, disabled, or non-editable targets are typed errors - the pointer
+  never lands on the wrong surface. `key` handles `Ctrl+A`-style combos
+  with an Alt=1/Ctrl=2/Meta=4/Shift=8 modifier mask (`rawKeyDown`, no text
+  while Ctrl/Meta/Alt is held).
+- Frame-scoped actions: `click`/`type`/`hover`/`select`/`upload` accept
+  `frame=` (CDP frameId). Geometry maps leaf-rect -> owner chain (padding +
+  border per ancestor, JS rect chain) to main-frame viewport px; every
+  ancestor level is hit-tested in its own realm against the true stamped
+  owners, so a mid-level overlay is `occluded` too. `@eN` refs stay
+  main-frame (ref+`frame` is typed `invalid_args`); unmapped/OOPIF frames are
+  typed errors, never silent main-frame actions (this engine exposes no
+  separate iframe target, so no OOPIF landing is claimed).
+- New `storage` tool: cookies + `localStorage`/`sessionStorage` in one call
+  (page-scoped by default, `allSites:true` widens cookie read/clear),
+  plus versioned file save/load (`{gladiusStorage:1,...}`; replies carry
+  counts/bytes/origin only, never values). Cookie writes are read-back
+  verified (`cookie_rejected` otherwise, compared by name/domain/path
+  against the whole jar); `load` enforces an origin match unless
+  `force:true`; `redact:true` masks values (`••••`).
+- Gates: `rust-toolchain.toml` pins the crate MSRV (1.88.0, rustfmt +
+  clippy); `cargo fmt --all --check` is clean; input schemas are tightened
+  (enums for modes/actions, `minProperties`/`minLength`/`minItems`,
+  `oneOf` for `viewport` reset vs width+height, `additionalProperties:
+  false` everywhere - output schemas frozen); CI runs fmt, clippy
+  `-D warnings`, the full suite, and the release `gladius selftest`.
+  Tool count 21 -> 22.
 
 - Build provenance: `gladius --version` (also `version`) now reports the crate
   version **and** the exact commit the binary was built from, stamped at build
@@ -189,6 +175,69 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - README copy block: the destination directory is created as part of the
   example (`Copy-Item` creates the files, never the destination directory),
   and the example no longer names an absolute machine path.
+
+## [0.3.0] - 2026-10-18
+
+- Full-fledged browser tooling: 16 tools -> 21, schemas backward-compatible
+  (every addition is optional; existing callers are unaffected).
+- New `targets` tool: every CDP target with its stable id (pages, workers of
+  all kinds) plus the active page's frame tree (main + nested iframes, each
+  with its frameId), and `select` to make a page target current by id.
+- Target-scoped `evaluate`: optional `target` (CDP targetId: page,
+  dedicated/shared worker, service worker) and `frame` (CDP frameId:
+  isolated-world eval, works cross-origin) route `Runtime.evaluate` to that
+  realm; the tracked active page is untouched. Worker realms answer ONLY on
+  their auto-attach event session (a direct attach returns a session whose
+  commands hang on this engine, measured): page sessions auto-attach
+  (session-scoped `Target.setAutoAttach`, no pausing) and the reader records
+  `Target.attachedToTarget` targetId -> sessionId for the route.
+- Fail loud: unknown arguments are rejected with typed
+  `invalid_args`/`unknown_arg` on every tool (new reason in the closed code
+  set), never silently ignored - the shape that once routed evaluations to
+  the wrong realm with no error.
+- `wait_for` gains an `expression` predicate form: polls a computed JS
+  condition on the active page with backoff inside the shared hard deadline;
+  expiry is the typed timeout, a throwing condition is a real error.
+- New `dialog` tool: policy (`accept` + optional `promptText`, default
+  accept) applied by the reader's auto-handler plus the last recorded dialog
+  (`type`/`message`/`url`). Covers alert/confirm/prompt/beforeunload; a
+  session can never deadlock on a dialog. beforeunload needs sticky
+  activation to fire on this engine (trusted input first).
+- New `history` tool: back/forward/reload on the active page, returning the
+  live url+title after the load settle; a step past the boundary is a typed
+  error, never a silent no-op.
+- New `network` tool: observable capture (method/url/status/resource type/
+  timing, cap 500) with get/drain/clear and a url-substring filter. The
+  Network domain arms lazily on first `network` use (any action, including
+  `clear`); drain removes only the returned entries.
+- New `cdp` tool: raw `{method, params, session?}` escape hatch returning the
+  raw CDP result; a CDP error reply is a tool error, never a protocol error.
+- Main-thread stack: `mcp`/`selftest` now run on a runtime worker instead of
+  the 1 MB PE main-thread stack the block_on polled them on (a cold launch
+  overflowed main deterministically on one build and ran clean on the next;
+  the depth, not the code, was at the edge).
+- Version bump 0.2.1 -> 0.3.0 (`Cargo.toml` + `npm/package.json` in step).
+  NOT published: the harness keeps consuming `gladius-mcp@latest` until an
+  owner-named publish happens.
+
+## [0.2.1] - 2026-10-17
+
+- Engine swap: Obscura is gone. Gladius drives the owned pinned Chromium
+  (`chrome-headless-shell` `155.0.8059.84`, headless-only, no headed path)
+  provisioned by `scripts/fetch-chromium.ps1` into
+  `%LOCALAPPDATA%\gladius\chromium\` (overridable via
+  `GLADIUS_CHROMIUM_CACHE`, explicit binary via `GLADIUS_CHROMIUM`).
+  `initialize` reports `serverInfo.backend` `chromium`. JS dialogs are real
+  (auto-accepted and reported) and the `console` tool's `Log.entryAdded` leg
+  is live. `scripts/fetch-engine.ps1` is deleted; the former Obscura record
+  is kept for provenance in `docs/OBSCURA-COMPAT.md`.
+- Shipping path matches the new engine: CI provisions the pinned browser
+  (restored from cache per pin, re-verified) instead of Obscura; the release
+  runtime bundle carries only the server plus licences/notices — the browser
+  is fetched from Google's Chrome-for-Testing endpoint at provision time and
+  never bundled; the `gladius-mcp` launcher provisions and verifies both the
+  server runtime and the browser on first run and launches the server with
+  `GLADIUS_CHROMIUM` pointed at the pinned browser.
 
 ## [0.1.0] - 2026-10-11
 

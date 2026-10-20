@@ -32,7 +32,11 @@ fn serve() -> u16 {
                 .unwrap_or("/")
                 .to_string();
             let name = path.trim_start_matches('/');
-            let name = if name.is_empty() { "dialogs2.html" } else { name };
+            let name = if name.is_empty() {
+                "dialogs2.html"
+            } else {
+                name
+            };
             let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             p.push("tests");
             p.push("fixtures");
@@ -89,7 +93,12 @@ impl Client {
                 }
             }
         });
-        Client { stdin, rx, next_id: 1, child }
+        Client {
+            stdin,
+            rx,
+            next_id: 1,
+            child,
+        }
     }
 
     fn result(&mut self, method: &str, params: Value) -> Value {
@@ -105,7 +114,10 @@ impl Client {
         let resp: Value =
             serde_json::from_str(&line).unwrap_or_else(|_| panic!("bad json for {method}: {line}"));
         assert!(resp.get("id") == Some(&json!(id)), "id echo for {method}");
-        assert!(resp.get("error").is_none(), "{method} protocol error: {resp}");
+        assert!(
+            resp.get("error").is_none(),
+            "{method} protocol error: {resp}"
+        );
         resp.get("result").cloned().unwrap_or(Value::Null)
     }
 
@@ -160,7 +172,8 @@ fn press(c: &mut Client, sid: &str, t: &str) -> Value {
     )
 }
 
-fn eval_text(c: &mut Client, expr: &str) -> String {    let r = c.call("evaluate", json!({"expression": expr}));
+fn eval_text(c: &mut Client, expr: &str) -> String {
+    let r = c.call("evaluate", json!({"expression": expr}));
     assert!(r.get("isError").is_none(), "evaluate ok: {r}");
     content_text(&r)
 }
@@ -188,41 +201,65 @@ fn dialogs_accept_policy_reports_text_and_effect() {
     assert!(a.get("isError").is_none(), "alert click ok: {a}");
     let at = content_text(&a);
     assert!(at.contains("DLG2_probe-alert"), "alert text reported: {at}");
-    assert!(eval_text(&mut c, "document.getElementById('r').textContent").contains("ALERT_DONE"), "page unblocked");
+    assert!(
+        eval_text(&mut c, "document.getElementById('r').textContent").contains("ALERT_DONE"),
+        "page unblocked"
+    );
 
     // confirm under accept answers true.
     let cf = c.call("click", json!({"element": "#confirm2"}));
     assert!(cf.get("isError").is_none(), "confirm click ok: {cf}");
-    assert!(content_text(&cf).contains("DLG2_probe-confirm"), "confirm text: {cf}");
-    assert!(eval_text(&mut c, "document.getElementById('r').textContent").contains("CONFIRM_IS:true"), "accept effect");
+    assert!(
+        content_text(&cf).contains("DLG2_probe-confirm"),
+        "confirm text: {cf}"
+    );
+    assert!(
+        eval_text(&mut c, "document.getElementById('r').textContent").contains("CONFIRM_IS:true"),
+        "accept effect"
+    );
 
     // prompt with configured prompt text.
-    let set = c.call("dialog", json!({"action": "policy", "accept": true, "promptText": "TYPED_X"}));
+    let set = c.call(
+        "dialog",
+        json!({"action": "policy", "accept": true, "promptText": "TYPED_X"}),
+    );
     assert!(set.get("isError").is_none(), "policy set ok: {set}");
     let pr = c.call("click", json!({"element": "#prompt2"}));
     assert!(pr.get("isError").is_none(), "prompt click ok: {pr}");
-    assert!(content_text(&pr).contains("DLG2_probe-prompt"), "prompt text: {pr}");
+    assert!(
+        content_text(&pr).contains("DLG2_probe-prompt"),
+        "prompt text: {pr}"
+    );
 
     // dialog get reports the last dialog plus the live policy (checked
     // before any evaluate drains the record).
     let g = c.call("dialog", json!({"action": "get"}));
     let gobj = content_obj(&g);
     assert_eq!(
-        gobj.get("dialog").and_then(|d| d.get("type")).and_then(|t| t.as_str()),
+        gobj.get("dialog")
+            .and_then(|d| d.get("type"))
+            .and_then(|t| t.as_str()),
         Some("prompt"),
         "last dialog: {gobj}"
     );
     assert_eq!(
-        gobj.get("dialog").and_then(|d| d.get("message")).and_then(|m| m.as_str()),
+        gobj.get("dialog")
+            .and_then(|d| d.get("message"))
+            .and_then(|m| m.as_str()),
         Some("DLG2_probe-prompt"),
         "last message: {gobj}"
     );
     assert_eq!(
-        gobj.get("policy").and_then(|p| p.get("promptText")).and_then(|t| t.as_str()),
+        gobj.get("policy")
+            .and_then(|p| p.get("promptText"))
+            .and_then(|t| t.as_str()),
         Some("TYPED_X"),
         "live policy: {gobj}"
     );
-    assert!(eval_text(&mut c, "document.getElementById('r').textContent").contains("PROMPT_IS:TYPED_X"), "prompt text effect");
+    assert!(
+        eval_text(&mut c, "document.getElementById('r').textContent").contains("PROMPT_IS:TYPED_X"),
+        "prompt text effect"
+    );
 
     finish(c);
 }
@@ -242,14 +279,23 @@ fn dialogs_dismiss_policy_observably_refuses() {
     // confirm under dismiss answers false; prompt returns null.
     let cf = c.call("click", json!({"element": "#confirm2"}));
     assert!(cf.get("isError").is_none(), "confirm click ok: {cf}");
-    assert!(eval_text(&mut c, "document.getElementById('r').textContent").contains("CONFIRM_IS:false"), "dismiss effect");
+    assert!(
+        eval_text(&mut c, "document.getElementById('r').textContent").contains("CONFIRM_IS:false"),
+        "dismiss effect"
+    );
     let pr = c.call("click", json!({"element": "#prompt2"}));
     assert!(pr.get("isError").is_none(), "prompt click ok: {pr}");
-    assert!(eval_text(&mut c, "document.getElementById('r').textContent").contains("PROMPT_IS:null"), "dismiss prompt effect");
+    assert!(
+        eval_text(&mut c, "document.getElementById('r').textContent").contains("PROMPT_IS:null"),
+        "dismiss prompt effect"
+    );
 
     // policy without accept is a typed missing-arg; unknown action is typed.
     let noacc = c.call("dialog", json!({"action": "policy"}));
-    assert!(noacc.get("isError").is_some(), "policy needs accept: {noacc}");
+    assert!(
+        noacc.get("isError").is_some(),
+        "policy needs accept: {noacc}"
+    );
     assert_eq!(
         structured(&noacc).get("reason").and_then(|v| v.as_str()),
         Some("missing_arg"),
@@ -302,7 +348,9 @@ fn dialogs_beforeunload_never_deadlocks() {
     assert!(!sid.is_empty(), "second session: {attached}");
     // Trusted click on empty page area: sticky activation, no navigation.
     assert!(press(&mut c, &sid, "mousePressed").get("isError").is_none());
-    assert!(press(&mut c, &sid, "mouseReleased").get("isError").is_none());
+    assert!(press(&mut c, &sid, "mouseReleased")
+        .get("isError")
+        .is_none());
 
     // Arm beforeunload and leave via an in-page navigation under accept.
     // Needs sticky activation (trusted click above): without it the engine
@@ -311,18 +359,30 @@ fn dialogs_beforeunload_never_deadlocks() {
     // the page's string), so the proof is the type + the blocking behavior.
     let arm = c.call("evaluate", json!({"expression": "window.onbeforeunload = (e) => { e.preventDefault(); e.returnValue = 'DLG2_before-leave'; return 'DLG2_before-leave'; }; 'armed'"}));
     assert!(arm.get("isError").is_none(), "arm ok: {arm}");
-    let go = c.call("evaluate", json!({"expression": "location.href='/flip.html'; 'leaving'"}));
+    let go = c.call(
+        "evaluate",
+        json!({"expression": "location.href='/flip.html'; 'leaving'"}),
+    );
     assert!(go.get("isError").is_none(), "leave ok (accepted): {go}");
-    let w = c.call("wait_for", json!({"expression": "location.href.includes('/flip.html')", "ms": 8000}));
+    let w = c.call(
+        "wait_for",
+        json!({"expression": "location.href.includes('/flip.html')", "ms": 8000}),
+    );
     assert!(w.get("isError").is_none(), "navigated without hanging: {w}");
     let g = content_obj(&c.call("dialog", json!({"action": "get"})));
     assert_eq!(
-        g.get("dialog").and_then(|d| d.get("type")).and_then(|t| t.as_str()),
+        g.get("dialog")
+            .and_then(|d| d.get("type"))
+            .and_then(|t| t.as_str()),
         Some("beforeunload"),
         "beforeunload recorded: {g}"
     );
     assert!(
-        g.get("dialog").and_then(|d| d.get("url")).and_then(|u| u.as_str()).unwrap_or("").contains("/dialogs2.html"),
+        g.get("dialog")
+            .and_then(|d| d.get("url"))
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .contains("/dialogs2.html"),
         "beforeunload url: {g}"
     );
 
@@ -331,21 +391,31 @@ fn dialogs_beforeunload_never_deadlocks() {
     let back = c.call("navigate", json!({"url": url}));
     assert!(back.get("isError").is_none(), "back ok: {back}");
     assert!(press(&mut c, &sid, "mousePressed").get("isError").is_none());
-    assert!(press(&mut c, &sid, "mouseReleased").get("isError").is_none());
+    assert!(press(&mut c, &sid, "mouseReleased")
+        .get("isError")
+        .is_none());
     let _ = c.call("evaluate", json!({"expression": "window.onbeforeunload = (e) => { e.preventDefault(); e.returnValue = 'DLG2_stay'; return 'DLG2_stay'; }; 'armed'"}));
     let set = c.call("dialog", json!({"action": "policy", "accept": false}));
     assert!(set.get("isError").is_none(), "dismiss ok: {set}");
-    let stay = c.call("evaluate", json!({"expression": "location.href='/flip.html'; 'leaving'"}));
+    let stay = c.call(
+        "evaluate",
+        json!({"expression": "location.href='/flip.html'; 'leaving'"}),
+    );
     assert!(stay.get("isError").is_none(), "stay call ok: {stay}");
     std::thread::sleep(Duration::from_millis(1500));
     let g2 = content_obj(&c.call("dialog", json!({"action": "get"})));
     assert_eq!(
-        g2.get("dialog").and_then(|d| d.get("type")).and_then(|t| t.as_str()),
+        g2.get("dialog")
+            .and_then(|d| d.get("type"))
+            .and_then(|t| t.as_str()),
         Some("beforeunload"),
         "dismissed beforeunload recorded: {g2}"
     );
     let href2 = eval_text(&mut c, "window.location.href");
-    assert!(href2.contains("/dialogs2.html"), "dismiss cancelled the leave (still here): {href2}");
+    assert!(
+        href2.contains("/dialogs2.html"),
+        "dismiss cancelled the leave (still here): {href2}"
+    );
 
     finish(c);
 }

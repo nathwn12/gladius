@@ -179,12 +179,20 @@ fn viewport_override_readback_reset_and_new_tab() {
         .iter()
         .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("viewport"))
         .expect("viewport listed");
-    let required = vp
-        .get("inputSchema")
-        .and_then(|s| s.get("required"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    assert_eq!(required, json!(["width", "height"]), "required args: {vp}");
+    let schema = vp.get("inputSchema").expect("viewport inputSchema");
+    assert_eq!(
+        schema.get("oneOf"),
+        Some(&json!([
+            {"properties": {"reset": {"const": true}}, "required": ["reset"]},
+            {"properties": {"reset": {"const": false}}, "required": ["reset", "width", "height"]},
+            {"required": ["width", "height"], "not": {"required": ["reset"]}}
+        ])),
+        "reset-vs-size oneOf: {vp}"
+    );
+    assert!(
+        schema.get("required").is_none(),
+        "no top-level required (reset:true needs no width/height): {vp}"
+    );
 
     let nav = c.call("navigate", json!({"url": fixture_url()}));
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
@@ -260,4 +268,77 @@ fn viewport_override_readback_reset_and_new_tab() {
     let closed = c.call("close", json!({}));
     assert!(closed.get("isError").is_none(), "close ok: {closed}");
     shutdown(c);
+}
+
+/// G6: the viewport input schema models the runtime exactly. A small
+/// evaluator over the schema's own keywords (`required`, `properties`
+/// `const`, `not`, `oneOf`): no jsonschema dep, just enough to prove the
+/// six reset/dimensions cases the tool actually implements.
+fn schema_valid(schema: &Value, instance: &Value) -> bool {
+    let obj = match instance.as_object() {
+        Some(o) => o,
+        None => return false,
+    };
+    if let Some(req) = schema.get("required").and_then(|r| r.as_array()) {
+        for k in req {
+            if !obj.contains_key(k.as_str().unwrap_or("")) {
+                return false;
+            }
+        }
+    }
+    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+        for (k, sub) in props {
+            if let Some(v) = obj.get(k) {
+                if let Some(c) = sub.get("const") {
+                    if v != c {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(not) = schema.get("not") {
+        if schema_valid(not, instance) {
+            return false;
+        }
+    }
+    if let Some(one) = schema.get("oneOf").and_then(|o| o.as_array()) {
+        return one.iter().filter(|b| schema_valid(b, instance)).count() == 1;
+    }
+    true
+}
+
+#[test]
+fn viewport_input_schema_models_reset_branches() {
+    let mut c = Client::spawn();
+    let listed = c.result("tools/list", json!({}));
+    let vp = listed
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .expect("tools array")
+        .iter()
+        .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("viewport"))
+        .expect("viewport listed")
+        .clone();
+    let schema = vp.get("inputSchema").expect("viewport inputSchema").clone();
+    let closed = c.call("close", json!({}));
+    assert!(closed.get("isError").is_none(), "close ok: {closed}");
+    shutdown(c);
+    // reset:false alone is invalid (runtime requires width/height);
+    // reset:false or absent with width+height is valid; reset:true is
+    // valid with or without dimensions (the runtime ignores them).
+    for (args, want) in [
+        (json!({"reset": false}), false),
+        (json!({"reset": false, "width": 800, "height": 600}), true),
+        (json!({"reset": true}), true),
+        (json!({"reset": true, "width": 800, "height": 600}), true),
+        (json!({"width": 800, "height": 600}), true),
+        (json!({}), false),
+    ] {
+        assert_eq!(
+            schema_valid(&schema, &args),
+            want,
+            "viewport schema case {args}: {schema}"
+        );
+    }
 }

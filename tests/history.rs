@@ -89,7 +89,12 @@ impl Client {
                 }
             }
         });
-        Client { stdin, rx, next_id: 1, child }
+        Client {
+            stdin,
+            rx,
+            next_id: 1,
+            child,
+        }
     }
 
     fn result(&mut self, method: &str, params: Value) -> Value {
@@ -105,7 +110,10 @@ impl Client {
         let resp: Value =
             serde_json::from_str(&line).unwrap_or_else(|_| panic!("bad json for {method}: {line}"));
         assert!(resp.get("id") == Some(&json!(id)), "id echo for {method}");
-        assert!(resp.get("error").is_none(), "{method} protocol error: {resp}");
+        assert!(
+            resp.get("error").is_none(),
+            "{method} protocol error: {resp}"
+        );
         resp.get("result").cloned().unwrap_or(Value::Null)
     }
 
@@ -161,7 +169,10 @@ fn history_walks_back_forward_and_reloads() {
     let mut c = Client::spawn();
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     for page in ["h1.html", "h2.html", "h3.html"] {
-        let nav = c.call("navigate", json!({"url": format!("http://127.0.0.1:{port}/{page}")}));
+        let nav = c.call(
+            "navigate",
+            json!({"url": format!("http://127.0.0.1:{port}/{page}")}),
+        );
         assert!(nav.get("isError").is_none(), "navigate {page} ok: {nav}");
     }
 
@@ -170,13 +181,20 @@ fn history_walks_back_forward_and_reloads() {
     assert!(b1.get("isError").is_none(), "back ok: {b1}");
     let o1 = content_obj(&b1);
     assert!(
-        o1.get("url").and_then(|u| u.as_str()).unwrap_or("").ends_with("/h2.html"),
+        o1.get("url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .ends_with("/h2.html"),
         "back lands on h2: {o1}"
     );
     let b2 = hist_url(&mut c, "back");
     assert!(b2.get("isError").is_none(), "back ok: {b2}");
     assert!(
-        content_obj(&b2).get("url").and_then(|u| u.as_str()).unwrap_or("").ends_with("/h1.html"),
+        content_obj(&b2)
+            .get("url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .ends_with("/h1.html"),
         "back lands on h1: {b2}"
     );
 
@@ -185,11 +203,18 @@ fn history_walks_back_forward_and_reloads() {
     let b3 = hist_url(&mut c, "back");
     assert!(b3.get("isError").is_none(), "back to blank ok: {b3}");
     assert!(
-        content_obj(&b3).get("url").and_then(|u| u.as_str()).unwrap_or("") == "about:blank",
+        content_obj(&b3)
+            .get("url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            == "about:blank",
         "back lands on about:blank: {b3}"
     );
     let bend = hist_url(&mut c, "back");
-    assert!(bend.get("isError").is_some(), "boundary back isError: {bend}");
+    assert!(
+        bend.get("isError").is_some(),
+        "boundary back isError: {bend}"
+    );
     assert_eq!(
         structured(&bend).get("reason").and_then(|v| v.as_str()),
         Some("not_found"),
@@ -201,21 +226,35 @@ fn history_walks_back_forward_and_reloads() {
         let f = hist_url(&mut c, "forward");
         assert!(f.get("isError").is_none(), "forward {n} ok: {f}");
         assert!(
-            content_obj(&f).get("url").and_then(|u| u.as_str()).unwrap_or("").ends_with(want),
+            content_obj(&f)
+                .get("url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .ends_with(want),
             "forward lands on {want}: {f}"
         );
     }
     let fend = hist_url(&mut c, "forward");
-    assert!(fend.get("isError").is_some(), "boundary forward isError: {fend}");
+    assert!(
+        fend.get("isError").is_some(),
+        "boundary forward isError: {fend}"
+    );
 
     // Reload replays the current entry: still h3, marker intact.
     let rel = hist_url(&mut c, "reload");
     assert!(rel.get("isError").is_none(), "reload ok: {rel}");
     assert!(
-        content_obj(&rel).get("url").and_then(|u| u.as_str()).unwrap_or("").ends_with("/h3.html"),
+        content_obj(&rel)
+            .get("url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .ends_with("/h3.html"),
         "reload stays on h3: {rel}"
     );
-    let ev = c.call("evaluate", json!({"expression": "document.querySelector('h1').textContent"}));
+    let ev = c.call(
+        "evaluate",
+        json!({"expression": "document.querySelector('h1').textContent"}),
+    );
     assert!(
         content_text(&ev).contains("HIST_THREE_MARKER_ccc"),
         "reloaded page intact: {ev}"
@@ -230,7 +269,10 @@ fn history_walks_back_forward_and_reloads() {
         "reason: {bad}"
     );
     let missing = c.call("history", json!({}));
-    assert!(missing.get("isError").is_some(), "missing action: {missing}");
+    assert!(
+        missing.get("isError").is_some(),
+        "missing action: {missing}"
+    );
 
     finish(c);
 }

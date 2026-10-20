@@ -9,7 +9,7 @@
 ```powershell
 npx -y gladius-mcp@latest --doctor
 ```
-You need Node 22.14 or newer on Windows x64 first. Your first real serve run provisions the pinned server runtime (0.3.0) plus the pinned chrome-headless-shell browser (155.0.8059.84), both hash-verified, while `--doctor` only prints the manifest with the resolved cache paths and exits 0 without downloading anything.
+You need Node 22.14 or newer on Windows x64 first. Your first real serve run provisions the pinned server runtime (0.4.0) plus the pinned chrome-headless-shell browser (155.0.8059.84), both hash-verified, while `--doctor` only prints the manifest with the resolved cache paths and exits 0 without downloading anything.
 
 ### Or let your AI install it
 
@@ -39,7 +39,7 @@ Wire the server into your MCP client config:
 
 Pin an exact version instead of `@latest`:
 ```powershell
-npx gladius-mcp@0.3.0 --doctor
+npx gladius-mcp@0.4.0 --doctor
 ```
 Point the launcher at a browser you already hold to skip the browser download. Set `GLADIUS_CHROMIUM` to your chrome-headless-shell binary before you start the server:
 ```powershell
@@ -81,10 +81,13 @@ You get back the page text with tags stripped and scripts dropped.
 
 ## What you get
 
-- An agent that works the page for you: 21 tools to open pages, snapshot structure, click, type, screenshot, read the console, target frames and workers, wait on JS predicates, handle dialogs, walk history, read the network, and drive raw CDP (docs/ARCHITECTURE.md).
+- An agent that works the page for you: 22 tools to open pages, snapshot the real Accessibility tree (default; `mode:"legacy"` keeps the old DOM heuristic), click, type, screenshot, read the console, target frames and workers, wait on JS predicates, handle dialogs, walk history, read the network, manage cookies and web storage (save/load), and drive raw CDP (docs/ARCHITECTURE.md). The `storage` tool reports exactly these reply keys (required: `ok`, `action`): `ok`, `action`, `scope`, `url`, `origin`, `cookies`, `localStorage`, `sessionStorage`, `counts`, `set`, `cleared`, `failed`, `applied`, `path`, `bytes`, `fileOrigin`, `redacted`, `note`; it sits immediately after `tabs` in `tools/list`. Hidden/ignored subtrees stay out of the snapshot (an old ref to one is a typed `stale_ref`); acting on a shadow-DOM ref is not yet supported.
 - The same browser every run: pinned chrome-headless-shell, hash-verified and provisioned on first run, shown by --doctor (docs/CHROMIUM.md).
 - A small local footprint: one native binary over stdio that starts the browser only when the first tool call needs it (docs/ARCHITECTURE.md).
 - Errors you can act on: typed tool errors, buffered console messages plus uncaught exceptions, and a headless-only engine with no silent fallback (docs/ENGINE.md).
+- Trusted, frame-aware input: `click`/`type` drive real CDP pointer and `insertText` events (`isTrusted:true`) after scroll, hit-test, and settle - occluded or non-editable targets are typed errors, never silent clicks. `click`/`type`/`hover`/`select`/`upload` take `frame=` to act inside an iframe (per-level owner hit-test; `@eN` refs stay main-frame); `key` handles `Ctrl+A`-style combos with a modifier mask.
+- Machine-readable contract: every tool has a versioned `outputSchema` plus `readOnly`/`destructive`/`idempotent`/`openWorld` annotations, and every failure carries a typed `structuredContent` code/reason beside the prose.
+- Headless-only by owner decision: no headed code path exists and none is planned (docs/HEADED-MODE.md); the visible path is an explicit external attach that gladius never owns.
 
 ## Configure it
 
@@ -103,7 +106,7 @@ You override paths and platform handling with four env vars:
 Pin an exact version instead of `@latest`:
 
 ```powershell
-npx gladius-mcp@0.3.0 --doctor
+npx gladius-mcp@0.4.0 --doctor
 ```
 
 ## Requirements
@@ -118,7 +121,7 @@ npx gladius-mcp@0.3.0 --doctor
 - Package: https://www.npmjs.com/package/gladius-mcp
 - Releases: https://github.com/nathwn12/gladius/releases
 - Issues: https://github.com/nathwn12/gladius/issues
-- Docs: [browser pin](docs/CHROMIUM.md), [engine notes](docs/ENGINE.md), [changelog](CHANGELOG.md)
+- Docs: [browser pin](docs/CHROMIUM.md), [engine notes](docs/ENGINE.md), [headless-only decision](docs/HEADED-MODE.md), [changelog](CHANGELOG.md)
 - License: MIT, see [LICENSE](LICENSE)
 
 <!-- nathwn12 house footer: identical in every repo. Do not edit. -->

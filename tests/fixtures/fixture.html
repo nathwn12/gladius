@@ -10,7 +10,7 @@
 <button type="submit" id="go">GO</button>
 </form>
 <p id="submit-result">NOT_SUBMITTED</p>
-<div id="hover-target" onmouseover="document.getElementById('hover-result').textContent='HOVERED_OK'" style="margin-top:1200px;padding:40px;background:#eee;">HOVER_ME</div>
+<div id="hover-target" onmouseover="document.getElementById('hover-result').textContent='HOVERED_OK'" style="margin-top:1200px;padding:40px;background:#eee;" role="button" tabindex="0">HOVER_ME</div>
 <p id="hover-result">NOT_HOVERED</p>
 <select id="color" onchange="document.getElementById('select-result').textContent='SELECTED:'+this.value">
 <option value="r">Red</option>
@@ -23,6 +23,7 @@
 <input id="disabled-input" type="text" disabled value="">
 <input id="readonly-input" type="text" readonly value="orig">
 <div id="hidden-box" style="display:none;" onclick="document.getElementById('hidden-result').textContent='HIDDEN_CLICKED'">HIDDEN</div>
+<div id="aria-hidden-probe" aria-hidden="true"><button onclick="window.__ariaProbe=1">ARIA_HIDDEN_PROBE_XYZ</button></div>
 <p id="hidden-result">NOT_CLICKED</p>
 <script>window.__gladiusValue = 42;</script>
 </body>

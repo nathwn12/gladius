@@ -148,6 +148,67 @@ fn finish(mut c: Client) {
     shutdown(c);
 }
 
+fn node_lines(t: &str) -> Vec<&str> {
+    t.lines().filter(|l| l.starts_with("- ")).collect()
+}
+
+fn find_ref(snap: &str, needle: &str) -> String {
+    for line in snap.lines() {
+        if line.contains(needle) {
+            if let Some(a) = line.find("[@") {
+                let rest = &line[a + 2..];
+                if let Some(b) = rest.find(']') {
+                    return format!("@{}", &rest[..b]);
+                }
+            }
+        }
+    }
+    panic!("no ref found for {needle:?} in snapshot:\n{snap}");
+}
+
+#[test]
+fn default_snapshot_hides_hidden_old_ref_stales() {
+    // G3b hidden/ignored-node semantics: the default (AX) snapshot carries
+    // no node line for display:none or aria-hidden subtrees (the legacy
+    // path still stamps both), and a ref to such a node from an older table
+    // fails as a typed stale_ref - never a silent main-frame click.
+    let mut c = launch_on_fixture();
+    let def = content_text(&c.call("snapshot", json!({})));
+    for needle in ["HIDDEN", "ARIA_HIDDEN_PROBE_XYZ"] {
+        assert!(
+            !node_lines(&def).iter().any(|l| l.contains(needle)),
+            "default carries no {needle} node line:\n{def}"
+        );
+    }
+    let leg = content_text(&c.call("snapshot", json!({"mode": "legacy"})));
+    assert!(
+        node_lines(&leg).iter().any(|l| l.contains("HIDDEN")),
+        "legacy still stamps the hidden node:\n{leg}"
+    );
+    let rhid = find_ref(&leg, "\"HIDDEN\"");
+    // A fresh default snapshot replaces the ref table: the legacy hidden
+    // ref is gone with the old table.
+    let _ = c.call("snapshot", json!({}));
+    for (tool, args) in [
+        ("click", json!({"element": rhid})),
+        ("type", json!({"element": rhid, "text": "x"})),
+        ("hover", json!({"element": rhid})),
+    ] {
+        let r = c.call(tool, args);
+        assert!(is_error(&r), "{tool} old hidden ref isError: {r}");
+        assert!(
+            content_text(&r).contains("stale ref"),
+            "{tool} old hidden ref is a typed stale_ref: {r}"
+        );
+    }
+    // A visible-but-disabled node is still listed (typed, not dropped).
+    assert!(
+        node_lines(&def).iter().any(|l| l.contains("DISABLED_BTN")),
+        "disabled button still listed:\n{def}"
+    );
+    finish(c);
+}
+
 #[test]
 fn click_refuses_hidden_and_disabled() {
     let mut c = launch_on_fixture();

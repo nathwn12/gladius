@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head><title>Gladius AX Fixture</title></head>
+<body>
+<h1>AX_FIXTURE_MARKER_ax-67890</h1>
+<button id="ax-btn" aria-label="AX Real Button">AX_BTN_LABEL_visible</button>
+<a id="ax-link" href="#">AX_LINK_LABEL_nav</a>
+<input id="ax-text" type="text" aria-label="AX Name Field" value="">
+<input id="ax-pass" type="password" aria-label="AX Password Field" value="supersecret123">
+<div id="ax-hidden" style="display:none;"><button id="ax-hidden-btn">AX_HIDDEN_SHOULD_NOT_APPEAR</button></div>
+<button id="ax-disabled" disabled>AX_DISABLED_BTN</button>
+<input id="ax-check" type="checkbox" aria-label="AX Check Me" checked>
+<select id="ax-select" aria-label="AX Choice"><option value="a">AX_OPT_A</option><option value="b">AX_OPT_B</option></select>
+<div id="shadow-host"></div>
+<script>
+const h = document.getElementById('shadow-host');
+const s = h.attachShadow({mode: 'open'});
+s.innerHTML = '<button id="shadow-btn">SHADOW_BTN_LABEL_inner-abc</button>';
+</script>
+<iframe id="ax-frame" src="ax_frame.html"></iframe>
+</body>
+</html>
