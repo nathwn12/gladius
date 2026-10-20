@@ -343,3 +343,27 @@ fn text_mode_preserved() {
     );
     finish(c);
 }
+
+#[test]
+fn refs_are_unique_across_snapshots() {
+    let mut c = launch_on_fixture();
+    let snap1 = content_text(&c.call("snapshot", json!({})));
+    let r1 = find_ref(&snap1, "CLICK_ME");
+    let snap2 = content_text(&c.call("snapshot", json!({})));
+    let r2 = find_ref(&snap2, "CLICK_ME");
+    assert_ne!(r1, r2, "second snapshot reassigns refs: {r1} vs {r2}");
+
+    // Old ref is gone with the old table: typed unknown, never a wrong click.
+    let old = c.call("click", json!({"element": r1}));
+    assert!(is_error(&old), "old ref isError: {old}");
+    let m = content_text(&old);
+    assert!(
+        m.contains("stale ref") && m.contains("unknown ref"),
+        "typed stale unknown: {m}"
+    );
+
+    // New ref still acts.
+    let new = c.call("click", json!({"element": r2}));
+    assert!(!is_error(&new), "new ref ok: {new}");
+    finish(c);
+}

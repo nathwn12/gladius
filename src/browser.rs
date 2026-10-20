@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Stdio;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -378,6 +378,8 @@ pub struct Browser {
     pid: Mutex<Option<u32>>,
     refs: AsyncMutex<HashMap<String, String>>,
     snap_url: AsyncMutex<String>,
+    ref_seq: std::sync::atomic::AtomicUsize,
+    snapshot_lock: AsyncMutex<()>,
 }
 
 impl Browser {
@@ -387,6 +389,8 @@ impl Browser {
             pid: Mutex::new(None),
             refs: AsyncMutex::new(HashMap::new()),
             snap_url: AsyncMutex::new(String::new()),
+            ref_seq: AtomicUsize::new(0),
+            snapshot_lock: AsyncMutex::new(()),
         }
     }
 
@@ -404,6 +408,21 @@ impl Browser {
     /// URL captured at the last AX snapshot (empty when none taken yet).
     pub async fn snap_url(&self) -> String {
         self.snap_url.lock().await.clone()
+    }
+
+    /// Serialize snapshots so ref ranges never overlap.
+    pub async fn lock_snapshot(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.snapshot_lock.lock().await
+    }
+
+    /// Base offset for the next snapshot's refs (`e{base+1}..`).
+    pub fn ref_start(&self) -> usize {
+        self.ref_seq.load(Ordering::SeqCst)
+    }
+
+    /// Reserve `n` refs after a snapshot.
+    pub fn ref_advance(&self, n: usize) {
+        self.ref_seq.fetch_add(n, Ordering::SeqCst);
     }
 
     /// Drain the latest auto-handled dialog record (if any). Acting tools
@@ -3184,6 +3203,8 @@ mod tests {
             pid: Mutex::new(Some(pid)),
             refs: AsyncMutex::new(HashMap::new()),
             snap_url: AsyncMutex::new(String::new()),
+            ref_seq: AtomicUsize::new(0),
+            snapshot_lock: AsyncMutex::new(()),
         };
         TestRig {
             browser,
@@ -3656,6 +3677,8 @@ mod tests {
             pid: Mutex::new(None),
             refs: AsyncMutex::new(HashMap::new()),
             snap_url: AsyncMutex::new(String::new()),
+            ref_seq: AtomicUsize::new(0),
+            snapshot_lock: AsyncMutex::new(()),
         }
     }
 
