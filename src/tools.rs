@@ -7,13 +7,13 @@ pub fn list() -> Value {
     json!({"tools": [
         {"name": "navigate", "description": "Navigate the active page to a URL",
          "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
-        {"name": "snapshot", "description": "AX snapshot: one line per actionable node with a stable ref (@e1, @e2, ...), role/name/value, plus page text. Pass {\"mode\":\"text\"} for the legacy text-only output.",
+        {"name": "snapshot", "description": "AX snapshot: one line per actionable node with a stable ref (@eN, unique per snapshot), role/name/value, plus page text. Pass {\"mode\":\"text\"} for the legacy text-only output.",
          "inputSchema": {"type": "object", "properties": {"mode": {"type": "string"}}}},
         {"name": "screenshot", "description": "PNG screenshot of the active page (unavailable with GLADIUS_BACKEND_CAPS=dom-only: no rendering pipeline)",
          "inputSchema": {"type": "object", "properties": {"fullPage": {"type": "boolean"}}}},
-        {"name": "click", "description": "Click an element by CSS selector or AX ref (@eN from snapshot; exact, never first-match)",
+        {"name": "click", "description": "Click an element by CSS selector (first match) or AX ref (@eN from snapshot; exact)",
          "inputSchema": {"type": "object", "properties": {"element": {"type": "string"}}, "required": ["element"]}},
-        {"name": "type", "description": "Type text into an element by CSS selector or AX ref (@eN from snapshot; exact)",
+        {"name": "type", "description": "Type text into an element by CSS selector (first match) or AX ref (@eN from snapshot; exact)",
          "inputSchema": {"type": "object", "properties": {
              "element": {"type": "string"}, "text": {"type": "string"}, "submit": {"type": "boolean"}},
              "required": ["element", "text"]}},
@@ -42,13 +42,13 @@ pub fn list() -> Value {
         {"name": "console", "description": "Console capture: buffered console messages + uncaught exceptions, each {type,text,url,line,ts}. Ring buffer, cap 200. action get (default)|drain|clear; limit caps returned (default 100).",
          "inputSchema": {"type": "object", "properties": {
              "action": {"type": "string"}, "limit": {"type": "integer"}}}},
-        {"name": "upload", "description": "Set files on an <input type=file> by CSS selector or AX ref (@eN from snapshot; exact). paths[] must exist locally.",
+        {"name": "upload", "description": "Set files on an <input type=file> by CSS selector (first match) or AX ref (@eN from snapshot; exact). paths[] must exist locally.",
          "inputSchema": {"type": "object", "properties": {
              "element": {"type": "string"}, "paths": {"type": "array", "items": {"type": "string"}}},
              "required": ["element", "paths"]}},
         {"name": "fetch_text", "description": "Fast plain-HTTP GET with no browser; HTML stripped to text",
          "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
-        {"name": "hover", "description": "Hover over an element by CSS selector or AX ref (@eN from snapshot; exact)",
+        {"name": "hover", "description": "Hover over an element by CSS selector (first match) or AX ref (@eN from snapshot; exact)",
          "inputSchema": {"type": "object", "properties": {"element": {"type": "string"}}, "required": ["element"]}},
         {"name": "select", "description": "Choose a <select> option by value (preferred) or visible text; element is a CSS selector or AX ref (@eN)",
          "inputSchema": {"type": "object", "properties": {
@@ -649,9 +649,12 @@ async fn tool_snapshot(browser: &Browser, mode: Option<&str>) -> Result<Value, T
     }
     // AX-tree mode (default): enumerate actionable nodes in document order,
     // stamp each with an exact data-gladius-ref id, and report role/name/value.
-    let v = browser
-        .eval(
-            r#"(() => {
+    // Refs are unique across snapshots: the lock serializes concurrent
+    // snapshots and the base offset keeps @eN from ever being reassigned.
+    let _snap_guard = browser.lock_snapshot().await;
+    let start = browser.ref_start();
+    let raw_js = r#"(() => {
+  const base = __REF_BASE__;
   const cands = Array.from(document.querySelectorAll("a,button,input,select,textarea,[role],[tabindex],[onclick],[onmouseover]"));
   const seen = new Set(); const items = []; let n = 0;
   for (const el of cands) {
@@ -685,15 +688,15 @@ async fn tool_snapshot(browser: &Browser, mode: Option<&str>) -> Result<Value, T
       if (t === "INPUT" || t === "TEXTAREA" || t === "SELECT") value = String(el.value).slice(0, 60);
     } catch (e) {}
     n++;
-    const ref = "e" + n;
+    const ref = "e" + (base + n);
     try { el.dataset.gladiusRef = ref; } catch (e) {}
     items.push({ref: ref, role: role, name: name, value: value,
                 tag: (el.tagName || "").toLowerCase(), disabled: !!el.disabled});
   }
   return {url: location.href, title: document.title, items: items};
-})()"#,
-        )
-        .await?;
+})()"#;
+    let expr = raw_js.replace("__REF_BASE__", &start.to_string());
+    let v = browser.eval(&expr).await?;
     let empty = Vec::new();
     let items = v
         .get("items")
@@ -717,6 +720,8 @@ async fn tool_snapshot(browser: &Browser, mode: Option<&str>) -> Result<Value, T
         }
     }
     browser.store_refs(url.clone(), table).await;
+    let total = items.len();
+    browser.ref_advance(total);
     // Page text keeps old callers (marker asserts) working on AX output.
     let tv = browser
         .eval("((((document.body && document.body.innerText) || (document.documentElement && document.documentElement.innerText) || '')) + '').slice(0, 12000)")
@@ -726,7 +731,6 @@ async fn tool_snapshot(browser: &Browser, mode: Option<&str>) -> Result<Value, T
         .and_then(|x| x.as_str().map(|s| s.to_string()))
         .unwrap_or_default();
     let text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    let total = items.len();
     let mut lines: Vec<String> = Vec::with_capacity(total + 3);
     lines.push(format!("AX snapshot: {title} <{url}>"));
     for it in items.iter() {
@@ -755,7 +759,13 @@ async fn tool_snapshot(browser: &Browser, mode: Option<&str>) -> Result<Value, T
     let mut tail = if text.is_empty() { String::new() } else { format!("\ntext: {text}") };
     let mut tail_cut = false;
     loop {
-        let mut footer = format!("\n[snapshot: {total} nodes, refs @e1..@e{total}]");
+        let mut footer = if total == 0 {
+            format!("\n[snapshot: {total} nodes, refs none]")
+        } else {
+            let first = start + 1;
+            let last = start + total;
+            format!("\n[snapshot: {total} nodes, refs @e{first}..@e{last}]")
+        };
         if shown < total_lines {
             let rest_chars: usize = lines
                 .iter()
