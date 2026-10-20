@@ -39,7 +39,7 @@ Wire the server into your MCP client config:
 
 Pin an exact version instead of `@latest`:
 ```powershell
-npx gladius-mcp@0.2.1 --doctor
+npx gladius-mcp@latest --doctor
 ```
 Point the launcher at a browser you already hold to skip the browser download. Set `GLADIUS_CHROMIUM` to your chrome-headless-shell binary before you start the server:
 ```powershell
