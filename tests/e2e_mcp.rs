@@ -79,7 +79,7 @@ impl Client {
         let id = self.next_id;
         self.next_id += 1;
         let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        writeln!(self.stdin, "{}", frame).expect("write stdin");
+        writeln!(self.stdin, "{frame}").expect("write stdin");
         self.stdin.flush().expect("flush stdin");
         let resp = self.recv(method);
         assert_eq!(resp.get("id"), Some(&json!(id)), "id echo for {method}");
@@ -88,7 +88,7 @@ impl Client {
 
     fn notify(&mut self, method: &str) {
         let frame = json!({"jsonrpc": "2.0", "method": method});
-        writeln!(self.stdin, "{}", frame).expect("write stdin");
+        writeln!(self.stdin, "{frame}").expect("write stdin");
         self.stdin.flush().expect("flush stdin");
     }
 

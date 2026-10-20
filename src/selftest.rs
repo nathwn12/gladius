@@ -31,12 +31,7 @@ pub async fn run() -> i32 {
     let b = Browser::new();
 
     // navigate
-    let v = crate::tools::call(
-        "navigate",
-        &serde_json::json!({"url": url}),
-        &b,
-    )
-    .await;
+    let v = crate::tools::call("navigate", &serde_json::json!({"url": url}), &b).await;
     let nav_text = v
         .get("content")
         .and_then(|c| c.get(0))
@@ -66,12 +61,7 @@ pub async fn run() -> i32 {
     check("evaluate", ev.contains("42"), &ev);
 
     // click toggles the element
-    let clk = crate::tools::call(
-        "click",
-        &serde_json::json!({"element": "#toggle"}),
-        &b,
-    )
-    .await;
+    let clk = crate::tools::call("click", &serde_json::json!({"element": "#toggle"}), &b).await;
     let clk_ok = clk.get("isError").is_none();
     check("click", clk_ok, &clk.to_string());
     let toggled = content_text(
@@ -94,9 +84,7 @@ pub async fn run() -> i32 {
         .await,
     );
     check("console-log-eval", le.contains("logged"), &le);
-    let cg = content_text(
-        &crate::tools::call("console", &serde_json::json!({}), &b).await,
-    );
+    let cg = content_text(&crate::tools::call("console", &serde_json::json!({}), &b).await);
     check(
         "console",
         cg.contains("GLADIUS_CONSOLE_PROBE_7f3a") && cg.contains("\"type\""),
@@ -114,9 +102,7 @@ pub async fn run() -> i32 {
     let mut exc_text = String::new();
     for _ in 0..10 {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        exc_text = content_text(
-            &crate::tools::call("console", &serde_json::json!({}), &b).await,
-        );
+        exc_text = content_text(&crate::tools::call("console", &serde_json::json!({}), &b).await);
         if exc_text.contains("GLADIUS_EXC_PROBE_9c1e") {
             exc_seen = true;
             break;
@@ -129,9 +115,7 @@ pub async fn run() -> i32 {
         &crate::tools::call("console", &serde_json::json!({"action": "clear"}), &b).await,
     );
     check("console-clear", clr.contains("cleared"), &clr);
-    let empty = content_text(
-        &crate::tools::call("console", &serde_json::json!({}), &b).await,
-    );
+    let empty = content_text(&crate::tools::call("console", &serde_json::json!({}), &b).await);
     check("console-empty", empty.contains("\"total\":0"), &empty);
 
     // console: drain returns messages AND clears
@@ -149,9 +133,7 @@ pub async fn run() -> i32 {
         dr.contains("GLADIUS_DRAIN_PROBE_4b2d") && dr.contains("cleared"),
         &truncate(&dr, 200),
     );
-    let empty2 = content_text(
-        &crate::tools::call("console", &serde_json::json!({}), &b).await,
-    );
+    let empty2 = content_text(&crate::tools::call("console", &serde_json::json!({}), &b).await);
     check("console-drained", empty2.contains("\"total\":0"), &empty2);
 
     // upload: real temp files onto the file input by selector

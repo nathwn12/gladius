@@ -249,12 +249,27 @@ fn ref_actions_are_exact() {
     ));
     assert!(vv.contains("ref-typed-1"), "type-by-ref landed: {vv}");
 
-    // Ref-targeted actionability gate (G-1): hidden node by ref errors, no click.
-    let rhid = content_text(&c.call(
-        "evaluate",
-        json!({"expression": "document.getElementById('hidden-box').dataset.gladiusRef || 'NOREF'"}),
-    ));
-    assert!(!rhid.contains("NOREF"), "hidden node stamped");
+    // Hidden-node semantics (G3b default is AX): the hidden box is NOT
+    // stamped and has no node line; the legacy path still stamps it. An
+    // old ref to a node absent from the current table is a typed
+    // stale_ref on click, never a silent main-frame click.
+    let def = content_text(&c.call("snapshot", json!({})));
+    assert!(
+        !def.lines()
+            .any(|l| l.starts_with("- ") && l.contains("HIDDEN")),
+        "default (AX) carries no hidden node line:\n{def}"
+    );
+    let leg = content_text(&c.call("snapshot", json!({"mode": "legacy"})));
+    let rhid = find_ref(&leg, "HIDDEN");
+    // Fresh default snapshot replaces the table: the legacy hidden ref is stale.
+    let _ = content_text(&c.call("snapshot", json!({})));
+    let stale = c.call("click", json!({"element": rhid}));
+    assert!(is_error(&stale), "old hidden ref isError: {stale}");
+    let sm = content_text(&stale);
+    assert!(
+        sm.contains("stale ref"),
+        "typed stale_ref for the gone hidden node, got: {sm}"
+    );
     finish(c);
 }
 

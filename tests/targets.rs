@@ -55,21 +55,25 @@ fn serve_fixtures(xonly: bool) -> u16 {
                 .to_string();
             let name = path.trim_start_matches('/');
             let name = if name.is_empty() { "realms.html" } else { name };
-            let allowed = if xonly { name == "x.html" } else { name != "x.html" };
+            let allowed = if xonly {
+                name == "x.html"
+            } else {
+                name != "x.html"
+            };
             let body = if allowed {
-                std::fs::read(fixture_path(if name == "x.html" { "child_x.html" } else { name }))
-                    .unwrap_or_default()
+                std::fs::read(fixture_path(if name == "x.html" {
+                    "child_x.html"
+                } else {
+                    name
+                }))
+                .unwrap_or_default()
             } else {
                 Vec::new()
             };
             let (status, ctype, bytes) = if allowed && !body.is_empty() {
                 ("200 OK", content_type(name), body)
             } else {
-                (
-                    "404 Not Found",
-                    "text/plain",
-                    b"nope".to_vec(),
-                )
+                ("404 Not Found", "text/plain", b"nope".to_vec())
             };
             let _ = s.write_all(
                 format!(
@@ -252,38 +256,62 @@ fn realms_target_scoped_evaluate() {
         .and_then(|t| t.as_array())
         .expect("targets array");
     assert!(
-        targets.iter().any(|t| t.get("type").and_then(|v| v.as_str()) == Some("page")),
+        targets
+            .iter()
+            .any(|t| t.get("type").and_then(|v| v.as_str()) == Some("page")),
         "a page target is listed: {obj}"
     );
     let worker = targets
         .iter()
         .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("worker"))
         .expect("dedicated worker target listed (type worker; its url is empty on this engine)");
-    let worker_id = worker.get("targetId").and_then(|v| v.as_str()).unwrap_or("");
+    let worker_id = worker
+        .get("targetId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     assert!(!worker_id.is_empty(), "worker has a stable id");
     let swt = targets
         .iter()
         .find(|t| {
-            t.get("url").and_then(|v| v.as_str()).unwrap_or("").ends_with("sw.js")
+            t.get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .ends_with("sw.js")
         })
         .expect("service worker target listed");
     let sw_id = swt.get("targetId").and_then(|v| v.as_str()).unwrap_or("");
     assert!(!sw_id.is_empty(), "sw has a stable id");
 
     // Frame tree: main + same-origin child + cross-origin child.
-    let frames = obj.get("frames").and_then(|f| f.as_array()).expect("frames array");
+    let frames = obj
+        .get("frames")
+        .and_then(|f| f.as_array())
+        .expect("frames array");
     assert!(frames.len() >= 3, "main + both iframes: {obj}");
     let same = frames
         .iter()
-        .find(|f| f.get("url").and_then(|v| v.as_str()).unwrap_or("").contains("child_same.html"))
+        .find(|f| {
+            f.get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("child_same.html")
+        })
         .expect("same-origin frame listed");
     let xframe = frames
         .iter()
-        .find(|f| f.get("url").and_then(|v| v.as_str()).unwrap_or("").contains("/x.html"))
+        .find(|f| {
+            f.get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("/x.html")
+        })
         .expect("cross-origin frame listed");
     let same_id = same.get("frameId").and_then(|v| v.as_str()).unwrap_or("");
     let x_id = xframe.get("frameId").and_then(|v| v.as_str()).unwrap_or("");
-    assert!(!same_id.is_empty() && !x_id.is_empty(), "frames have stable ids");
+    assert!(
+        !same_id.is_empty() && !x_id.is_empty(),
+        "frames have stable ids"
+    );
 
     // Realm contrast: top page is a Window.
     let top = ev(&mut c, json!({"expression": "globalThis.constructor.name"}));
@@ -359,10 +387,16 @@ fn unknown_arguments_are_rejected_loudly() {
         ("dialog", json!({"action": "get", "target": "T1"})),
         ("history", json!({"action": "back", "url": "x"})),
         ("network", json!({"action": "get", "target": "T1"})),
-        ("cdp", json!({"method": "Target.getTargets", "target": "T1"})),
+        (
+            "cdp",
+            json!({"method": "Target.getTargets", "target": "T1"}),
+        ),
     ] {
         let r = c.call(tool, args);
-        assert!(r.get("isError").is_some(), "{tool}: unknown arg must fail: {r}");
+        assert!(
+            r.get("isError").is_some(),
+            "{tool}: unknown arg must fail: {r}"
+        );
         let sc = r.get("structuredContent").cloned().unwrap_or(Value::Null);
         assert_eq!(
             sc.get("code").and_then(|v| v.as_str()),
@@ -380,7 +414,10 @@ fn unknown_arguments_are_rejected_loudly() {
     let nav = c.call("navigate", json!({"url": "about:blank"}));
     assert!(nav.get("isError").is_none(), "known args pass: {nav}");
     let shot = c.call("screenshot", json!({}));
-    assert!(shot.get("isError").is_none(), "empty-args screenshot ok: {shot}");
+    assert!(
+        shot.get("isError").is_none(),
+        "empty-args screenshot ok: {shot}"
+    );
 
     finish(c);
 }
@@ -398,7 +435,10 @@ fn targets_select_pages_and_refuses_workers() {
 
     let listed = c.call("targets", json!({}));
     let obj = content_obj(&listed);
-    let targets = obj.get("targets").and_then(|t| t.as_array()).expect("targets");
+    let targets = obj
+        .get("targets")
+        .and_then(|t| t.as_array())
+        .expect("targets");
     let page_id = targets
         .iter()
         .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))

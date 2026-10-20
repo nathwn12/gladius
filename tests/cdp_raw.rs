@@ -55,7 +55,12 @@ impl Client {
                 }
             }
         });
-        Client { stdin, rx, next_id: 1, child }
+        Client {
+            stdin,
+            rx,
+            next_id: 1,
+            child,
+        }
     }
 
     fn result(&mut self, method: &str, params: Value) -> Value {
@@ -71,7 +76,10 @@ impl Client {
         let resp: Value =
             serde_json::from_str(&line).unwrap_or_else(|_| panic!("bad json for {method}: {line}"));
         assert!(resp.get("id") == Some(&json!(id)), "id echo for {method}");
-        assert!(resp.get("error").is_none(), "{method} protocol error: {resp}");
+        assert!(
+            resp.get("error").is_none(),
+            "{method} protocol error: {resp}"
+        );
         resp.get("result").cloned().unwrap_or(Value::Null)
     }
 
@@ -129,7 +137,11 @@ fn cdp_browser_level_and_session_scoped() {
     assert!(ver.get("isError").is_none(), "getVersion ok: {ver}");
     let vobj = content_obj(&ver);
     assert!(
-        vobj.get("result").and_then(|r| r.get("product")).and_then(|p| p.as_str()).unwrap_or("").contains("Chrome"),
+        vobj.get("result")
+            .and_then(|r| r.get("product"))
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .contains("Chrome"),
         "chromium product: {vobj}"
     );
 
@@ -137,7 +149,11 @@ fn cdp_browser_level_and_session_scoped() {
     let tgt = c.call("cdp", json!({"method": "Target.getTargets"}));
     assert!(tgt.get("isError").is_none(), "getTargets ok: {tgt}");
     assert!(
-        content_obj(&tgt).get("result").and_then(|r| r.get("targetInfos")).and_then(|t| t.as_array()).is_some(),
+        content_obj(&tgt)
+            .get("result")
+            .and_then(|r| r.get("targetInfos"))
+            .and_then(|t| t.as_array())
+            .is_some(),
         "targetInfos: {tgt}"
     );
 
@@ -173,14 +189,20 @@ fn cdp_browser_level_and_session_scoped() {
     );
     assert!(ev.get("isError").is_none(), "session eval ok: {ev}");
     assert_eq!(
-        content_obj(&ev).get("result").and_then(|r| r.get("result")).and_then(|r| r.get("value")),
+        content_obj(&ev)
+            .get("result")
+            .and_then(|r| r.get("result"))
+            .and_then(|r| r.get("value")),
         Some(&json!(42)),
         "raw result: {ev}"
     );
 
     // Unknown methods and bad sessions are tool errors, never protocol errors.
     let bad = c.call("cdp", json!({"method": "Nope.nope"}));
-    assert!(bad.get("isError").is_some(), "unknown method isError: {bad}");
+    assert!(
+        bad.get("isError").is_some(),
+        "unknown method isError: {bad}"
+    );
     assert_eq!(
         structured(&bad).get("code").and_then(|v| v.as_str()),
         Some("error"),
@@ -192,20 +214,31 @@ fn cdp_browser_level_and_session_scoped() {
                "params": {"expression": "1", "returnByValue": true},
                "session": "NO_SUCH_SESSION"}),
     );
-    assert!(badsess.get("isError").is_some(), "bad session isError: {badsess}");
+    assert!(
+        badsess.get("isError").is_some(),
+        "bad session isError: {badsess}"
+    );
 
     // Missing method and non-object params are typed argument errors.
     let nomethod = c.call("cdp", json!({}));
-    assert!(nomethod.get("isError").is_some(), "missing method: {nomethod}");
+    assert!(
+        nomethod.get("isError").is_some(),
+        "missing method: {nomethod}"
+    );
     assert_eq!(
         structured(&nomethod).get("reason").and_then(|v| v.as_str()),
         Some("missing_arg"),
         "reason: {nomethod}"
     );
     let badparams = c.call("cdp", json!({"method": "Target.getTargets", "params": [1]}));
-    assert!(badparams.get("isError").is_some(), "bad params: {badparams}");
+    assert!(
+        badparams.get("isError").is_some(),
+        "bad params: {badparams}"
+    );
     assert_eq!(
-        structured(&badparams).get("reason").and_then(|v| v.as_str()),
+        structured(&badparams)
+            .get("reason")
+            .and_then(|v| v.as_str()),
         Some("bad_value"),
         "reason: {badparams}"
     );

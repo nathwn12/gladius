@@ -89,7 +89,12 @@ impl Client {
                 }
             }
         });
-        Client { stdin, rx, next_id: 1, child }
+        Client {
+            stdin,
+            rx,
+            next_id: 1,
+            child,
+        }
     }
 
     fn result(&mut self, method: &str, params: Value) -> Value {
@@ -105,7 +110,10 @@ impl Client {
         let resp: Value =
             serde_json::from_str(&line).unwrap_or_else(|_| panic!("bad json for {method}: {line}"));
         assert!(resp.get("id") == Some(&json!(id)), "id echo for {method}");
-        assert!(resp.get("error").is_none(), "{method} protocol error: {resp}");
+        assert!(
+            resp.get("error").is_none(),
+            "{method} protocol error: {resp}"
+        );
         resp.get("result").cloned().unwrap_or(Value::Null)
     }
 
@@ -151,7 +159,10 @@ fn wait_for_expression_resolves_when_value_flips() {
     let port = serve();
     let mut c = Client::spawn();
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
-    let nav = c.call("navigate", json!({"url": format!("http://127.0.0.1:{port}/flip.html")}));
+    let nav = c.call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/flip.html")}),
+    );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
     // The fixture flips `window.__flip` to 'FLIPPED_OK' after ~1.5 s.
@@ -164,7 +175,10 @@ fn wait_for_expression_resolves_when_value_flips() {
     assert!(t.contains("\"ok\":true"), "ok payload: {t}");
 
     // Truthiness follows JS rules: a non-empty string is truthy.
-    let w2 = c.call("wait_for", json!({"expression": "window.__flip", "ms": 2000}));
+    let w2 = c.call(
+        "wait_for",
+        json!({"expression": "window.__flip", "ms": 2000}),
+    );
     assert!(w2.get("isError").is_none(), "truthy string ok: {w2}");
 
     finish(c);
@@ -175,7 +189,10 @@ fn wait_for_expression_times_out_typed_when_never_true() {
     let port = serve();
     let mut c = Client::spawn();
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
-    let nav = c.call("navigate", json!({"url": format!("http://127.0.0.1:{port}/flip.html")}));
+    let nav = c.call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/flip.html")}),
+    );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
     let t0 = std::time::Instant::now();
@@ -188,28 +205,45 @@ fn wait_for_expression_times_out_typed_when_never_true() {
     let t = content_text(&w);
     assert!(t.contains("timeout"), "timeout prose: {w}");
     let sc = structured(&w);
-    assert_eq!(sc.get("code").and_then(|v| v.as_str()), Some("timeout"), "code: {w}");
+    assert_eq!(
+        sc.get("code").and_then(|v| v.as_str()),
+        Some("timeout"),
+        "code: {w}"
+    );
     assert_eq!(
         sc.get("reason").and_then(|v| v.as_str()),
         Some("budget_exceeded"),
         "reason: {w}"
     );
-    assert_eq!(sc.get("tool").and_then(|v| v.as_str()), Some("wait_for"), "tool: {w}");
+    assert_eq!(
+        sc.get("tool").and_then(|v| v.as_str()),
+        Some("wait_for"),
+        "tool: {w}"
+    );
     assert!(
         dt >= Duration::from_millis(1000) && dt < Duration::from_secs(10),
         "budget honored, took {dt:?}"
     );
 
     // A throwing condition is a real error, not "not yet true".
-    let bad = c.call("wait_for", json!({"expression": "null.foo.bar", "ms": 2000}));
-    assert!(bad.get("isError").is_some(), "throwing condition isError: {bad}");
+    let bad = c.call(
+        "wait_for",
+        json!({"expression": "null.foo.bar", "ms": 2000}),
+    );
+    assert!(
+        bad.get("isError").is_some(),
+        "throwing condition isError: {bad}"
+    );
 
     // expression + selector is one condition per call, never both.
     let both = c.call(
         "wait_for",
         json!({"expression": "true", "selector": "#x", "ms": 1000}),
     );
-    assert!(both.get("isError").is_some(), "expression+selector rejected: {both}");
+    assert!(
+        both.get("isError").is_some(),
+        "expression+selector rejected: {both}"
+    );
     assert_eq!(
         structured(&both).get("reason").and_then(|v| v.as_str()),
         Some("bad_value"),

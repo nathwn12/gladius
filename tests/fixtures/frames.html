@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head><title>Gladius Frames Fixture</title></head>
+<body>
+<h1 id="marker">GLADIUS_FRAMES_MARKER_11223</h1>
+<p id="top-note">TOP_PAGE</p>
+<iframe id="sub" src="frames_child.html" name="subframe" style="margin: 80px 0 0 100px; padding: 12px; border: 7px solid #333; width: 600px; height: 500px;"></iframe>
+<input id="combo-input" type="text" value="COMBO_SEED_TEXT">
+<p id="combo-last"></p>
+<p id="combo-count">0</p>
+<script>
+// Recorder state is mirrored into DOM nodes (#combo-last, #combo-count):
+// `key` dispatches trusted CDP events (no eval realm involved), but the
+// assertions below read through evaluate, so DOM is the shared surface.
+(function () {
+  var i = document.getElementById('combo-input');
+  i.addEventListener('keydown', function (e) {
+    document.getElementById('combo-last').textContent = JSON.stringify({key: e.key, code: e.code, ctrlKey: !!e.ctrlKey, shiftKey: !!e.shiftKey, altKey: !!e.altKey, metaKey: !!e.metaKey});
+  });
+  i.addEventListener('input', function () {
+    var c = document.getElementById('combo-count');
+    c.textContent = String((parseInt(c.textContent || '0', 10) || 0) + 1);
+  });
+})();
+</script>
+</body>
+</html>

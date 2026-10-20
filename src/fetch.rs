@@ -118,10 +118,7 @@ mod tests {
     /// Pre-fix (`&amp;` replaced first) the first assert yields `<tag>`.
     #[test]
     fn entities_decode_exactly_once() {
-        assert_eq!(
-            html_to_text("<p>&amp;lt;tag&amp;gt;</p>"),
-            "&lt;tag&gt;"
-        );
+        assert_eq!(html_to_text("<p>&amp;lt;tag&amp;gt;</p>"), "&lt;tag&gt;");
         assert_eq!(html_to_text("<p>&lt;tag&gt;</p>"), "<tag>");
         assert_eq!(html_to_text("<p>&amp;amp;</p>"), "&amp;");
         assert_eq!(html_to_text("<p>a&nbsp;b &quot;q&quot;</p>"), "a b \"q\"");
@@ -135,10 +132,7 @@ mod tests {
     async fn fetch_streams_within_byte_budget() {
         let prefix = "<html><body><p>FETCH_HEAD_MARKER_8m</p>";
         let body_len: usize = 8 * 1024 * 1024;
-        assert!(
-            body_len > prefix.len(),
-            "body dwarfs the prefix"
-        );
+        assert!(body_len > prefix.len(), "body dwarfs the prefix");
         let ln = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback bind");

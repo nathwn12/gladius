@@ -13,13 +13,11 @@ use serde_json::{json, Value};
 
 // 1x1 transparent PNG.
 const PIXEL_PNG: &[u8] = &[
-    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
-    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-    0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00,
-    0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x18, 0x05, 0xa3,
-    0x60, 0x14, 0x8c, 0x02, 0x00, 0x00, 0x09, 0x00, 0x03, 0x9e, 0x0a, 0x7e,
-    0x34, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60,
-    0x82,
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x60, 0x18, 0x05, 0xa3,
+    0x60, 0x14, 0x8c, 0x02, 0x00, 0x00, 0x09, 0x00, 0x03, 0x9e, 0x0a, 0x7e, 0x34, 0x00, 0x00, 0x00,
+    0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 ];
 
 fn serve() -> u16 {
@@ -107,7 +105,12 @@ impl Client {
                 }
             }
         });
-        Client { stdin, rx, next_id: 1, child }
+        Client {
+            stdin,
+            rx,
+            next_id: 1,
+            child,
+        }
     }
 
     fn result(&mut self, method: &str, params: Value) -> Value {
@@ -123,7 +126,10 @@ impl Client {
         let resp: Value =
             serde_json::from_str(&line).unwrap_or_else(|_| panic!("bad json for {method}: {line}"));
         assert!(resp.get("id") == Some(&json!(id)), "id echo for {method}");
-        assert!(resp.get("error").is_none(), "{method} protocol error: {resp}");
+        assert!(
+            resp.get("error").is_none(),
+            "{method} protocol error: {resp}"
+        );
         resp.get("result").cloned().unwrap_or(Value::Null)
     }
 
@@ -182,14 +188,20 @@ fn network_captures_fetch_xhr_and_subresource() {
     let port = serve();
     let mut c = Client::spawn();
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
-    let nav = c.call("navigate", json!({"url": format!("http://127.0.0.1:{port}/net.html")}));
+    let nav = c.call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/net.html")}),
+    );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
     // Start clean (and enable the Network domain), then reload so the
     // document + subresource load inside the capture window.
     let clr = c.call("network", json!({"action": "clear"}));
     assert!(clr.get("isError").is_none(), "clear ok: {clr}");
-    let nav2 = c.call("navigate", json!({"url": format!("http://127.0.0.1:{port}/net.html")}));
+    let nav2 = c.call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/net.html")}),
+    );
     assert!(nav2.get("isError").is_none(), "renavigate ok: {nav2}");
 
     // Fire fetch + XHR from the page.
@@ -221,19 +233,50 @@ fn network_captures_fetch_xhr_and_subresource() {
     }
     let find = |sub: &str| {
         got.iter()
-            .find(|e| e.get("url").and_then(|u| u.as_str()).unwrap_or("").contains(sub))
+            .find(|e| {
+                e.get("url")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("")
+                    .contains(sub)
+            })
             .unwrap_or_else(|| panic!("entry for {sub} captured: {got:?}"))
             .clone()
     };
     let fetch = find("/api/data?x=1");
-    assert_eq!(fetch.get("method").and_then(|m| m.as_str()), Some("GET"), "fetch method: {fetch}");
-    assert_eq!(fetch.get("status").and_then(|s| s.as_i64()), Some(200), "fetch status: {fetch}");
-    assert!(!fetch.get("type").and_then(|t| t.as_str()).unwrap_or("").is_empty(), "fetch type: {fetch}");
-    assert!(fetch.get("ts").and_then(|t| t.as_u64()).unwrap_or(0) > 0, "fetch ts: {fetch}");
+    assert_eq!(
+        fetch.get("method").and_then(|m| m.as_str()),
+        Some("GET"),
+        "fetch method: {fetch}"
+    );
+    assert_eq!(
+        fetch.get("status").and_then(|s| s.as_i64()),
+        Some(200),
+        "fetch status: {fetch}"
+    );
+    assert!(
+        !fetch
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .is_empty(),
+        "fetch type: {fetch}"
+    );
+    assert!(
+        fetch.get("ts").and_then(|t| t.as_u64()).unwrap_or(0) > 0,
+        "fetch ts: {fetch}"
+    );
     let xhr = find("/api/xhr?y=2");
-    assert_eq!(xhr.get("status").and_then(|s| s.as_i64()), Some(200), "xhr status: {xhr}");
+    assert_eq!(
+        xhr.get("status").and_then(|s| s.as_i64()),
+        Some(200),
+        "xhr status: {xhr}"
+    );
     let img = find("/pixel.png");
-    assert_eq!(img.get("status").and_then(|s| s.as_i64()), Some(200), "img status: {img}");
+    assert_eq!(
+        img.get("status").and_then(|s| s.as_i64()),
+        Some(200),
+        "img status: {img}"
+    );
 
     // Filter narrows to the matching url substring.
     let f = c.call("network", json!({"action": "get", "filter": "/api/data"}));
@@ -241,7 +284,11 @@ fn network_captures_fetch_xhr_and_subresource() {
     let fgot = entries_of(&f);
     assert!(!fgot.is_empty(), "filter matches: {fgot:?}");
     assert!(
-        fgot.iter().all(|e| e.get("url").and_then(|u| u.as_str()).unwrap_or("").contains("/api/data")),
+        fgot.iter().all(|e| e
+            .get("url")
+            .and_then(|u| u.as_str())
+            .unwrap_or("")
+            .contains("/api/data")),
         "filter exact: {fgot:?}"
     );
 
@@ -249,9 +296,16 @@ fn network_captures_fetch_xhr_and_subresource() {
     let d = c.call("network", json!({"action": "drain"}));
     assert!(d.get("isError").is_none(), "drain ok: {d}");
     let dobj = content_obj(&d);
-    assert!(dobj.get("cleared").and_then(|v| v.as_i64()).unwrap_or(0) > 0, "drained some: {dobj}");
+    assert!(
+        dobj.get("cleared").and_then(|v| v.as_i64()).unwrap_or(0) > 0,
+        "drained some: {dobj}"
+    );
     let g2 = c.call("network", json!({}));
-    assert_eq!(content_obj(&g2).get("total").and_then(|v| v.as_i64()), Some(0), "ring empty after drain: {g2}");
+    assert_eq!(
+        content_obj(&g2).get("total").and_then(|v| v.as_i64()),
+        Some(0),
+        "ring empty after drain: {g2}"
+    );
 
     // Unknown action is typed; limit is honored.
     let bad = c.call("network", json!({"action": "bogus"}));

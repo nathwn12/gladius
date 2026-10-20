@@ -146,7 +146,11 @@ impl Client {
     }
 
     fn call(&mut self, name: &str, args: Value, timeout: Duration) -> Value {
-        self.result("tools/call", json!({"name": name, "arguments": args}), timeout)
+        self.result(
+            "tools/call",
+            json!({"name": name, "arguments": args}),
+            timeout,
+        )
     }
 
     /// stderr lines seen so far (non-blocking drain).
@@ -341,9 +345,13 @@ fn headless_owned_e2e_navigate_snapshot_screenshot() {
         .and_then(|t| t.as_array())
         .expect("tools array")
         .iter()
-        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+        .filter_map(|t| {
+            t.get("name")
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string())
+        })
         .collect();
-    assert_eq!(names.len(), 21, "exactly the 21 tools: {names:?}");
+    assert_eq!(names.len(), 22, "exactly the 22 tools: {names:?}");
 
     let nav = c.call(
         "navigate",
@@ -373,7 +381,10 @@ fn headless_owned_e2e_navigate_snapshot_screenshot() {
 
     let shot = c.call("screenshot", json!({}), Duration::from_secs(60));
     assert!(shot.get("isError").is_none(), "screenshot ok");
-    let img = shot.get("content").and_then(|cc| cc.get(0)).expect("image block");
+    let img = shot
+        .get("content")
+        .and_then(|cc| cc.get(0))
+        .expect("image block");
     assert_eq!(
         img.get("type").and_then(|t| t.as_str()),
         Some("image"),
@@ -486,7 +497,11 @@ fn headless_browser_has_no_visible_window() {
         !wins.is_empty(),
         "positive control: chrome-headless-shell processes exist while the instance runs"
     );
-    let visible: Vec<u32> = wins.iter().filter(|(_, h)| *h != 0).map(|(p, _)| *p).collect();
+    let visible: Vec<u32> = wins
+        .iter()
+        .filter(|(_, h)| *h != 0)
+        .map(|(p, _)| *p)
+        .collect();
     assert!(
         visible.is_empty(),
         "no visible top-level window for the instance (pid:handle): {wins:?}"
@@ -518,7 +533,11 @@ fn headless_profile_is_private_and_swept() {
         "instance owns a private profile dir (server pid {spid})"
     );
     for d in &dirs {
-        assert!(d.is_dir(), "profile dir exists during the run: {}", d.display());
+        assert!(
+            d.is_dir(),
+            "profile dir exists during the run: {}",
+            d.display()
+        );
     }
     eprintln!("[headless-profile] private dirs: {dirs:?}");
 
@@ -566,12 +585,18 @@ fn headless_second_instance_runs_concurrently() {
     let da = profile_dirs(a.pid());
     let db = profile_dirs(b.pid());
     assert!(!da.is_empty() && !db.is_empty(), "both own profiles");
-    assert_ne!(da, db, "profiles are private per instance: {da:?} vs {db:?}");
+    assert_ne!(
+        da, db,
+        "profiles are private per instance: {da:?} vs {db:?}"
+    );
 
     // Both respond over their own CDP sessions.
     let sa = content_text(&a.call("snapshot", json!({}), Duration::from_secs(30)));
     let sb = content_text(&b.call("snapshot", json!({}), Duration::from_secs(30)));
-    assert!(sa.contains("GLADIUS_MARKER_hello-12345"), "A responds: {sa:.120}");
+    assert!(
+        sa.contains("GLADIUS_MARKER_hello-12345"),
+        "A responds: {sa:.120}"
+    );
     assert!(sb.contains("DIALOG_FIXTURE_MARKER"), "B responds");
     finish(a);
     finish(b);
@@ -590,11 +615,7 @@ fn headless_occupied_profile_does_not_disturb_first_browser() {
     // first browser - the first endpoint keeps answering and keeps driving
     // exactly its own targets (no hijack in either direction).
     let exe = pinned_chromium_exe();
-    assert!(
-        exe.is_file(),
-        "pinned chromium missing: {}",
-        exe.display()
-    );
+    assert!(exe.is_file(), "pinned chromium missing: {}", exe.display());
     let profile = std::env::temp_dir().join(format!(
         "gladius-occupied-probe-{}-{}",
         std::process::id(),
@@ -708,7 +729,9 @@ fn headless_occupied_profile_does_not_disturb_first_browser() {
             !ws_b.is_empty() && ws_b != ws_a,
             "second is a distinct browser, first untouched: A={ws_a} B={ws_b}"
         );
-        eprintln!("[occupied-profile] sharing permitted by shell; first undisturbed A={ws_a} B={ws_b}");
+        eprintln!(
+            "[occupied-profile] sharing permitted by shell; first undisturbed A={ws_a} B={ws_b}"
+        );
     }
 }
 
@@ -768,7 +791,10 @@ fn headless_headed_request_fails_closed() {
         json!({"url": fixture("fixture.html")}),
         Duration::from_secs(60),
     );
-    assert!(nav.get("isError").is_some(), "headed navigate refuses: {nav}");
+    assert!(
+        nav.get("isError").is_some(),
+        "headed navigate refuses: {nav}"
+    );
     let t = content_text(&nav);
     assert!(
         t.contains("headless-only") || t.contains("not supported"),
