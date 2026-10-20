@@ -9,7 +9,7 @@
 ```powershell
 npx -y gladius-mcp@latest --doctor
 ```
-You need Node 22.14 or newer on Windows x64 first. Your first real serve run provisions the pinned server runtime (0.4.0) plus the pinned chrome-headless-shell browser (155.0.8059.84), both hash-verified, while `--doctor` only prints the manifest with the resolved cache paths and exits 0 without downloading anything.
+You need Node 22.14 or newer on Windows x64 first. Your first real serve run provisions the pinned server runtime (0.4.1) plus the pinned chrome-headless-shell browser (155.0.8059.84), both hash-verified, while `--doctor` only prints the manifest with the resolved cache paths and exits 0 without downloading anything.
 
 ### Or let your AI install it
 

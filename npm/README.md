@@ -33,6 +33,11 @@ npx gladius-mcp@latest --doctor
 Prints the pinned manifest and the resolved cache paths, exits 0, performs
 no fetch. `--print-manifest` is an alias.
 
+## Overrides
+
+Use `npx gladius-mcp@latest`; a pinned version is only installable while its
+GitHub release exists; the one-release policy deletes older releases.
+
 ## Requirements
 
 - Windows x86_64. Any other platform refuses at startup
