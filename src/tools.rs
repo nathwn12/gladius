@@ -1952,7 +1952,9 @@ async fn tool_screenshot(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
         .map_err(|e| {
-            ToolErr::fallback(format!("screenshot: capture payload is not valid base64: {e}"))
+            ToolErr::fallback(format!(
+                "screenshot: capture payload is not valid base64: {e}"
+            ))
         })?;
     let len = bytes.len() as i64;
     if let Some(p) = path {
@@ -4867,10 +4869,8 @@ mod screenshot_file_tests {
 
     #[test]
     fn path_writes_valid_png_and_creates_missing_parents() {
-        let dir = std::env::temp_dir().join(format!(
-            "gladius-screenshot-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("gladius-screenshot-test-{}", std::process::id()));
         let target = dir.join("nested").join("shot.png");
         let _ = std::fs::remove_dir_all(&dir);
         if let Err(e) = write_screenshot_file(target.to_str().unwrap(), &decode_fixture()) {
