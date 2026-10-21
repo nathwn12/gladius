@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.4.2] - 2026-10-21
+
+- Launcher/engine version handshake (fail closed): the npm launcher sets
+  `GLADIUS_EXPECTED_VERSION` to its own `package.json` version in the engine
+  child env, and refuses when its `engine-manifest.json` `serverVersion`
+  disagrees with it (actionable reinstall line, never "whatever is cached").
+  The engine (`src/main.rs`) exits 3 on a mismatch instead of serving a
+  mixed-version pair.
+- Launcher prints its own version (`--version`, no network) and derives the
+  runtime cache dir from the agreed pin (`<serverVersion>-<bundleSha8>`).
+- Global installs refused by design: `preinstall` guard fails
+  `npm i -g` with the `npx gladius-mcp@0.4.2` line; local installs unaffected.
+- Fixed stale engine pin: the manifest's `runtime.source`/`archive` pointed
+  at `v0.4.0` while the package was `0.4.1`; both now derive from `0.4.2`.
+- Docs: screenshot `path` writes the decoded PNG bytes to the given path
+  (see README); `gladius --version` prints `gladius <crate> (<sha>[-dirty])`.
+
 ## [0.4.1] - 2026-10-20
 
 - Docs: one-release policy — install with `npx gladius-mcp@latest`; a pinned version is only installable while its GitHub release exists.

@@ -33,6 +33,9 @@
 //     GLADIUS_CHROMIUM pointed at the provisioned browser (the server reads
 //     that variable), unless the user already set it: an explicit
 //     GLADIUS_CHROMIUM wins, and then no browser is provisioned at all.
+//     The child env always carries GLADIUS_EXPECTED_VERSION set to this
+//     launcher's own package.json version, so the engine's fail-closed gate
+//     (src/main.rs) refuses instead of serving a mixed-version pair.
 //     stdio is inherited. ALL launcher chatter goes to stderr; stdout belongs
 //     to the MCP channel. No stdout writes exist on the run path.
 //   - `--doctor` / `--print-manifest` is the no-network diagnostic: it
@@ -55,6 +58,7 @@ const { spawn } = require('node:child_process');
 
 const PKG_DIR = path.dirname(path.dirname(__filename));
 const MANIFEST_PATH = path.join(PKG_DIR, 'engine-manifest.json');
+const PKG_JSON_PATH = path.join(PKG_DIR, 'package.json');
 const PLATFORM_OVERRIDE_ENV = 'GLADIUS_MCP_ALLOW_NON_WINDOWS';
 const RUNTIME_CACHE_OVERRIDE_ENV = 'GLADIUS_ENGINE_CACHE';
 const BROWSER_CACHE_OVERRIDE_ENV = 'GLADIUS_CHROMIUM_CACHE';
@@ -74,6 +78,22 @@ function fail(message) {
 
 function log(message) {
   process.stderr.write(`gladius-mcp: ${message}\n`);
+}
+
+// The launcher's own version (the referent the engine gate checks against).
+// Read fresh from package.json on every run: never a cached constant, never
+// a fixed tag.
+function loadPackageVersion() {
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(PKG_JSON_PATH, 'utf8'));
+  } catch (err) {
+    fail(`cannot read package version at ${PKG_JSON_PATH}: ${err.message}`);
+  }
+  if (!pkg || typeof pkg.version !== 'string' || pkg.version.length === 0) {
+    fail(`package.json has no version; refusing to run (reinstall with \`npx -y gladius-mcp@latest\`).`);
+  }
+  return pkg.version;
 }
 
 function loadManifest() {
@@ -167,11 +187,12 @@ function printDoctor(manifest) {
 
 function usage(exitCode, stream) {
   const text = [
-    'usage: gladius-mcp [--doctor | --print-manifest | --help]',
+    'usage: gladius-mcp [--doctor | --print-manifest | --version | --help]',
     '',
     '  (no args)            provision the pinned runtime + browser on first run, then serve MCP over stdio',
     '  --doctor,            print the pinned manifest and the resolved cache',
     '  --print-manifest     paths, perform no network access, exit 0',
+    '  --version            print the launcher version, perform no network access, exit 0',
     '  --help, -h           print this usage',
     '',
     'runtime cache: ' + path.join('%LOCALAPPDATA%', 'gladius', 'engine', '<serverVersion>-<bundleSha8>') + ` (override: ${RUNTIME_CACHE_OVERRIDE_ENV})`,
@@ -574,6 +595,7 @@ function runServer(cacheDir, manifest, browserExe) {
   // signal relay is needed; the exit code is forwarded below.
   const env = { ...process.env };
   if (browserExe) env[BROWSER_PATH_OVERRIDE_ENV] = browserExe;
+  env.GLADIUS_EXPECTED_VERSION = loadPackageVersion();
   const child = spawn(exe, [], { stdio: 'inherit', env });
   child.on('error', (err) => fail(`cannot start ${exe}: ${err.message}`));
   child.on('exit', (code, signal) => {
@@ -589,7 +611,26 @@ async function main() {
   const args = process.argv.slice(2);
   const manifest = loadManifest();
   if (manifest.package !== 'gladius-mcp') fail('engine manifest names the wrong package.');
+  const pkgVersion = loadPackageVersion();
+  // Fail closed on a stale manifest: the runtime cache leaf derives from
+  // manifest.serverVersion, so agreement here is what binds the selected
+  // cache directory to this launcher's version. Never take "whatever is
+  // cached": a skew refuses with the reinstall line instead of provisioning
+  // or serving a mixed-version pair.
+  if (manifest.serverVersion !== pkgVersion) {
+    fail(
+      `version skew: launcher ${pkgVersion} vs manifest serverVersion ${manifest.serverVersion} ` +
+      `— reinstall with \`npx -y gladius-mcp@latest\` (then re-run --doctor); refusing to serve`
+    );
+  }
   if (args.includes('--help') || args.includes('-h')) usage(0, process.stdout);
+  if (args.includes('--version') || args.includes('version')) {
+    const known = new Set(['--version', 'version']);
+    const unknown = args.filter((a) => !known.has(a));
+    if (unknown.length > 0) usage(2, process.stderr);
+    process.stdout.write(pkgVersion + '\n');
+    process.exit(0);
+  }
   if (args.includes('--doctor') || args.includes('--print-manifest')) {
     const known = new Set(['--doctor', '--print-manifest']);
     const unknown = args.filter((a) => !known.has(a));

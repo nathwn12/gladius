@@ -96,8 +96,9 @@ in `THIRD-PARTY-NOTICES.md`.
 - `repository.url` in `npm/package.json` must match the GitHub repo
   (`https://github.com/nathwn12/gladius`) exactly — trusted
   publishing/provenance requires it.
-- `npm/package.json` has NO `scripts` field at all (the workflow asserts
-  this): a postinstall download would silently never run under npx, so
+- `npm/package.json` has no `scripts` field except the global-install-refusal
+  `preinstall` guard (the workflow asserts exactly this): a postinstall
+  download would silently never run under npx, so
   the engine is acquired on first RUN by the launcher instead.
 - Publish runs on a GitHub-hosted runner with `id-token: write`
   (OIDC requirement). Self-hosted runners are not trusted publishers.

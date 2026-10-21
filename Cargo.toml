@@ -1,6 +1,6 @@
 [package]
 name = "gladius"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 license = "MIT"
 description = "Browser-use MCP server in Rust driving the owned pinned Chromium (chrome-headless-shell) over CDP - single static binary, stdio transport"
@@ -28,6 +28,9 @@ futures-util = "0.3"
 serde_json = "1"
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Screenshot `path` writes decode the CDP base64 payload with this direct
+# dep (already in the resolved tree transitively); never hand-rolled.
+base64 = "0.22"
 
 # ---------------------------------------------------------------- build speed
 # Fast inner loop. `line-tables-only` keeps file:line backtraces but drops

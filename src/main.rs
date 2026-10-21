@@ -7,6 +7,33 @@ mod tools;
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Version handshake (fail closed): the npm launcher pins the engine it
+    // provisioned, but nothing in the protocol binds the two — a stale
+    // launcher once ran a stale engine silently. When the launcher exports
+    // GLADIUS_EXPECTED_VERSION (its own package version), a mismatch refuses
+    // to serve instead of running mixed versions. Unset = local/dev run, no
+    // gate. Launcher-side export is still required for this to bite.
+    if let Ok(expected) = std::env::var("GLADIUS_EXPECTED_VERSION") {
+        let actual = env!("CARGO_PKG_VERSION");
+        if !expected.trim().is_empty() && expected.trim() != actual {
+            eprintln!(
+                "[gladius] version mismatch: launcher {expected}, engine {actual} \
+                 — reinstall with `npx -y gladius-mcp@latest` (then re-run --doctor); refusing to serve"
+            );
+            std::process::exit(3);
+        }
+    }
+    // One stderr line on every startup so a harness can record exactly which
+    // engine ran. Stderr only: stdout belongs to the MCP channel in serve.
+    eprintln!(
+        "[gladius] engine gladius {} ({}{})",
+        env!("CARGO_PKG_VERSION"),
+        env!("GLADIUS_GIT_SHA"),
+        match env!("GLADIUS_GIT_DIRTY") {
+            "1" => "-dirty",
+            _ => "",
+        }
+    );
     // No headed path exists (headless-only by owner decision 2026-10-17):
     // a headed request fails closed here, before anything resolves,
     // provisions, or launches.
