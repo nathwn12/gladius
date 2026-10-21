@@ -269,8 +269,9 @@ dependencies = [
 
 [[package]]
 name = "gladius"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
+ "base64 0.22.1",
  "futures-util",
  "reqwest",
  "serde_json",

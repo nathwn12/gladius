@@ -30,8 +30,8 @@ pub fn list() -> Value {
             "anyOf": [{"required": ["url", "title", "truncated", "nodes"]}, {"required": ["mode", "text"]}]},
          "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}},
         {"name": "screenshot", "title": "Screenshot",
-         "description": "PNG screenshot of the active page (unavailable with GLADIUS_BACKEND_CAPS=dom-only: no rendering pipeline)",
-         "inputSchema": {"type": "object", "properties": {"fullPage": {"type": "boolean"}}, "additionalProperties": false},
+         "description": "PNG screenshot of the active page (unavailable with GLADIUS_BACKEND_CAPS=dom-only: no rendering pipeline). Optional path: an ABSOLUTE filesystem path the decoded PNG is also written to (missing parent directories are created; a failed write is a typed error, never a silent success). There is no allowlisted screenshot root: only absolute paths are accepted, and a relative path is rejected. When path is absent the reply shape is unchanged.",
+         "inputSchema": {"type": "object", "properties": {"fullPage": {"type": "boolean"}, "path": {"type": "string"}}, "additionalProperties": false},
          "outputSchema": {"type": "object",
             "properties": {"mimeType": {"type": "string"}, "bytes": {"type": "integer", "minimum": 0}},
             "required": ["mimeType", "bytes"], "additionalProperties": false},
@@ -353,14 +353,15 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                 .await
             }
             "screenshot" => {
-                if let Err(e) = check_unknown("screenshot", args, &["fullPage"]) {
+                if let Err(e) = check_unknown("screenshot", args, &["fullPage", "path"]) {
                     return e.envelope();
                 }
                 let full = args
                     .get("fullPage")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                tool_screenshot(browser, full).await
+                let path = args.get("path").and_then(|v| v.as_str());
+                tool_screenshot(browser, full, path).await
             }
             "click" => {
                 if let Err(e) = check_unknown("click", args, &["element", "frame"]) {
@@ -1883,7 +1884,38 @@ async fn tool_snapshot_text_frame(
               "structuredContent": {"mode": "text", "text": prose}}))
 }
 
-async fn tool_screenshot(browser: &Browser, full_page: bool) -> Result<Value, ToolErr> {
+/// Write an already-decoded screenshot PNG to `path`. There is no
+/// allowlisted screenshot root in this crate, so only an ABSOLUTE path is
+/// accepted (a relative path is a typed `invalid_args`/`bad_value` refusal,
+/// never resolved against a working directory). Missing parent directories
+/// are created; any I/O failure is a typed error, never a silent success.
+/// Split out from `tool_screenshot` so the file path is unit-testable
+/// without a browser.
+fn write_screenshot_file(path: &str, png: &[u8]) -> Result<(), ToolErr> {
+    let dest = std::path::Path::new(path);
+    if !dest.is_absolute() {
+        return Err(ToolErr::typed(
+            format!("screenshot: refusing relative path (pass an absolute path): {path}"),
+            json!({"code": "invalid_args", "reason": "bad_value", "tool": "screenshot", "arg": "path"}),
+        ));
+    }
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ToolErr::fallback(format!("screenshot: cannot create parent directory: {e}"))
+            })?;
+        }
+    }
+    std::fs::write(dest, png)
+        .map_err(|e| ToolErr::fallback(format!("screenshot: save failed: {e}")))?;
+    Ok(())
+}
+
+async fn tool_screenshot(
+    browser: &Browser,
+    full_page: bool,
+    path: Option<&str>,
+) -> Result<Value, ToolErr> {
     // Capability gate: a dom-only backend has no rendering pipeline, so
     // there are no pixels to capture. Refuse with the backend and the
     // reason, never a fake or blank image. Checked before any browser
@@ -1914,12 +1946,25 @@ async fn tool_screenshot(browser: &Browser, full_page: bool) -> Result<Value, To
         .and_then(|v| v.as_str())
         .ok_or("screenshot: no data returned".to_string())?
         .to_string();
-    // Decoded byte length without a new dependency: base64 4 chars -> 3 bytes,
-    // minus padding. The text/structured blocks never carry the pixels.
-    let datalen = data.len();
-    let pad = data.chars().rev().take_while(|&c| c == '=').count();
-    let bytes = ((datalen / 4) * 3).saturating_sub(pad) as i64;
-    let meta = json!({"mimeType": "image/png", "bytes": bytes});
+    // Decoded with the `base64` crate (never hand-rolled). The byte count
+    // is the decoded length; the text/structured blocks never carry pixels.
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .map_err(|e| {
+            ToolErr::fallback(format!("screenshot: capture payload is not valid base64: {e}"))
+        })?;
+    let len = bytes.len() as i64;
+    if let Some(p) = path {
+        write_screenshot_file(p, &bytes)?;
+    }
+    let mut meta = serde_json::Map::new();
+    meta.insert("mimeType".to_string(), json!("image/png"));
+    meta.insert("bytes".to_string(), json!(len));
+    if let Some(p) = path {
+        meta.insert("path".to_string(), json!(p));
+    }
+    let meta = Value::Object(meta);
     Ok(
         json!({"content": [{"type": "image", "data": data, "mimeType": "image/png"},
                           {"type": "text", "text": meta.to_string()}],
@@ -4801,5 +4846,48 @@ async fn tool_cdp(
     match browser.cdp_raw(method, params, session).await {
         Ok(v) => Ok(ok_text(json!({"result": v}).to_string())),
         Err(e) => Err(ToolErr::fallback(e)),
+    }
+}
+
+#[cfg(test)]
+mod screenshot_file_tests {
+    use super::write_screenshot_file;
+
+    // 1x1 transparent PNG, decoded with the same `base64` crate the tool uses.
+    const TINY_PNG_B64: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+    fn decode_fixture() -> Vec<u8> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(TINY_PNG_B64)
+            .expect("fixture must decode")
+    }
+
+    #[test]
+    fn path_writes_valid_png_and_creates_missing_parents() {
+        let dir = std::env::temp_dir().join(format!(
+            "gladius-screenshot-test-{}",
+            std::process::id()
+        ));
+        let target = dir.join("nested").join("shot.png");
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(e) = write_screenshot_file(target.to_str().unwrap(), &decode_fixture()) {
+            panic!("write must succeed: {}", e.prose);
+        }
+        let back = std::fs::read(&target).expect("file must exist");
+        assert!(
+            back.len() >= 8 && back[..8] == PNG_MAGIC,
+            "file must start with the PNG magic bytes"
+        );
+        assert_eq!(back, decode_fixture(), "round trip must be exact");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relative_path_is_rejected() {
+        let r = write_screenshot_file("relative/shot.png", &decode_fixture());
+        assert!(r.is_err(), "relative path must fail closed");
     }
 }

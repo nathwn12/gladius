@@ -93,7 +93,16 @@ jobs:
           if ($Matches[1] -ne $ver) { throw "crate version $($Matches[1]) != tag version $ver" }
           $pkg = Get-Content npm/package.json -Raw | ConvertFrom-Json
           if ($pkg.version -ne $ver) { throw "npm package version $($pkg.version) != tag version $ver" }
-          if ($null -ne $pkg.scripts) { throw 'npm/package.json must not contain a scripts field (postinstall would never run under npx)' }
+          # Sole scripts-field exception: the global-install-refusal preinstall
+          # guard (no install-time download; it only refuses `npm i -g`).
+          # A postinstall download would silently never run under npx, so
+          # anything beyond that single guard still fails closed.
+          if ($null -ne $pkg.scripts) {
+            $names = @($pkg.scripts.PSObject.Properties.Name)
+            if ($names.Count -ne 1 -or $names[0] -ne 'preinstall' -or $pkg.scripts.preinstall -notmatch 'npm_config_global') {
+              throw 'npm/package.json scripts field must hold only the global-install-refusal preinstall guard'
+            }
+          }
           $man = Get-Content npm/engine-manifest.json -Raw | ConvertFrom-Json
           if ($man.serverVersion -ne $ver) { throw "manifest serverVersion $($man.serverVersion) != tag version $ver" }
           # 2. Browser identity drift gate: the npm manifest's browser pin must
@@ -208,7 +217,7 @@ jobs:
           node -e "const v=process.versions.node.split('.').map(Number); if (!(v[0]>22||(v[0]===22&&v[1]>=14))) { console.error('need node >= 22.14.0'); process.exit(1) }"
           node -e "const v=require('child_process').execSync('npm --version').toString().trim().split('.').map(Number); if (!(v[0]>11||(v[0]===11&&(v[1]>5||(v[1]===5&&v[2]>=1))))) { console.error('need npm >= 11.5.1'); process.exit(1) }"
           test "$(node -p "require('./npm-pkg/package.json').version")" = "${GITHUB_REF_NAME#v}" || { echo "npm package version != tag version"; exit 1; }
-          node -e "for (const f of ['./npm-pkg/package.json','./npm-pkg/engine-manifest.json','./npm-pkg/bin/gladius-mcp.js']) require('fs').accessSync(f); const p=require('./npm-pkg/package.json'); if (p.scripts!==undefined) { console.error('scripts field present'); process.exit(1) }; const m=require('./npm-pkg/engine-manifest.json'); if (m.serverVersion!==p.version) { console.error('serverVersion != package version'); process.exit(1) }; for (const s of [m.runtime.archive.sha256, m.runtime.server.sha256, m.browser.asset.sha256]) if (!/^[0-9a-f]{64}$/.test(s)) { console.error('manifest still has placeholder hashes'); process.exit(1) }; if (!Array.isArray(m.browser.files) || m.browser.files.length!==m.browser.fileCount) { console.error('browser file list != fileCount'); process.exit(1) }; console.log('npm package OK: no scripts field, serverVersion matches, all release hashes filled, browser pin complete')"
+          node -e "for (const f of ['./npm-pkg/package.json','./npm-pkg/engine-manifest.json','./npm-pkg/bin/gladius-mcp.js']) require('fs').accessSync(f); const p=require('./npm-pkg/package.json'); if (p.scripts!==undefined && (Object.keys(p.scripts).join(',')!=='preinstall' || !/npm_config_global/.test(p.scripts.preinstall))) { console.error('scripts field holds more than the preinstall global-refusal guard'); process.exit(1) }; const m=require('./npm-pkg/engine-manifest.json'); if (m.serverVersion!==p.version) { console.error('serverVersion != package version'); process.exit(1) }; for (const s of [m.runtime.archive.sha256, m.runtime.server.sha256, m.browser.asset.sha256]) if (!/^[0-9a-f]{64}$/.test(s)) { console.error('manifest still has placeholder hashes'); process.exit(1) }; if (!Array.isArray(m.browser.files) || m.browser.files.length!==m.browser.fileCount) { console.error('browser file list != fileCount'); process.exit(1) }; console.log('npm package OK: no scripts field, serverVersion matches, all release hashes filled, browser pin complete')"
       - name: publish to npm (OIDC trusted publishing)
         id: publish_npm
         if: steps.release_mode.outputs.current == 'true'
