@@ -187,10 +187,15 @@ jobs:
           $tag = $env:RELEASE_TAG
           $stage = "$env:RUNNER_TEMP\cleanroom"
           New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          $info = npm pack --json --pack-destination $stage ./npm | ConvertFrom-Json
           # npm 11 prints an array, npm 12 an object keyed by package name.
-          $entry = if ($info -is [array]) { $info[0] } else { @($info.PSObject.Properties.Value)[0] }
-          $tgz = Join-Path $stage $entry.filename
+          # ConvertFrom-Json unrolls a single-element array to an object, so
+          # the old branches read `id` instead of `filename`; node reads both.
+          $info = npm pack --json --pack-destination $stage ./npm | Out-String
+          $name = node -p "Object.values(JSON.parse(process.argv[1]))[0].filename" "$info"
+          $tgz = Join-Path $stage $name
+          if (-not $name -or -not (Test-Path -LiteralPath $tgz -PathType Leaf)) {
+            throw "npm pack gave no tarball in $stage; raw npm output:`n$info"
+          }
           $bundle = "dist\gladius-$tag-windows-x86_64.zip"
           if (-not (Test-Path -LiteralPath $bundle)) { throw "built archive missing: $bundle" }
           node scripts/cleanroom-check.mjs --tarball $tgz --bundle $bundle
