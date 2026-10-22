@@ -56,6 +56,11 @@ manifest pins the archive hash, the extracted tree's file count + total size,
 and every per-file sha256. The runtime bundle carries the Chromium licence
 attribution copy (`THIRD-PARTY-LICENSES/LICENSE.headless_shell`).
 
+## Full documentation
+
+https://github.com/nathwn12/gladius/blob/main/README.md
+https://www.npmjs.com/package/gladius-mcp
+
 ## License
 
 MIT — see LICENSE.
