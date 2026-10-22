@@ -7,9 +7,9 @@
 ## Install
 
 ```powershell
-npx gladius-mcp@0.4.2 --doctor
+npx gladius-mcp@0.4.3 --doctor
 ```
-You need Node 22.14 or newer on Windows x64 first. Your first real serve run provisions the pinned server runtime (0.4.2) plus the pinned chrome-headless-shell browser (155.0.8059.84), both hash-verified, while `--doctor` only prints the manifest with the resolved cache paths and exits 0 without downloading anything.
+You need Node 22.14 or newer on Windows x64 first. Your first real serve run provisions the pinned server runtime (0.4.3) plus the pinned chrome-headless-shell browser (155.0.8059.84), both hash-verified, while `--doctor` only prints the manifest with the resolved cache paths and exits 0 without downloading anything.
 Global installs are refused by design — use `npx`, never `npm i -g`.
 
 ### Or let your AI install it

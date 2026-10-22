@@ -1,7 +1,7 @@
 {
   "_comment": "Pinned browser + server runtime manifest for the gladius-mcp launcher. The BROWSER is fetched from Google's Chrome-for-Testing endpoint at first run and is NEVER redistributed in our release assets or npm package: our own scripts/chromium-manifest.json is the integrity root (CfT publishes no hashes). The release workflow asserts this browser pin deep-equals that file, agrees with the pin constants in scripts/fetch-chromium.ps1, and matches the provisioned browser bytes, then fills the runtime.* hashes it computes from the real build artifacts. The launcher downloads ONLY runtime.archive (from the tagged GitHub Release) plus the browser asset (from Google), verifying every sha256 before and after extraction.",
   "package": "gladius-mcp",
-  "serverVersion": "0.4.2",
+  "serverVersion": "0.4.3",
   "browser": {
     "project": "Chrome for Testing: chrome-headless-shell (headless-only //content wrapper)",
     "version": "155.0.8059.84",
@@ -1460,9 +1460,9 @@
     ]
   },
   "runtime": {
-    "source": "https://github.com/nathwn12/gladius/releases/download/v0.4.2",
+    "source": "https://github.com/nathwn12/gladius/releases/download/v0.4.3",
     "archive": {
-      "name": "gladius-v0.4.2-windows-x86_64.zip",
+      "name": "gladius-v0.4.3-windows-x86_64.zip",
       "sha256": "RELEASE_WORKFLOW_FILLS_THIS",
       "size": 0
     },

@@ -1,6 +1,6 @@
 [package]
 name = "gladius"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 license = "MIT"
 description = "Browser-use MCP server in Rust driving the owned pinned Chromium (chrome-headless-shell) over CDP - single static binary, stdio transport"

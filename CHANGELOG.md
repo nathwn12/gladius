@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.4.3] - 2026-10-23
+
+- Rebuild of unchanged engine source, cut to exercise the release gate:
+  every commit after `v0.4.2` is release-gate tooling only
+  (`.github/workflows/release.yml`, `docs/PUBLISHING.md`,
+  `scripts/release-check.mjs`, `scripts/cleanroom-check.mjs`), so this
+  version ships the same `src/` and the same `Cargo.lock` as `0.4.2`.
+- Publish verification now polls the npm registry for up to 3 minutes
+  (12 x 15 s) after `npm publish` instead of checking once, and the
+  workflow fails closed when the packaged manifest's `runtime.source` or
+  `runtime.archive.name` does not contain the tag.
+- No behaviour change and no dependency change.
+
 ## [0.4.2] - 2026-10-21
 
 - Launcher/engine version handshake (fail closed): the npm launcher sets
