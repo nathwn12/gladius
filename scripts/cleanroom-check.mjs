@@ -5,8 +5,19 @@
 // scrubbed profile with empty caches — then prove the engine provisions
 // and the server boots. Prints a PASS/FAIL table; any FAIL exits 1.
 //
-//   node scripts/cleanroom-check.mjs --tarball <path.tgz>
+//   node scripts/cleanroom-check.mjs --tarball <path.tgz> [--bundle <path.zip>]
 //   node scripts/cleanroom-check.mjs --registry --version <semver> [--keep]
+//
+// --bundle points the launcher (GLADIUS_ENGINE_BUNDLE) at a locally built
+// runtime archive instead of the Release download, so the gate can run BEFORE
+// that Release exists. It applies to --tarball mode only; the launcher still
+// checks the archive's size and sha256 against the installed manifest, so a
+// wrong zip fails this gate exactly like a bad download would. --registry mode
+// scrubs the override, so the public gate can never be bypassed.
+//
+// The boot itself still provisions the pinned Chromium from Google's
+// Chrome-for-Testing endpoint on first run: that part of the gate stays
+// network-dependent whatever the local runtime bundle says.
 //
 // Node stdlib only. Windows-only.
 import { spawnSync } from 'node:child_process';
@@ -23,19 +34,28 @@ if (process.platform !== 'win32') {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BOOT_TIMEOUT_MS = 300 * 1000;
 
+const USAGE = 'usage: cleanroom-check.mjs --tarball <path.tgz> [--bundle <path.zip>] | --registry --version <semver> [--keep]';
 let tarball = null;
 let registry = false;
 let version = null;
 let keep = false;
+let bundle = null;
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
   if (a === '--tarball') tarball = process.argv[++i];
   else if (a === '--registry') registry = true;
   else if (a === '--version') version = process.argv[++i];
-  else if (a === '--keep') keep = true;
+  else if (a === '--bundle') {
+    bundle = process.argv[++i];
+    if (!bundle || bundle.startsWith('--')) {
+      console.error('cleanroom-check: error: --bundle needs a <path.zip> value.');
+      console.error(USAGE);
+      process.exit(1);
+    }
+  } else if (a === '--keep') keep = true;
   else {
     console.error(`cleanroom-check: error: unknown arg '${a}'.`);
-    console.error('usage: cleanroom-check.mjs --tarball <path.tgz> | --registry --version <semver> [--keep]');
+    console.error(USAGE);
     process.exit(1);
   }
 }
@@ -63,6 +83,23 @@ if (tarball) {
     }
   } catch (err) {
     console.error(`cleanroom-check: error: cannot stat tarball ${tarball}: ${err.message}`);
+    process.exit(1);
+  }
+}
+// --bundle is a tarball-mode input only: in --registry mode the launcher must
+// provision from the public Release, so an override there would fake the gate.
+if (bundle && registry) {
+  console.error('cleanroom-check: error: --bundle applies to --tarball mode only; --registry must download from the public Release.');
+  process.exit(1);
+}
+if (bundle) {
+  try {
+    if (!fs.statSync(path.resolve(bundle)).isFile()) {
+      console.error(`cleanroom-check: error: bundle is not a file: ${bundle}`);
+      process.exit(1);
+    }
+  } catch (err) {
+    console.error(`cleanroom-check: error: bundle not found: ${bundle}`);
     process.exit(1);
   }
 }
@@ -95,6 +132,23 @@ const scrubEnv = {
   npm_config_cache: npmCache,
   npm_config_prefix: npmPrefix,
 };
+// A stale engine pin in the parent env would bypass the clean room: the
+// launcher would reuse a warmed runtime and the gate would prove nothing.
+delete scrubEnv.GLADIUS_ENGINE_CACHE;
+// A local-bundle override is only ever supplied by this script, and only for
+// the pre-publish tarball gate. Scrubbing it here means --registry can never
+// inherit one and skip the real download.
+delete scrubEnv.GLADIUS_ENGINE_BUNDLE;
+// Tarball mode + --bundle: hand the child a copy inside <tmp> so the gate still
+// touches nothing outside its scratch dir. The launcher verifies the copy's
+// size and sha256 against the installed manifest, so a wrong zip is refused.
+if (tarball && bundle) {
+  const bundleDir = path.join(tmp, 'bundle');
+  fs.mkdirSync(bundleDir, { recursive: true });
+  const stagedBundle = path.join(bundleDir, path.basename(path.resolve(bundle)));
+  fs.copyFileSync(path.resolve(bundle), stagedBundle);
+  scrubEnv.GLADIUS_ENGINE_BUNDLE = stagedBundle;
+}
 
 const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
 function run(cmd, { timeout = 120 * 1000, stdin = 'pipe' } = {}) {
@@ -278,6 +332,10 @@ if (!engineDir || !engineDir.startsWith(tmp)) {
 // Chromium is provisioned alongside on first run (~123 MB): report only,
 // never assert (beyond the boot-clean stderr check above).
 {
+  console.log(`cleanroom-check: engine source: ${scrubEnv.GLADIUS_ENGINE_BUNDLE ? `local bundle ${scrubEnv.GLADIUS_ENGINE_BUNDLE}` : 'Release download'}`);
+  if (bundle) {
+    console.log('cleanroom-check: the runtime bundle is local, but the boot still provisions Chromium from Google\'s Chrome-for-Testing endpoint (network-dependent)');
+  }
   const cdir = doctor?.browserCacheDir && String(doctor.browserCacheDir).startsWith(tmp)
     ? doctor.browserCacheDir
     : path.join(localAppData, 'gladius', 'chromium');
