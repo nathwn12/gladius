@@ -322,7 +322,17 @@ fn snapshot_redacts_password_and_autocomplete_values() {
     let mut c = Client::spawn();
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     let url = format!("http://127.0.0.1:{port}/");
-    let nav = c.call("navigate", json!({"url": url}));
+    let mut nav = c.call("navigate", json!({"url": url}));
+    // CDP can abort the first navigation while the browser attaches
+    // (net::ERR_ABORTED); this test's subject is redaction, not navigation,
+    // so one retry is allowed — any other error stays fatal and verbatim.
+    if is_error(&nav) && nav.to_string().contains("net::ERR_ABORTED") {
+        nav = c.call("navigate", json!({"url": url}));
+        assert!(
+            !is_error(&nav),
+            "navigate retry after net::ERR_ABORTED: {nav}"
+        );
+    }
     assert!(!is_error(&nav), "navigate ok: {nav}");
 
     let snap = c.call("snapshot", json!({}));

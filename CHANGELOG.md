@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.4.4] - 2026-10-23
+
+- Release gate: the pre-publish cleanroom installed the tarball and booted
+  it, but the launcher fetches `runtime.archive` from the GitHub Release —
+  an asset the `publish` job creates *after* `needs: [build]`. Every new
+  version therefore 404'd at the gate. The launcher gained
+  `GLADIUS_ENGINE_BUNDLE`, a diagnostics-only override that reads a local
+  zip instead of downloading, and `scripts/cleanroom-check.mjs` gained
+  `--bundle` to point it at the archive built in the same run. The size and
+  sha256 checks are unchanged and still run on the local bytes, and both
+  the override and a stale `GLADIUS_ENGINE_CACHE` are scrubbed in
+  `--registry` mode, so the gate keeps its teeth. The gate is not weakened:
+  it is fed the real artifact. The boot still provisions Chromium from
+  Google, so that part stays network-dependent.
+- `release.yml` accepts `workflow_dispatch` with `version` and `dry_run`
+  (default `true`), so the whole build + pre-publish gate can be rehearsed
+  under a `v<version>` tag before one exists. A dry run skips exactly the
+  irreversible steps — release creation, npm publish, outgoing-release
+  deletion — and the public-registry gate that depends on them.
+- `tests/safety.rs`: the `snapshot_redacts_password_and_autocomplete_values`
+  navigate precondition is retried once when it fails with
+  `net::ERR_ABORTED` (a CDP abort while the browser attaches, observed in
+  one of three release runs). Any other error stays fatal and verbatim; the
+  retry is asserted, and every redaction/leak assertion is untouched.
+- No engine behaviour change.
+
 ## [0.4.3] - 2026-10-23
 
 - Rebuild of unchanged engine source, cut to exercise the release gate:
