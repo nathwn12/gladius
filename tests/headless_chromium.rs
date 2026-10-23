@@ -351,7 +351,7 @@ fn headless_owned_e2e_navigate_snapshot_screenshot() {
                 .map(|s| s.to_string())
         })
         .collect();
-    assert_eq!(names.len(), 22, "exactly the 22 tools: {names:?}");
+    assert_eq!(names.len(), 25, "exactly the 25 tools: {names:?}");
 
     let nav = c.call(
         "navigate",

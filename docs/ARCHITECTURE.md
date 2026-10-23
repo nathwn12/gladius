@@ -11,8 +11,11 @@
 |---|---|---|
 | `navigate` | `url: string` | text after load event (timeout -> error) |
 | `snapshot` | `mode?: "ax"\|"legacy"\|"text"` (default AX) | Real Accessibility tree: one line per actionable node with a stable ref (`@e1`, `@e2`, ...), role/name/value, plus page text (capped 8000 chars). Hidden/ignored subtrees (display:none, aria-hidden) are excluded from the lines; an old ref to such a node is a typed `stale_ref`, never a silent click. `mode:"legacy"` keeps the old DOM heuristic (stamps hidden nodes); `mode:"text"` = text-only output. Shadow-DOM nodes resolve in the snapshot, but acting on a shadow ref through the main-document resolver is not yet supported (typed `stale_ref`, G4). `frame` (CDP frameId) scopes the snapshot to that iframe |
-| `screenshot` | `fullPage?: bool` (default false) | PNG bytes (base64 `image` part) of viewport / full page; refuses under `dom-only` |
-| `click` | `element: string` (CSS, or AX ref `@eN`), `frame?: string` (CDP frameId) | trusted pointer sequence (`mouseMoved`/`mousePressed`/`mouseReleased` on the page session; `isTrusted:true` pointer/mouse/click events) after scroll + hit-test; occluded targets are typed `not_actionable`, never a click into the overlay. `frame` scopes to that iframe (same-process CSS selectors; per-level owner hit-test up the ancestor chain; OOPIF without a mapped target is a typed error, never a main-frame click) |
+| `screenshot` | `fullPage?: bool`, `path?: string`, `deterministic?: bool` (default false), `width?: number`, `height?: number` (only with `deterministic`) | PNG bytes (base64 `image` part) of viewport / full page; refuses under `dom-only`. `deterministic:true` fixes device metrics (current viewport or `width`/`height`, `deviceScaleFactor:1`, `mobile:false`) and restores them afterwards, sets `prefers-reduced-motion:reduce`, injects a temporary style freezing `animation`/`transition`/`caret-color`/scrollbars, waits on `document.fonts.ready` + every `img` `complete` + two animation frames, then captures `{format:png, fromSurface:true, captureBeyondViewport:fullPage}`. The reply adds `viewport`, `deviceScaleFactor`, `url`, `bytes` and a FNV-1a `checksum`, so two captures of the same page are provably identical |
+| `assert_layout` | `ref?: string\|string[]`, `selector?: string\|string[]` (one of them), `checks?: object`, `screenshotOnFail?: bool`, `screenshotPath?: string` | geometry proved without pixels. Checks: `exists`, `visible`, `stableFrames` (N animation frames, identical bbox), `box {x,y,w,h,tolerance}` (VIEWPORT css px from `DOM.getBoxModel`), `hitTarget` (`elementFromPoint` at the centre is the target or a descendant), `computed` (subset of `getComputedStyle`), `noOverflow` (`scrollWidth/Height <= clientWidth/Height + tolerance`), `inViewport`. Returns `{pass, checks:[{target,check,pass,expected,actual,delta}], targets:[...]}`; `screenshotOnFail` adds one deterministic capture's path/bytes/checksum |
+| `layout` | `ref?`, `selector?`, `includeOverlaps?: bool` (default true) | every match's viewport `rect`, page-coordinate `box` (`DOM.getBoxModel`), content quad count, scroll size (`scrollWidth/Height` vs `clientWidth/Height`), computed `display`/`visibility`/`opacity`, a z-order hint (`paintIndex`, `zIndex`, `position`, `stackingContext`) and every overlapping pair with its intersection rect and area |
+| `visual` | `action: "save"\|"compare"\|"list"\|"delete"`, `name?: string`, `fullPage?: bool`, `threshold?: number` (per-channel 0..1, default 0.1), `maxDiffPixels?: number`, `maxDiffRatio?: number`, `maskRects?: {x,y,w,h}[]`, `update?: bool`, `antialias?: bool` (default true), `includeAA?: bool` (default false, the inverse), `minDiffCluster?: number` (default 2), `requireEnvironmentMatch?: bool` | deterministic baselines under `GLADIUS_VISUAL_DIR` (default `<cwd>/.gladius/visual`), names sanitised to `[A-Za-z0-9._-]`; each baseline writes a `<name>.meta.json` sidecar (browser, browserMajor, viewport, deviceScaleFactor, url, checksum, createdAt). `compare` diffs the current deterministic capture against the baseline **inside a scratch headless target created with `background:true`** (both PNGs ride in as `data:` URLs and are decoded onto a canvas, so no PNG crate is added) and returns `{pass, diffPixels, totalPixels, ratio, bbox, maxChannelDelta, ignoredPixels, ignoredClusters, baselinePath, diffPath, antialias, minDiffCluster, scratchBackground, environment {match, baseline, current}}`. Anti-aliasing is ignored by default with a mechanical rule: a candidate is suppressed only when its 3x3 luminance neighbourhood has ≥32 levels of contrast in **both** images, so a 1 px edge artefact passes while a 1 px change in a flat fill or a 2x2 block fails. A browser-major / viewport / DSF mismatch raises a `baseline_environment_mismatch` warning (not a failure unless `requireEnvironmentMatch:true`); `update:true` rewrites the PNG and the sidecar |
+| `click` | `element: string` (CSS, or AX ref `@eN`), `frame?: string` (CDP frameId), `hoverFirst?: bool` (default false) | trusted pointer sequence at the exact float box centre: `mousePressed` + `mouseReleased` only, plus ONE `mouseMoved` positioning event when `hoverFirst:true` - no movement loop, no interpolation; `isTrusted:true` pointer/mouse/click events after scroll + hit-test; occluded targets are typed `not_actionable`, never a click into the overlay. `frame` scopes to that iframe (same-process CSS selectors; per-level owner hit-test up the ancestor chain; OOPIF without a mapped target is a typed error, never a main-frame click) |
 | `type` | `element: string, text: string, submit?: bool, frame?: string` | focus + select-all in the (frame) realm, then trusted `Input.insertText` (`isTrusted:true` input event); the seed is replaced, not appended. File/date-like and non-editable targets are typed `not_editable`, never a silent no-op |
 | `evaluate` | `expression: string, target?: string, frame?: string` | JSON-serialised JS result (`undefined` -> tool error, distinct from explicit `null`); `target` (CDP targetId) evaluates in that realm, `frame` (CDP frameId) in that iframe's isolated world |
 | `wait_for` | `selector?, text?, ms?, networkIdle?: bool, idleMs?: number, expression?: string` (at least one field) | `{ ok: true }` when the condition holds or timeout elapses (max 15s); `expression` polls a JS predicate with backoff |
@@ -45,9 +48,13 @@ Rules: tools are **dumb primitives** - no planner, no LLM, no judgement-retries 
   Headless-only (owner decision 2026-10-17, no headed path). Launched as
   `chrome-headless-shell --headless --remote-debugging-port <free>
   --user-data-dir <private> --no-first-run --no-default-browser-check
+  --disable-backgrounding-occluded-windows
+  --disable-renderer-backgrounding --disable-background-timer-throttling
   --remote-allow-origins http://127.0.0.1:<port> about:blank`, readiness via
-  `GET /json/version`. Full pin record: `docs/CHROMIUM.md`, launch contract:
-  `docs/ENGINE.md`. |
+  `GET /json/version`. The three `--disable-*` flags exist so a tab that is
+  NOT the active page still renders, still screenshots and still runs its
+  timers (asserted by the selftest). Full pin record: `docs/CHROMIUM.md`,
+  launch contract: `docs/ENGINE.md`. |
 | **Tier 1 (rejected)** | Lightpanda no-render | — | Rejected: no Windows target; AGPL-3.0 §13-only; text-only raster. |
 
 No full-Chrome tier: there is no headed path and none is planned - the shell
@@ -72,7 +79,7 @@ gladius opened and never kills, never sweeps. `GLADIUS_BACKEND_CAPS` declares `r
 - Transport: **JSON-RPC 2.0 over stdio, newline-delimited** (one message per line) -
   **hand-rolled** in `src/mcp.rs` over `tokio` stdio and `serde_json`: no `rmcp` SDK, no
   external framing crate. STDOUT carries only protocol frames; all logs go to STDERR.
-- Lifecycle: `initialize` -> `tools/list` (exactly the 22 tools above) -> `tools/call` ->
+- Lifecycle: `initialize` -> `tools/list` (exactly the 25 tools above) -> `tools/call` ->
   stdio EOF / `close` -> shutdown.
 - Each `tools/call` response is `{ content: [{ type: "text"|"image", ... }] }` per MCP content
   convention; `screenshot` returns an `image` part (base64 PNG), everything else `text`.
@@ -161,6 +168,107 @@ running by design - no `kill_tree`, no pid kill, nothing deleted.
   (`readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`), and
   every error carries a typed `structuredContent` code/reason - see §1 and
   the envelope contract.
+
+## 6a. Determinism, focus and the no-OS-input guarantee
+
+The hard constraint behind every one of these tools: **zero OS cursor
+movement, zero OS keyboard injection, zero focus stealing, zero visible
+window or terminal for the owned engine.** Everything rides CDP against an
+owned `chrome-headless-shell`, which cannot go headed at all. The one
+qualification is the explicit attach seam: an engine the user started
+(`GLADIUS_CDP_URL`) is theirs and not headless by construction, so
+`visual compare` opens and closes one scratch tab there for the in-engine
+diff. That is a tab in an engine gladius does not own; gladius itself never
+raises, focuses or moves a window on any path.
+
+- **Exact input, no animation.** `click` resolves the box centre as a float
+  (sub-pixel) and dispatches `mousePressed` + `mouseReleased` at that point -
+  no `mouseMoved` at all unless the caller passes `hoverFirst:true`, which
+  adds ONE positioning event at the same point. No interpolation, no stepped
+  path, no smoothing loop (`Browser::mouse_click`); `hover` stays an
+  explicit, separately requested move. `type` is `Input.insertText`; `key`
+  is `dispatchKeyEvent`. No OS input API is referenced anywhere.
+- **Focus without foreground.** `attach_to` enables
+  `Emulation.setFocusEmulationEnabled` on every session, so `:focus`,
+  `document.hasFocus()` and focus-gated handlers behave as if the tab owned
+  the focus while the operator's real focus is untouched. No
+  `Page.bringToFront` exists on any path: activating a tab requires an
+  explicit `targets select` / `tabs select`.
+- **Background tabs keep working.** The launch adds
+  `--disable-backgrounding-occluded-windows`,
+  `--disable-renderer-backgrounding` and
+  `--disable-background-timer-throttling` (`chromium_argv`). The selftest
+  proves it: with the fixture in a background tab, a capture taken on that
+  tab's own session is byte-identical to the foreground capture and its
+  `setInterval` keeps firing (25 ticks in 1.2 s instead of ~0-1).
+- **Deterministic pixels.** `screenshot {deterministic:true}` pins metrics,
+  motion, caret and scrollbars and waits for fonts/images/frames before
+  capturing, then restores every override **and confirms the restore from the
+  page** (bounded poll of viewport/dsf, the freeze stylesheet and
+  `matchMedia`, with one re-apply if the clear did not land): an awaited CDP
+  reply is not proof that the page has applied it. The motion preference is
+  restored to the **engine/host default**, so the guarantee is
+  "unchanged from the pre-capture value" - a host that asks for reduced motion
+  (CI runners disable animations) reports `reduce` again afterwards, and the
+  reply says whether the emulation was applied at all
+  (`reducedMotionEmulated`). Two captures of the same page
+  return the same checksum - the assertion the selftest makes.
+- **Geometry without pixels.** `assert_layout` and `layout` answer "where is
+  it / is it really there" from `DOM.getBoxModel` + `Runtime.evaluate`, so a
+  layout regression is caught and reported as numbers (`{check, pass,
+  expected, actual, delta}`) instead of requiring an image diff.
+- **Visual regression without a PNG crate.** `visual compare` opens a
+  throwaway target, decodes baseline and current from `data:` URLs onto a
+  canvas, and diffs `ImageData` there. No dependency was added for PNG
+  decoding. The target is created with `background:true` so it never becomes
+  the active tab, and there is no foreground fallback: an engine that rejects
+  the parameter produces a typed `scratch_background_unsupported` error and no
+  target is created at all (asserted against a recording peer that answers the
+  rejection a real engine sends). It is closed on every path. On an external
+  attach that scratch target is a real extra tab for the duration of the
+  compare (see the qualification above), but it never activates.
+- **Anti-aliasing tolerance is a rule, not a bigger threshold.** A candidate
+  pixel (largest channel delta over `threshold`, outside `maskRects`) is
+  grouped into a 4-connected component; the component is ignored only when
+  `antialias` is on, every pixel in it has a 3x3 luminance neighbourhood of at
+  least 32 levels in **both** images, and the component is no larger than
+  `minDiffCluster` (default 2). So a 1 px edge artefact is ignored, a 1 px
+  change in a flat fill is not (no baseline-side contrast), and a 2x2 block is
+  not (4 > 2). `ignoredPixels`/`ignoredClusters` report what was suppressed and
+  the diff PNG paints those pixels amber instead of red.
+- **Baselines carry their environment.** `save` writes `<name>.meta.json`
+  (browser, browserMajor, viewport, deviceScaleFactor, url, checksum,
+  createdAt from a dependency-free civil-date conversion). `compare` returns
+  `environment {match, baseline, current}` and a `baseline_environment_mismatch`
+  warning when browser major, viewport or DSF differ; it does not fail by
+  default (the pixels decide), and `requireEnvironmentMatch:true` turns the
+  mismatch into a failure. A sidecar that is missing, malformed or unreadable
+  is reported as `environment.known:false` with a
+  `baseline_environment_unknown` warning - and is a typed
+  `baseline_environment_unknown` failure under `requireEnvironmentMatch:true`,
+  because a strict gate must never pass without evidence. This is what stops
+  browser-update rot from being silently absorbed.
+- **Captures are serialized.** `screenshot`, `assert_layout` (its
+  `screenshotOnFail` capture) and `visual` hold the execution lock, and the
+  capture module holds a second connection-level lock across the whole
+  mutation-and-restore window. Three concurrent deterministic captures with
+  different forced geometry each report their own viewport and leave the
+  page's own override intact; without that lock they all report the last
+  override written (measured, and asserted by the selftest).
+- **Cancellation cannot skip cleanup.** Those same three tools also hold a
+  per-call *section gate* for the whole call. `notifications/cancelled` (and a
+  duplicate-id supersede) marks the call cancelled and then aborts from a
+  detached waiter that first takes the section gate — so the future can never
+  be dropped mid-restore, and the execution lock is released only after
+  metrics, emulated media, freeze stylesheet and scratch target are back to
+  their prior state. The response is still suppressed. The gate is acquired
+  BEFORE the decisive liveness recheck, so a cancel that lands in the entry
+  window stops the call at the gate instead of admitting it into the section;
+  the abort waiter holds the gate across `handle.abort()` for the same reason.
+  A cancel that arrives before the section starts (pre-start, or waiting for
+  the lock) aborts immediately, exactly as before. `GLADIUS_TEST_CRITICAL_DELAY_MS` is the
+  test-only hook that widens the window so the cancellation tests can cancel
+  deterministically; it is never set in production.
 
 ## 7. Non-goals (explicit)
 

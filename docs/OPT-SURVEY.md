@@ -6,7 +6,7 @@
 > launchable engine, plus explicit attach via `GLADIUS_CDP_URL`. Timings and
 > hot-path structure below are historical evidence, not current instructions.
 > (2026-10-20): tool counts below are the survey-time surface (9-13 tools);
-> the shipped surface is 22 tools (`docs/ARCHITECTURE.md` §1).
+> the shipped surface is 25 tools (`docs/ARCHITECTURE.md` §1).
 
 > Recon artifact for session `ses_ed8bd551cffeHmdMpTecyGZT4W` (fleet ses_ed8bd551cffeHmdMpTecyGZT4W), 2026-10-11,
 > local Windows, headless only, no source edits (one new doc: this file).
@@ -200,7 +200,7 @@ optimization #2); it duplicates much of #2's payoff and lands naturally with the
 
 - All timings are local loopback (`file://`); site network cost is excluded by construction.
 - Cold-start samples show real variance (175-391 ms) - reproduce with n>=5 before quoting a single number.
-- The repo's `docs\ARCHITECTURE.md` budget table ("22 tools" today; "9 tools" at survey time, `<100 ms` initialize, `p50 < 200 ms`) was
+- The repo's `docs\ARCHITECTURE.md` budget table ("25 tools" today; "9 tools" at survey time, `<100 ms` initialize, `p50 < 200 ms`) was
   partially stale against the 13-tool build; initialize measured 24.5 ms median (within budget), steady
   state measured per §3.
 - Everything unmeasured is labelled `unmeasured` in-line; nothing in this doc is estimated silently.

@@ -1,8 +1,18 @@
+// The tool table is one large `json!` literal (one macro expansion per tool,
+// and one nesting level per field). The `visual` entry carries the AA rule and
+// environment contract, which pushes the default 128-level macro recursion
+// limit over the edge; 256 is the smallest bump that compiles and is stable
+// against future schema growth.
+#![recursion_limit = "256"]
+
 mod browser;
+mod capture;
 mod fetch;
+mod layout;
 mod mcp;
 mod selftest;
 mod tools;
+mod visual;
 
 #[tokio::main]
 async fn main() {
@@ -66,13 +76,31 @@ async fn main() {
                 1
             }
         },
-        Some("selftest") => match tokio::spawn(selftest::run()).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[gladius] selftest task failed: {e}");
-                1
+        Some("selftest") => {
+            // Own thread with an explicit generous stack. The chain the
+            // selftest drives (run -> tools::call -> launch -> ws) is deep,
+            // and a debug profile gives every local its own stack slot with
+            // no reuse, so the 2 MB tokio worker default is too tight for an
+            // end-to-end check that keeps growing. The product path is
+            // unaffected: `serve` still runs on the normal worker pool.
+            let handle = std::thread::Builder::new()
+                .name("gladius-selftest".to_string())
+                .stack_size(16 * 1024 * 1024)
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("selftest runtime")
+                        .block_on(selftest::run())
+                });
+            match handle {
+                Ok(h) => h.join().unwrap_or(1),
+                Err(e) => {
+                    eprintln!("[gladius] selftest thread: {e}");
+                    1
+                }
             }
-        },
+        }
         // Provenance: the crate version plus the commit this binary was built
         // from (`build.rs`), with `-dirty` when the tree was modified at build
         // time. This is the referent a deployed binary can be checked against.

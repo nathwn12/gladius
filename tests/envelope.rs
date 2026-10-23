@@ -139,7 +139,7 @@ fn schemas_map(c: &mut Client) -> std::collections::HashMap<String, Value> {
             }
         }
     }
-    assert_eq!(m.len(), 22, "22 outputSchemas listed");
+    assert_eq!(m.len(), 25, "25 outputSchemas listed");
     m
 }
 
@@ -699,7 +699,7 @@ fn snapshot_structured_blocks() {
 
 #[test]
 fn capabilities_manifest() {
-    // Default backend: exact tools-only capabilities; count 22, nothing
+    // Default backend: exact tools-only capabilities; count 25, nothing
     // gated under serverInfo; backend/caps extras remain in serverInfo.
     let mut c = Client::spawn();
     let init = c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
@@ -714,7 +714,7 @@ fn capabilities_manifest() {
         "exact tools-only capabilities: {init}"
     );
     let info = init.get("serverInfo").expect("serverInfo present");
-    assert_eq!(info.get("count"), Some(&json!(22)), "tool count: {init}");
+    assert_eq!(info.get("count"), Some(&json!(25)), "tool count: {init}");
     assert_eq!(info.get("gated"), Some(&json!({})), "nothing gated: {init}");
     let listed = c.result("tools/list", json!({}));
     let n = listed
@@ -722,7 +722,7 @@ fn capabilities_manifest() {
         .and_then(|t| t.as_array())
         .expect("tools array")
         .len();
-    assert_eq!(n, 22, "listed tools match the serverInfo count");
+    assert_eq!(n, 25, "listed tools match the serverInfo count");
     assert_eq!(
         info.get("count"),
         Some(&json!(n)),
@@ -756,13 +756,14 @@ fn capabilities_manifest() {
     let info2 = init2.get("serverInfo").expect("serverInfo present");
     assert_eq!(
         info2.get("count"),
-        Some(&json!(22)),
+        Some(&json!(25)),
         "dom-only count: {init2}"
     );
     assert_eq!(
         info2.get("gated"),
-        Some(&json!({"screenshot": "requires caps: render"})),
-        "screenshot gated: {init2}"
+        Some(&json!({"screenshot": "requires caps: render",
+                     "visual": "save/compare require caps: render"})),
+        "render-only tools gated: {init2}"
     );
     assert_eq!(
         init2.get("serverInfo").and_then(|s| s.get("name")),
@@ -1050,11 +1051,12 @@ fn capabilities_invalid_caps() {
         "invalid caps reported: {init}"
     );
     let info = init.get("serverInfo").expect("serverInfo present");
-    assert_eq!(info.get("count"), Some(&json!(22)), "tool count: {init}");
+    assert_eq!(info.get("count"), Some(&json!(25)), "tool count: {init}");
     assert_eq!(
         info.get("gated"),
-        Some(&json!({"screenshot": "requires caps: render"})),
-        "invalid caps gate screenshot: {init}"
+        Some(&json!({"screenshot": "requires caps: render",
+                     "visual": "save/compare require caps: render"})),
+        "invalid caps gate the render-only tools: {init}"
     );
     let shot = c.call("screenshot", json!({}));
     assert!(is_error(&shot), "invalid-caps screenshot refuses: {shot}");
@@ -1487,5 +1489,227 @@ fn upload_ref_notfile_reports_ref() {
         "upload-notfile-selector code"
     );
 
+    finish(c);
+}
+
+/// Blocking fix 3: a success must not carry a key its `outputSchema` does not
+/// declare. With `additionalProperties:false` an undeclared key is a protocol
+/// lie - a strict client rejects an ordinary successful result. This walks the
+/// tools whose replies are shape-variable (visual save/compare/list/delete,
+/// layout with and without matches, assert_layout, deterministic screenshot)
+/// and asserts every returned key is declared.
+#[test]
+fn success_keys_are_all_declared() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vdir = dir.path().join("visual");
+    let vdir_s = vdir.to_string_lossy().to_string();
+    let mut c = Client::spawn_extra(&[("GLADIUS_VISUAL_DIR", vdir_s.as_str())]);
+    let schemas = schemas_map(&mut c);
+    let shot_path = dir.path().join("shot.png").to_string_lossy().to_string();
+    let fail_path = dir.path().join("fail.png").to_string_lossy().to_string();
+    let nav = c.call("navigate", json!({"url": fixture_url()}));
+    assert!(!is_error(&nav), "navigate: {nav}");
+
+    let cases: Vec<(&str, Value)> = vec![
+        ("screenshot", json!({})),
+        ("screenshot", json!({"deterministic": true})),
+        (
+            "screenshot",
+            json!({"deterministic": true, "width": 640, "height": 480, "path": shot_path}),
+        ),
+        ("layout", json!({"selector": "h1"})),
+        ("layout", json!({"selector": "#no-such-element"})),
+        (
+            "assert_layout",
+            json!({"selector": "h1", "checks": {"box": {"x": 0, "tolerance": 1000.0}}}),
+        ),
+        (
+            "assert_layout",
+            json!({"selector": "#no-such-element", "screenshotOnFail": true,
+                   "screenshotPath": fail_path}),
+        ),
+        ("visual", json!({"action": "save", "name": "declared-keys"})),
+        (
+            "visual",
+            json!({"action": "compare", "name": "declared-keys"}),
+        ),
+        (
+            "visual",
+            json!({"action": "compare", "name": "declared-keys", "update": true}),
+        ),
+        ("visual", json!({"action": "list"})),
+        (
+            "visual",
+            json!({"action": "delete", "name": "declared-keys"}),
+        ),
+    ];
+
+    for (tool, args) in cases {
+        let r = c.call(tool, args.clone());
+        assert!(!is_error(&r), "{tool} {args} succeeded: {r}");
+        let sc = structured(&r);
+        let declared = schemas[tool]
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("schema properties");
+        let obj = sc
+            .as_object()
+            .unwrap_or_else(|| panic!("{tool} {args} structuredContent is an object: {sc}"));
+        for key in obj.keys() {
+            assert!(
+                declared.contains_key(key),
+                "{tool} {args} returned undeclared key '{key}' (outputSchema has \
+                 additionalProperties:false): {sc}"
+            );
+        }
+        // And every declared key that IS present has a compatible type,
+        // including the nullable ones.
+        for (key, val) in obj {
+            let Some(want) = declared.get(key).and_then(|d| d.get("type")) else {
+                continue;
+            };
+            let ok = match want {
+                Value::String(t) => val.is_null() && t == "null" || json_type_ok(val, t),
+                Value::Array(types) => types.iter().any(|t| {
+                    t.as_str()
+                        .map(|t| (val.is_null() && t == "null") || json_type_ok(val, t))
+                        .unwrap_or(false)
+                }),
+                _ => true,
+            };
+            assert!(ok, "{tool} {args} key '{key}' type {want}: {val}");
+        }
+    }
+    finish(c);
+}
+
+/// Non-blocking coverage gap: `visual compare` shape-variants that were never
+/// exercised - a CHANGED image (diff pixels, bbox, diff PNG) and a
+/// SIZE-MISMATCH result (null bbox/diffPath, ratio 1.0). Both must also match
+/// the declared schema, which is what `additionalProperties:false` promises.
+#[test]
+fn visual_compare_changed_and_size_mismatch_shapes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let vdir = dir.path().join("visual").to_string_lossy().to_string();
+    let mut c = Client::spawn_extra(&[("GLADIUS_VISUAL_DIR", vdir.as_str())]);
+    let schemas = schemas_map(&mut c);
+    let nav = c.call("navigate", json!({"url": fixture_url()}));
+    assert!(!is_error(&nav), "navigate: {nav}");
+
+    let save = c.call("visual", json!({"action": "save", "name": "shape"}));
+    assert!(!is_error(&save), "baseline saved: {save}");
+
+    // 1. Changed image: repaint the page, then compare.
+    let repaint = c.call(
+        "evaluate",
+        json!({"expression": "document.body.style.background = '#102030'; 'repainted'"}),
+    );
+    assert!(!is_error(&repaint), "repaint: {repaint}");
+    let changed = c.call("visual", json!({"action": "compare", "name": "shape"}));
+    assert!(!is_error(&changed), "compare answered: {changed}");
+    let sc = structured(&changed);
+    assert_eq!(
+        sc.get("pass"),
+        Some(&json!(false)),
+        "a changed image fails the compare: {sc}"
+    );
+    assert_eq!(
+        sc.get("sizeMismatch"),
+        Some(&json!(false)),
+        "same size, different pixels: {sc}"
+    );
+    assert!(
+        sc.get("diffPixels").and_then(|d| d.as_i64()).unwrap_or(0) > 0,
+        "changed pixels counted: {sc}"
+    );
+    assert!(
+        sc.get("maxChannelDelta")
+            .and_then(|d| d.as_i64())
+            .unwrap_or(0)
+            > 0,
+        "channel delta reported: {sc}"
+    );
+    let bbox = sc.get("bbox").cloned().unwrap_or(Value::Null);
+    assert!(
+        bbox.get("w").and_then(|w| w.as_i64()).unwrap_or(0) > 0
+            && bbox.get("h").and_then(|h| h.as_i64()).unwrap_or(0) > 0,
+        "bbox is a real object when pixels differ: {sc}"
+    );
+    let diff_path = sc
+        .get("diffPath")
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        !diff_path.is_empty() && std::path::Path::new(&diff_path).is_file(),
+        "a diff PNG was written and named: {sc}"
+    );
+    assert!(
+        sc.get("ratio")
+            .and_then(|r| r.as_f64())
+            .map(|r| r > 0.0 && r <= 1.0)
+            .unwrap_or(false),
+        "ratio in (0,1]: {sc}"
+    );
+
+    // 2. Size mismatch: baseline at 640x480, compare at 900x700.
+    let small = c.call(
+        "viewport",
+        json!({"width": 640, "height": 480, "deviceScaleFactor": 1}),
+    );
+    assert!(!is_error(&small), "viewport 640x480: {small}");
+    let save2 = c.call("visual", json!({"action": "save", "name": "sized"}));
+    assert!(!is_error(&save2), "baseline at 640x480: {save2}");
+    let big = c.call(
+        "viewport",
+        json!({"width": 900, "height": 700, "deviceScaleFactor": 1}),
+    );
+    assert!(!is_error(&big), "viewport 900x700: {big}");
+    let mismatch = c.call("visual", json!({"action": "compare", "name": "sized"}));
+    assert!(!is_error(&mismatch), "compare answered: {mismatch}");
+    let ms = structured(&mismatch);
+    assert_eq!(
+        ms.get("sizeMismatch"),
+        Some(&json!(true)),
+        "different PNG sizes are reported as a mismatch: {ms}"
+    );
+    assert_eq!(ms.get("pass"), Some(&json!(false)), "mismatch fails: {ms}");
+    assert_eq!(
+        ms.get("bbox"),
+        Some(&Value::Null),
+        "no bbox without comparable pixels: {ms}"
+    );
+    assert_eq!(
+        ms.get("diffPath"),
+        Some(&Value::Null),
+        "no diff image without comparable pixels: {ms}"
+    );
+    assert_eq!(
+        ms.get("ratio"),
+        Some(&json!(1.0)),
+        "a size mismatch is a full-image difference: {ms}"
+    );
+    assert_eq!(
+        ms.get("diffPixels"),
+        ms.get("totalPixels"),
+        "every pixel of the compared image counts: {ms}"
+    );
+
+    // Both replies still match the published schema exactly.
+    for r in [&changed, &mismatch] {
+        let sc = structured(r);
+        let declared = schemas["visual"]
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("visual schema properties");
+        for key in sc.as_object().expect("object").keys() {
+            assert!(
+                declared.contains_key(key),
+                "undeclared key '{key}' in visual compare reply: {sc}"
+            );
+        }
+    }
+
+    let _ = c.call("viewport", json!({"reset": true}));
     finish(c);
 }

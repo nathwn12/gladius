@@ -6,7 +6,7 @@
 > launchable engine, plus explicit attach via `GLADIUS_CDP_URL`) are
 > historical - follow `docs/ARCHITECTURE.md` for the live backend picture.
 > (2026-10-20): "9-tool contract/surface" language below is the
-> research-phase surface; the shipped surface is 22 tools
+> research-phase surface; the shipped surface is 25 tools
 > (`docs/ARCHITECTURE.md` §1, `CHANGELOG.md` 0.4.0).
 
 > Policy: ranked by technical sophistication, not star counts. Stars are hype; architecture is king.
@@ -100,7 +100,7 @@
   of scope by design. Details: https://github.com/lightpanda-io/demo/blob/main/BENCHMARKS.md
 - **Transferable lesson:** this validates gladius's whole bet - CDP-compatible, no-render,
   single-binary is the Pareto frontier for agent browsing. Gladius's Tier-1 plan (Lightpanda
-  as the no-render backend) is a *backend swap behind the same 9-tool contract* [archived 2026-10-20: research-phase surface; shipped surface is 22 tools], not a rewrite.
+  as the no-render backend) is a *backend swap behind the same 9-tool contract* [archived 2026-10-20: research-phase surface; shipped surface is 25 tools], not a rewrite.
 
 ## 6. Rust building blocks (what gladius itself is built from)
 
@@ -111,7 +111,7 @@
 - **Cost profile:** the crate itself is light (tokio + websockets); the *browser child process*
   dominates. Gladius's rule: depend on the protocol layer, budget the child process.
 - **Transferable lesson:** use it (or its pattern) for the CDP session, but keep the MCP surface
-  frozen at 9 tools [archived 2026-10-20: research-phase surface; shipped surface is 22 tools] - chromiumoxide's API is far wider than agents need.
+  frozen at 9 tools [archived 2026-10-20: research-phase surface; shipped surface is 25 tools] - chromiumoxide's API is far wider than agents need.
 
 ### `rmcp` - official Rust MCP SDK - https://github.com/modelcontextprotocol/rust-sdk
 - **What it technically does:** the official `modelcontextprotocol/rust-sdk` crate (`rmcp`):
@@ -196,7 +196,7 @@
 
 | System | Startup | RAM (local) | Deps | Features | Verdict |
 |---|---|---|---|---|---|
-| gladius (target) | ~50 ms server; lazy browser | ~5 MB server + ~150 MB shell child | 1 static exe | 22 tools, CDP-full-fidelity DOM | - |
+| gladius (target) | ~50 ms server; lazy browser | ~5 MB server + ~150 MB shell child | 1 static exe | 25 tools, CDP-full-fidelity DOM | - |
 | `@playwright/mcp` https://github.com/microsoft/playwright-mcp | seconds (npx+Node+browser) | GBs w/ browser | Node 18+, browser downloads | 30+ tools, multi-browser, vision/pdf | **we beat it** on startup/RAM/deps; **it beats us** on breadth |
 | Puppeteer reference https://github.com/modelcontextprotocol/servers | seconds | GBs | Node + Chromium | archived, minimal | **we beat it** everywhere; it is dead |
 | `hangwin/mcp-chrome` https://github.com/hangwin/mcp-chrome | ~0 (browser already open) | ~0 own | extension + human browser | logged-in human profile | **it beats us** for personal browsing; **we beat it** headless/CI |

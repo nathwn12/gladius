@@ -183,6 +183,16 @@ struct Shared {
     /// calls so one target costs one attach. Never the active session: the
     /// tracked page session is untouched by realm-scoped evaluation.
     extra_sessions: AsyncMutex<HashMap<String, String>>,
+    /// Capture serialization. A deterministic capture mutates page-visible
+    /// state for its duration (device metrics override, emulated media, an
+    /// injected freeze stylesheet) and then restores it. Two of them running
+    /// at once would interleave those mutations and leave a stale override
+    /// or stylesheet behind, and a capture that overlaps a navigation would
+    /// restore onto the wrong document. Held for the WHOLE capture, plain or
+    /// deterministic, so a plain shot can never observe a half-applied
+    /// override either. `Arc<Mutex>` so the guard can be owned (no borrow of
+    /// a local Arc).
+    capture: Arc<AsyncMutex<()>>,
 }
 
 /// Ownership of the engine behind an `Inner` connection.
@@ -310,6 +320,7 @@ fn new_shared(sink: WsSink) -> Arc<Shared> {
         net_log: AsyncMutex::new(VecDeque::new()),
         dialog_policy: AsyncMutex::new(DialogPolicy::default()),
         extra_sessions: AsyncMutex::new(HashMap::new()),
+        capture: Arc::new(AsyncMutex::new(())),
     })
 }
 
@@ -609,6 +620,26 @@ impl Browser {
         Ok((w as i64, h as i64, dpr))
     }
 
+    /// The device-metrics override currently recorded for this connection
+    /// (`None` when the engine default applies). Does NOT connect, so a
+    /// capture path can ask what it must restore without launching anything.
+    pub async fn viewport_override(&self) -> Option<Value> {
+        let guard = self.state.lock().await;
+        match guard.as_ref() {
+            Some(inner) => inner.shared.viewport.lock().await.clone(),
+            None => None,
+        }
+    }
+
+    /// Owned guard over the capture serialization lock. Held for the whole
+    /// capture (mutations AND restoration), so two captures can never
+    /// interleave their overrides. Returns an owned guard, so the caller does
+    /// not borrow the connection.
+    pub async fn capture_lock(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+        let shared = self.shared().await?;
+        Ok(shared.capture.clone().lock_owned().await)
+    }
+
     /// Trusted main-frame pointer move: `Input.dispatchMouseEvent mouseMoved`
     /// at main-frame viewport CSS px (`x`, `y`). Main frame only (G4a); frame
     /// routing is G4b follow-up work.
@@ -622,18 +653,29 @@ impl Browser {
         .map(|_| ())
     }
 
-    /// Trusted main-frame left click at main-frame viewport CSS px: `mouseMoved`
-    /// then `mousePressed` (left, buttons:1, clickCount:1) then `mouseReleased`
-    /// (left, buttons:0, clickCount:1). Coordinates are main-frame viewport CSS
-    /// px (CDP `Input.dispatchMouseEvent` convention); modifiers default to 0
-    /// (no Alt/Ctrl/Meta/Shift - key combos are G4b, never smuggled here).
-    pub async fn mouse_click(&self, x: f64, y: f64) -> Result<(), String> {
-        self.command(
-            "Input.dispatchMouseEvent",
-            json!({"type": "mouseMoved", "x": x, "y": y}),
-            true,
-        )
-        .await?;
+    /// Trusted main-frame left click at main-frame viewport CSS px: by default
+    /// exactly TWO CDP events - `mousePressed` (left, buttons:1, clickCount:1)
+    /// then `mouseReleased` (left, buttons:0, clickCount:1) at the given
+    /// point. No `mouseMoved` is sent unless `hover_first` is true, and then
+    /// it is ONE positioning event at that same point (never a path, never
+    /// interpolation, never a stepped animation). Hover is an explicit
+    /// choice, not a side effect of clicking.
+    ///
+    /// The caller passes the exact float box centre: coordinates are not
+    /// rounded, stepped, or animated anywhere on this path. Coordinates are
+    /// main-frame viewport CSS px (CDP `Input.dispatchMouseEvent`
+    /// convention); modifiers default to 0 (no Alt/Ctrl/Meta/Shift - key
+    /// combos are G4b, never smuggled here). No OS input is involved: the
+    /// whole sequence rides CDP.
+    pub async fn mouse_click(&self, x: f64, y: f64, hover_first: bool) -> Result<(), String> {
+        if hover_first {
+            self.command(
+                "Input.dispatchMouseEvent",
+                json!({"type": "mouseMoved", "x": x, "y": y}),
+                true,
+            )
+            .await?;
+        }
         self.command(
             "Input.dispatchMouseEvent",
             json!({"type": "mousePressed", "x": x, "y": y,
@@ -2284,6 +2326,19 @@ async fn attach_to(shared: &Arc<Shared>, target_id: &str) -> Result<String, Stri
     // Enable page events on every new session: this is what delivers
     // Page.javascriptDialogOpening to the reader for auto-handling.
     let _ = send_raw(shared, "Page.enable", json!({}), Some(sid.clone())).await;
+    // Focus without foreground: a headless tab never owns the OS focus, so
+    // `document.hasFocus()` is false and `:focus`-styled controls (and every
+    // framework that gates handlers on focus) misbehave. Focus emulation
+    // makes the page behave as focused WITHOUT raising a window or stealing
+    // the operator's focus - the whole point of the headless-only contract.
+    // Enabled per session (session-scoped, like every other Emulation call).
+    let _ = send_raw(
+        shared,
+        "Emulation.setFocusEmulationEnabled",
+        json!({"enabled": true}),
+        Some(sid.clone()),
+    )
+    .await;
     // Runtime events feed the console ring (consoleAPICalled +
     // exceptionThrown); Log events add failed-resource lines. One extra
     // round-trip per attach; when the page is quiet the reader work is
@@ -3161,6 +3216,15 @@ fn chromium_argv(port: u16, profile_dir: &std::path::Path) -> Vec<String> {
         format!("--user-data-dir={}", profile_dir.display()),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
+        // Background-correctness flags (owner constraint: a page that is not
+        // the foreground tab must still render and screenshot). Chromium
+        // throttles and can stop compositing occluded/backgrounded tabs;
+        // all three switches pin timers, renderer priority and window
+        // occlusion behaviour so a non-active target keeps drawing and its
+        // timers keep firing at full cadence. One occurrence each.
+        "--disable-backgrounding-occluded-windows".to_string(),
+        "--disable-renderer-backgrounding".to_string(),
+        "--disable-background-timer-throttling".to_string(),
         format!("--remote-allow-origins=http://127.0.0.1:{port}"),
         "about:blank".to_string(),
     ]
@@ -3955,6 +4019,283 @@ mod tests {
                 t.abort();
             }
         }
+    }
+
+    /// Rig for CDP FRAME-level assertions: a real WS peer that records every
+    /// `Input.dispatchMouseEvent` it receives and answers every command, so
+    /// the session flow completes and the exact sequence can be inspected.
+    struct RecordingRig {
+        browser: Browser,
+        sent: Arc<std::sync::Mutex<Vec<Value>>>,
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+    }
+
+    async fn recording_rig() -> RecordingRig {
+        let ln = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback bind");
+        let port = ln.local_addr().expect("loopback addr").port();
+        let sent: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = sent.clone();
+        let srv = tokio::spawn(async move {
+            while let Ok((s, _)) = ln.accept().await {
+                let rec = rec.clone();
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(s).await else {
+                        return;
+                    };
+                    while let Some(Ok(msg)) = ws.next().await {
+                        let Message::Text(txt) = msg else { continue };
+                        let v: Value = serde_json::from_str(txt.as_str()).unwrap_or(Value::Null);
+                        let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        if method == "Input.dispatchMouseEvent" || method == "Target.createTarget" {
+                            rec.lock().unwrap().push(json!({
+                                "method": method,
+                                "params": v.get("params").cloned().unwrap_or(Value::Null)}));
+                        }
+                        // Just enough of the session flow for a tool call to
+                        // complete: one page target, one session, empty acks.
+                        // `Target.createTarget` is REJECTED the way an engine
+                        // that does not know `background` rejects it - the
+                        // scratch-tab tests need a real CDP error body.
+                        if method == "Target.createTarget" {
+                            let reply = json!({
+                                "id": v.get("id").cloned().unwrap_or(Value::Null),
+                                "error": {"code": -32602, "message":
+                                    "Invalid parameters: Failed to deserialize params.background - BINDINGS: boolean value expected"}});
+                            if ws
+                                .send(Message::Text(reply.to_string().into()))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        let result = match method {
+                            "Target.getTargets" => json!({"targetInfos": [
+                                {"targetId": "T1", "type": "page", "url": "about:blank"}]}),
+                            "Target.attachToTarget" => json!({"sessionId": "S1"}),
+                            _ => json!({}),
+                        };
+                        let reply = json!({"id": v.get("id").cloned().unwrap_or(Value::Null),
+                                           "result": result});
+                        if ws
+                            .send(Message::Text(reply.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let url = format!("ws://127.0.0.1:{port}/");
+        let (ws, _) = connect_async(&url).await.expect("ws connect");
+        let (sink, stream) = ws.split();
+        let shared = new_shared(sink);
+        let reader = tokio::spawn(reader_loop(stream, shared.clone()));
+        let mut std_cmd = std::process::Command::new("powershell");
+        std_cmd
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 120",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            std_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        let child = Command::from(std_cmd).spawn().expect("spawn sleeper");
+        let pid = child.id().expect("sleeper pid");
+        let profile = ProfileDir::create().expect("profile");
+        let inner = Inner {
+            engine: Engine::Owned {
+                _profile: profile,
+                #[cfg(windows)]
+                _job: None,
+                child: Box::new(child),
+                pid,
+            },
+            shared: shared.clone(),
+            reader,
+        };
+        let browser = Browser {
+            state: AsyncMutex::new(Some(inner)),
+            pid: Mutex::new(Some(pid)),
+            refs: AsyncMutex::new(HashMap::new()),
+            snap_url: AsyncMutex::new(String::new()),
+            ref_seq: AtomicUsize::new(0),
+            snapshot_lock: AsyncMutex::new(()),
+        };
+        RecordingRig {
+            browser,
+            sent,
+            tasks: vec![srv],
+        }
+    }
+
+    impl RecordingRig {
+        fn mouse_types(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| {
+                    e.pointer("/params/type")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        }
+
+        async fn shutdown(self) {
+            let RecordingRig { browser, tasks, .. } = self;
+            let _ = browser.close().await;
+            for t in tasks {
+                t.abort();
+            }
+        }
+    }
+
+    /// The click contract at the CDP FRAME level: a default click is exactly
+    /// `mousePressed` + `mouseReleased` at the caller's exact float point, and
+    /// `hoverFirst:true` prepends exactly ONE `mouseMoved` at that same point.
+    /// No path sends a movement loop, steps, or interpolation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn click_sends_no_mouse_moved_unless_hover_first() {
+        let rig = recording_rig().await;
+
+        rig.browser
+            .mouse_click(100.5, 200.25, false)
+            .await
+            .expect("default click dispatches");
+        assert_eq!(
+            rig.mouse_types(),
+            vec!["mousePressed".to_string(), "mouseReleased".to_string()],
+            "default click: press + release only, zero mouseMoved"
+        );
+        // Sub-pixel coordinates survive verbatim (never rounded).
+        {
+            let sent = rig.sent.lock().unwrap();
+            assert_eq!(
+                sent[0].pointer("/params/x").and_then(|v| v.as_f64()),
+                Some(100.5)
+            );
+            assert_eq!(
+                sent[0].pointer("/params/y").and_then(|v| v.as_f64()),
+                Some(200.25)
+            );
+            assert_eq!(
+                sent[1].pointer("/params/x").and_then(|v| v.as_f64()),
+                Some(100.5)
+            );
+        }
+
+        rig.sent.lock().unwrap().clear();
+        rig.browser
+            .mouse_click(7.0, 8.0, true)
+            .await
+            .expect("hover-first click dispatches");
+        assert_eq!(
+            rig.mouse_types(),
+            vec![
+                "mouseMoved".to_string(),
+                "mousePressed".to_string(),
+                "mouseReleased".to_string()
+            ],
+            "hoverFirst:true sends exactly one mouseMoved, then press + release"
+        );
+        {
+            let sent = rig.sent.lock().unwrap();
+            assert_eq!(
+                sent[0].pointer("/params/type").and_then(|v| v.as_str()),
+                Some("mouseMoved")
+            );
+            assert_eq!(
+                sent[0].pointer("/params/x").and_then(|v| v.as_f64()),
+                Some(7.0)
+            );
+            assert_eq!(
+                sent[0].pointer("/params/y").and_then(|v| v.as_f64()),
+                Some(8.0)
+            );
+        }
+
+        rig.shutdown().await;
+    }
+
+    /// The scratch diff tab is requested with `background:true` ONLY. An
+    /// engine that rejects the parameter gets a typed error and NO second,
+    /// foreground `Target.createTarget`: an activating tab on an attached
+    /// engine is exactly what the owner forbids. Hermetic (the peer answers
+    /// the rejection a real engine sends).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scratch_target_refuses_foreground_fallback() {
+        let rig = recording_rig().await;
+        let opts = crate::visual::DiffOpts::default();
+        let env =
+            match crate::visual::png_diff(&rig.browser, b"not-a-png", b"not-a-png", &opts).await {
+                Ok(_) => panic!("a rejected background parameter must not create a target"),
+                Err(e) => e.envelope(),
+            };
+        let prose = env
+            .pointer("/content/0/text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        assert!(
+            prose.contains("scratch_background_unsupported"),
+            "typed refusal prose: {env}"
+        );
+        assert_eq!(
+            env.pointer("/structuredContent/code"),
+            Some(&json!("scratch_background_unsupported")),
+            "typed code: {env}"
+        );
+        let calls: Vec<(String, Value)> = rig
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                (
+                    e.get("method")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    e.pointer("/params").cloned().unwrap_or(Value::Null),
+                )
+            })
+            .collect();
+        let created: Vec<&(String, Value)> = calls
+            .iter()
+            .filter(|(m, _)| m == "Target.createTarget")
+            .collect();
+        assert_eq!(
+            created.len(),
+            1,
+            "exactly one createTarget attempt, no foreground retry: {calls:?}"
+        );
+        assert_eq!(
+            created[0].1.get("background"),
+            Some(&json!(true)),
+            "the attempt carried background:true: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|(m, _)| m == "Target.attachToTarget"),
+            "no target was created, so nothing was attached: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|(m, _)| m == "Target.closeTarget"),
+            "no target was created, so nothing needed closing: {calls:?}"
+        );
+        rig.shutdown().await;
     }
 
     fn drain_count(v: &Value) -> usize {
@@ -5047,7 +5388,16 @@ mod tests {
             Some("about:blank"),
             "about:blank last: {argv:?}"
         );
-        for flag in ["--headless", "--no-first-run", "--no-default-browser-check"] {
+        for flag in [
+            "--headless",
+            "--no-first-run",
+            "--no-default-browser-check",
+            // Background correctness: a non-active tab must still render,
+            // still screenshot and still run its timers.
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-background-timer-throttling",
+        ] {
             let n = argv.iter().filter(|a| a.as_str() == flag).count();
             assert_eq!(n, 1, "flag {flag} must appear exactly once: {argv:?}");
         }
@@ -5080,6 +5430,9 @@ mod tests {
             "--headless".to_string(),
             "--no-default-browser-check".to_string(),
             "--no-first-run".to_string(),
+            "--disable-backgrounding-occluded-windows".to_string(),
+            "--disable-renderer-backgrounding".to_string(),
+            "--disable-background-timer-throttling".to_string(),
             "--remote-allow-origins=http://127.0.0.1:19431".to_string(),
             "--remote-debugging-port=19431".to_string(),
             profile_flag,

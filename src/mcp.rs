@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::FutureExt;
 use serde_json::{json, Value};
@@ -50,7 +51,7 @@ fn capabilities() -> Value {
 }
 
 fn instructions() -> &'static str {
-    "Gladius is headless-only (no headed mode). Always start with snapshot to get stable @eN refs, then act with @eN refs or CSS selectors. All 22 tools report typed errors (structuredContent code/reason alongside the prose); tool failures are results, never protocol errors."
+    "Gladius is headless-only (no headed mode). Always start with snapshot to get stable @eN refs, then act with @eN refs or CSS selectors. All 25 tools report typed errors (structuredContent code/reason alongside the prose); tool failures are results, never protocol errors. Everything rides CDP: no OS cursor, no OS keyboard, no focus stealing, no visible window on the owned headless engine (an engine you attached with GLADIUS_CDP_URL is yours, and visual compare opens one scratch tab there). screenshot {deterministic:true}, assert_layout, layout and visual prove pixels and geometry without a foreground tab."
 }
 
 fn server_info() -> Value {
@@ -79,6 +80,10 @@ fn server_info() -> Value {
     let mut gated = serde_json::Map::new();
     if info.get("caps").and_then(|c| c.as_str()) != Some("render") {
         gated.insert("screenshot".to_string(), json!("requires caps: render"));
+        gated.insert(
+            "visual".to_string(),
+            json!("save/compare require caps: render"),
+        );
     }
     m.insert("gated".to_string(), Value::Object(gated));
     Value::Object(m)
@@ -102,15 +107,29 @@ fn id_key(id: &Value) -> String {
 }
 
 /// True when the named tool mutates browser/page state and must hold the
-/// execution lock. Read-only tools (snapshot, screenshot, wait_for,
-/// fetch_text, targets list, console/network get) run lock-free so they
-/// overlap freely. `dialog` locks only for the mutating `policy` action;
-/// `network`/`console` lock only for `drain`/`clear`; `targets` locks only
-/// for `select`.
+/// execution lock. Read-only tools (snapshot, wait_for, fetch_text, targets
+/// list, console/network get) run lock-free so they overlap freely.
+/// `dialog` locks only for the mutating `policy` action; `network`/`console`
+/// lock only for `drain`/`clear`; `targets` locks only for `select`.
+///
+/// `screenshot` and `assert_layout` are NOT in that free list any more: their
+/// deterministic path mutates page-visible state for the duration of a
+/// capture (`Emulation.setDeviceMetricsOverride`, `Emulation.setEmulatedMedia`,
+/// an injected freeze stylesheet - `capture.rs`), so a capture must never
+/// interleave with a navigation, a `viewport` change or another capture.
+/// `visual` already holds the same lock for the same reason. The capture
+/// module also takes its own connection-level lock, so the two layers agree.
 fn needs_exec_lock(name: &str, args: &Value) -> bool {
     match name {
         "navigate" | "click" | "type" | "select" | "upload" | "key" | "hover" | "viewport"
         | "tabs" | "history" | "cdp" | "evaluate" | "close" => true,
+        // Deterministic capture + on-failure capture mutate the page while
+        // they run (see the doc comment above).
+        "screenshot" | "assert_layout" => true,
+        // `visual` writes baseline files and opens a scratch target for the
+        // in-engine diff: serialise it with the mutating tools so a compare
+        // cannot race another page action mid-capture.
+        "visual" => true,
         "targets" => {
             args.get("action")
                 .and_then(|v| v.as_str())
@@ -142,6 +161,104 @@ struct CallState {
     gen: u64,
     cancelled: bool,
     emitted: bool,
+    /// Cancellation-safety gate for tools that mutate page-visible state and
+    /// restore it (`screenshot`, `assert_layout`, `visual`). The task holds
+    /// this for the WHOLE call; a cancel waits for it before aborting, so the
+    /// future can never be dropped mid-restore with the overrides applied and
+    /// the locks released. See `abort_after_critical`.
+    critical: Arc<Mutex<()>>,
+}
+
+/// How long a cancel waits for an in-flight critical section before aborting
+/// anyway. Captures are bounded (settle cap + CDP per-call timeouts), so this
+/// only fires for a wedged engine - where leaving the page dirty is the lesser
+/// evil compared with a cancel that never returns.
+const CANCEL_GRACE: Duration = Duration::from_secs(60);
+
+/// Tools whose call mutates page-visible state and restores it before
+/// returning: their future must not be dropped mid-section. Every one of them
+/// is also exec-locked (`needs_exec_lock`), asserted by `exec_lock_tests`.
+fn needs_critical_section(name: &str) -> bool {
+    matches!(name, "screenshot" | "assert_layout" | "visual")
+}
+
+/// Abort `handle` only once its critical section has finished.
+///
+/// A deterministic capture applies device-metrics/media/freeze-style
+/// overrides and restores them at the end of the call; `visual compare` opens
+/// a scratch target and closes it at the end. `JoinHandle::abort` drops the
+/// future at its next await point, which would skip that cleanup while the
+/// locks are released - leaving a stale override or a leaked tab.
+///
+/// The waiter therefore acquires the section gate and **holds it across the
+/// abort**: releasing it first would let a task that is already queued on the
+/// gate slip into the mutating section in the window before the abort lands
+/// (the runtime polls tasks on other workers, so that window is real). With
+/// the guard held, the task either never acquires the gate (it is aborted
+/// while queued) or finished the section before the guard was handed over, in
+/// which case the abort is a no-op. The response is already suppressed by the
+/// `cancelled` flag, so nothing is emitted either way.
+fn abort_after_critical(handle: JoinHandle<()>, critical: Arc<Mutex<()>>) {
+    tokio::spawn(async move {
+        match tokio::time::timeout(CANCEL_GRACE, critical.lock()).await {
+            Ok(guard) => {
+                // Test-only: widen the window between acquiring the gate and
+                // issuing the abort, so the entry-race test can prove a
+                // queued task cannot enter the section in between.
+                if let Some(ms) = test_abort_hold_ms() {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+                // Test-only: leave the abort unissued. Simulates "the abort
+                // never arrived", which makes the section's own liveness
+                // recheck the ONLY thing keeping a cancelled task out - the
+                // test uses it to prove that recheck works.
+                if test_abort_skip() {
+                    drop(guard);
+                    return;
+                }
+                // The abort is issued WHILE the gate is held; the guard is
+                // dropped only after it. No await between the two.
+                handle.abort();
+                drop(guard);
+            }
+            Err(_) => {
+                eprintln!(
+                    "[gladius] warn: cancelled call still inside its critical section after \
+                     {CANCEL_GRACE:?}; aborting anyway (the page may need a reload)"
+                );
+                handle.abort();
+            }
+        }
+    });
+}
+
+/// Test-only hook (never set in production): skip the abort after taking the
+/// gate, so the section's liveness recheck is the only defence left.
+fn test_abort_skip() -> bool {
+    std::env::var("GLADIUS_TEST_ABORT_SKIP")
+        .map(|v| !v.trim().is_empty() && v.trim() != "0")
+        .unwrap_or(false)
+}
+
+/// Test-only hook (never set in production): hold the section gate for this
+/// many milliseconds before issuing a cancelled call's abort. It exists so the
+/// entry-race test can prove that a task queued on the gate cannot enter the
+/// mutating section while the abort is being issued.
+fn test_abort_hold_ms() -> Option<u64> {
+    std::env::var("GLADIUS_TEST_ABORT_HOLD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+}
+
+/// Test-only hook (never set in production): pause the dispatch task after the
+/// execution lock and before the section gate, so a cancel can land exactly in
+/// the "liveness checked, section not yet entered" window.
+fn test_entry_ms() -> Option<u64> {
+    std::env::var("GLADIUS_TEST_ENTRY_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
 }
 
 type Registry = Arc<Mutex<HashMap<String, CallState>>>;
@@ -367,12 +484,18 @@ pub async fn serve() -> Result<(), String> {
             }
             let key = id_key(&raw);
             let mut map = registry.lock().await;
-            if let Some(old) = map.get_mut(&key) {
-                old.cancelled = true;
-                if let Some(h) = old.handle.take() {
-                    h.abort();
+            let taken = match map.get_mut(&key) {
+                Some(old) => {
+                    old.cancelled = true;
+                    old.handle.take().map(|h| (h, old.critical.clone()))
                 }
-                map.remove(&key);
+                None => None,
+            };
+            map.remove(&key);
+            drop(map);
+            // Same rule as `handle_cancel`: never drop a future mid-restore.
+            if let Some((h, critical)) = taken {
+                abort_after_critical(h, critical);
             }
         }
         let method = req
@@ -446,10 +569,15 @@ async fn handle_cancel(req: &Value, registry: &Registry) {
         return;
     }
     st.cancelled = true;
-    if let Some(h) = st.handle.take() {
-        h.abort();
-    }
+    // Take the handle + its section gate out under the lock, then abort from
+    // a detached waiter so the read loop is never blocked by a capture that
+    // is finishing its restore (see `abort_after_critical`).
+    let taken = st.handle.take().map(|h| (h, st.critical.clone()));
     evict_stale_locked(&mut map);
+    drop(map);
+    if let Some((h, critical)) = taken {
+        abort_after_critical(h, critical);
+    }
 }
 
 /// Route one `tools/call` request: inline validation errors go straight to
@@ -566,14 +694,20 @@ async fn dispatch_call(
     // dispatch runs sequentially on the read loop); a present entry would
     // mean a task finished between the blocks, which is impossible without
     // an entry — defensively abort it rather than leak its handle.
+    let critical = Arc::new(Mutex::new(()));
     {
         let mut map = registry.lock().await;
         evict_stale_locked(&mut map);
-        if let Some(old) = map.get_mut(&key) {
-            old.cancelled = true;
-            if let Some(h) = old.handle.take() {
-                h.abort();
+        let taken = match map.get_mut(&key) {
+            Some(old) => {
+                old.cancelled = true;
+                old.handle.take().map(|h| (h, old.critical.clone()))
             }
+            None => None,
+        };
+        if let Some((h, prev_critical)) = taken {
+            // Finish any restore before dropping the previous future.
+            abort_after_critical(h, prev_critical);
         }
         map.insert(
             key.clone(),
@@ -582,6 +716,7 @@ async fn dispatch_call(
                 gen,
                 cancelled: false,
                 emitted: false,
+                critical: critical.clone(),
             },
         );
     }
@@ -590,6 +725,8 @@ async fn dispatch_call(
     let tx_task = tx.clone();
     let registry_task = registry.clone();
     let lock_needed = needs_exec_lock(&name, &args);
+    let section_needed = needs_critical_section(&name);
+    let critical_task = critical.clone();
     let key_task = key.clone();
     let handle: JoinHandle<()> = tokio::spawn(async move {
         // The permit releases when the task ends (normal, abort, panic).
@@ -605,6 +742,26 @@ async fn dispatch_call(
                 // A cancelled task waiting here aborts cleanly: the lock
                 // future is dropped, the tool never runs, nothing is sent.
                 let _guard = exec.lock().await;
+                if !is_live(&registry_task, &key_task, gen).await {
+                    return None;
+                }
+                // Test-only: park in the window between the liveness check and
+                // the section gate so a cancel can land exactly there.
+                if let Some(ms) = test_entry_ms() {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+                // Section gate: held for the WHOLE call, so a cancel can only
+                // abort this task after the capture/compare has restored what
+                // it touched (see `abort_after_critical`).
+                let _section = if section_needed {
+                    Some(critical_task.lock().await)
+                } else {
+                    None
+                };
+                // DECISIVE liveness recheck, under the gate: a cancel that
+                // landed while we were waiting for the gate must stop us HERE.
+                // Without this the task could enter the mutating section just
+                // before the waiter's abort and leave the page mid-override.
                 if !is_live(&registry_task, &key_task, gen).await {
                     return None;
                 }
@@ -749,6 +906,7 @@ mod concurrency_tests {
             gen,
             cancelled: false,
             emitted: false,
+            critical: Arc::new(Mutex::new(())),
         }
     }
 
@@ -774,6 +932,7 @@ mod concurrency_tests {
                 gen: 9,
                 cancelled: true,
                 emitted: false,
+                critical: Arc::new(Mutex::new(())),
             },
         );
         let resp = json!({"jsonrpc": "2.0", "id": 1, "result": {}});
@@ -800,6 +959,41 @@ mod concurrency_tests {
         );
     }
 
+    /// The abort waiter TAKES the section gate before aborting (the code holds
+    /// that guard across `handle.abort()`, with no await between the two).
+    /// Measured here: while the abort is pending the gate is unavailable to
+    /// everyone else - which is what stops a task queued on the gate from being
+    /// admitted around the abort. Without the acquisition (the pre-fix
+    /// `handle.abort()`-only waiter) the gate stays free and this fails. The
+    /// complementary defence - a cancelled call bailing on the liveness recheck
+    /// under that gate - is proven end-to-end in
+    /// `tests/concurrency.rs::cancel_while_queued_never_enters_the_section`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_waiter_takes_the_section_gate_first() {
+        // A child task standing in for the cancelled call.
+        let child = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let gate = Arc::new(Mutex::new(()));
+        std::env::set_var("GLADIUS_TEST_ABORT_HOLD_MS", "600");
+        abort_after_critical(child, gate.clone());
+
+        // During the hold the waiter owns the gate: nobody else can take it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            gate.try_lock().is_err(),
+            "the gate is held while the abort is pending (a queued task cannot enter)"
+        );
+
+        // Once the abort is issued the gate is released again.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(
+            gate.try_lock().is_ok(),
+            "the gate is released only after the abort was issued"
+        );
+        std::env::remove_var("GLADIUS_TEST_ABORT_HOLD_MS");
+    }
+
     #[test]
     fn panic_response_shape() {
         let r = panic_response(&json!(42));
@@ -822,6 +1016,7 @@ mod concurrency_tests {
                     gen: i as u64,
                     cancelled: true,
                     emitted: false,
+                    critical: Arc::new(Mutex::new(())),
                 },
             );
         }
@@ -836,5 +1031,51 @@ mod concurrency_tests {
         // Under the bound nothing is touched.
         evict_stale_locked(&mut map);
         assert!(map.contains_key("live"), "no-op under bound");
+    }
+}
+
+/// Blocking fix 2, mechanism level: the dispatcher serializes exactly the
+/// tools `needs_exec_lock` names. A deterministic capture mutates page-visible
+/// state (metrics override, emulated media, freeze stylesheet) and restores it,
+/// so `screenshot`, `assert_layout` (its `screenshotOnFail` capture) and
+/// `visual` must be in that set. This is the assertion that goes red if the
+/// lock classification regresses - the integration tests then prove the
+/// behaviour it buys.
+#[cfg(test)]
+mod exec_lock_tests {
+    use super::needs_exec_lock;
+    use serde_json::json;
+
+    #[test]
+    fn capture_tools_hold_the_execution_lock() {
+        // The section gate only makes sense inside the execution lock.
+        for tool in ["screenshot", "assert_layout", "visual"] {
+            assert!(
+                super::needs_critical_section(tool),
+                "{tool} mutates and restores page state: it needs the section gate"
+            );
+        }
+        for tool in ["navigate", "click", "snapshot", "layout"] {
+            assert!(
+                !super::needs_critical_section(tool),
+                "{tool} restores nothing, so it must stay abortable"
+            );
+        }
+        for tool in ["screenshot", "assert_layout", "visual"] {
+            assert!(
+                needs_exec_lock(tool, &json!({})),
+                "{tool} mutates page-visible state during a capture and must hold the exec lock"
+            );
+            // Same answer for the argument shapes that carry the capture.
+            assert!(needs_exec_lock(tool, &json!({"deterministic": true})));
+            assert!(needs_exec_lock(tool, &json!({"screenshotOnFail": true})));
+        }
+        // Pure reads stay lock-free so they keep overlapping.
+        for tool in ["snapshot", "wait_for", "fetch_text", "console", "network"] {
+            assert!(
+                !needs_exec_lock(tool, &json!({})),
+                "{tool} is a pure read and must stay lock-free"
+            );
+        }
     }
 }
