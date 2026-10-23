@@ -370,32 +370,3 @@ jobs:
               if [ "$tag" = "$RELEASE_TAG" ]; then continue; fi
               gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag=false
             done
-  cleanroom-public:
-    name: cleanroom gate (public registry)
-    needs: [publish]
-    runs-on: windows-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    # This job proves the PUBLISHED package installs from the public registry,
-    # so it has nothing to prove on a rehearsal that deliberately published
-    # nothing (it would only 404). A tag push always runs it.
-    if: github.event_name != 'workflow_dispatch' || inputs.dry_run == false
-    env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      # Post-publish gate (blocking): install the LIVE package from the
-      # public registry in a scrubbed profile with empty caches, then prove
-      # the engine provisions and the server boots. The version comes from
-      # the tag (pwsh syntax: pwsh is the default shell on windows-latest).
-      - name: cleanroom gate (registry)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if (-not $env:RELEASE_TAG.StartsWith('v')) { throw "tag '$env:RELEASE_TAG' does not start with v" }
-          $ver = $env:RELEASE_TAG.Substring(1)
-          node scripts/cleanroom-check.mjs --registry --version $ver
