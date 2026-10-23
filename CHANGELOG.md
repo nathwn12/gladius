@@ -63,6 +63,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   cancellation and scratch-target assertions in `tests/concurrency.rs`.
 - No dependency change.
 
+## [0.4.6] - 2026-10-23
+
+- Launcher: engine provisioning is safe under concurrent starts. Two processes
+  launched seconds apart into the same cache leaf both staged and renamed onto
+  the same final path; one lost the rename to `EPERM` and its cleanup deleted
+  the tree the other had just provisioned, so a live server lost its whole
+  tool namespace. Provisioning is now single-writer: a `<cache>.lock`
+  directory created with `mkdirSync` (the only exclusive-create primitive Node
+  has on Windows), an `owner.json` pid, a heartbeat at every phase, and
+  bounded polling for waiters. A lock whose owner pid is gone, or that
+  outlives the heartbeat ceiling, is broken by renaming it aside — the rename
+  is the race-breaker, so only one waiter can perform it. The final path is
+  never deleted outside the lock, renames onto it retry the transient Windows
+  codes (`EPERM`/`EACCES`/`EBUSY`) with backoff, and staging leftovers from a
+  crashed run are reaped instead of piling up.
+- Release path: the post-publish public-registry cleanroom gate is gone from
+  the workflow. A gate that depends on npm read-replica timing must not fail a
+  release that already published, because npm versions are immutable — a red
+  there can never be re-run green, so it permanently strands a version. Kept
+  deliberately: the build job's tarball cleanroom, which installs and boots
+  the exact artifact being shipped with no registry dependency. `--registry`
+  mode survives in `scripts/cleanroom-check.mjs` as a manual probe with no
+  caller.
+- No engine behaviour change.
+
+## [0.4.5] - 2026-10-23
+
+- Release chore only: the version is bumped to 0.4.5 in `Cargo.toml`,
+  `Cargo.lock`, `npm/package.json` and `npm/engine-manifest.json`
+  (`serverVersion`, `runtime.source` and the archive name). No source, test or
+  dependency change — this ships the same engine as 0.4.4.
+
 ## [0.4.4] - 2026-10-23
 
 - Release gate: the pre-publish cleanroom installed the tarball and booted
@@ -87,6 +119,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `net::ERR_ABORTED` (a CDP abort while the browser attaches, observed in
   one of three release runs). Any other error stays fatal and verbatim; the
   retry is asserted, and every redaction/leak assertion is untouched.
+- Cleanroom CI: the released tarball is resolved from `npm pack --json`
+  output by node instead of PowerShell, so both shapes are read —
+  `ConvertFrom-Json` unrolls a single-element array into an object, which made
+  the old `-is [array]` branch read `id` instead of `filename` (npm 11 emits
+  the array, npm 12 the object). A missing tarball now fails the job with the
+  raw npm output attached. CI-only fix.
 - No engine behaviour change.
 
 ## [0.4.3] - 2026-10-23
