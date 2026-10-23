@@ -16,6 +16,16 @@
 //! - `Page.captureScreenshot` with `format: "png"`, `fromSurface: true` and
 //!   `captureBeyondViewport` for full-page shots.
 //!
+//! Restoration is CONFIRMED, not assumed. The overrides are reverted with
+//! awaited CDP commands, but a reply only says the agent accepted them: the
+//! page's media-query and viewport state are refreshed on the renderer's own
+//! schedule, and a clear can be lost outright. The capture therefore polls the
+//! page (bounded, 2 s cap) until it reports the pre-capture viewport/dsf, no
+//! freeze stylesheet and no emulated reduced-motion, and re-applies the
+//! restore once if it does not - so a caller that reads the page immediately
+//! after this call can never observe the emulated state. That gap is what the
+//! release gate hit with `matchMedia('(prefers-reduced-motion: reduce)')`.
+//!
 //! Everything rides CDP: no OS input, no window, no foreground tab.
 //! The checksum is FNV-1a 64 over the decoded PNG bytes - cheap, dependency
 //! free, and enough to prove two captures are byte-identical.
@@ -151,6 +161,83 @@ pub(crate) async fn maybe_test_delay() {
     }
 }
 
+/// How long the restore may take to become visible to the PAGE. Bounded: a
+/// wedged renderer must not hang a capture (the pixels are already valid, so
+/// the confirmation is warned about, never fatal).
+const RESTORE_CONFIRM_CAP: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Cadence of the confirmation probe. Small: normally the very first probe
+/// already agrees (the clear is applied by the time the reply lands), so the
+/// steady-state cost is one `Runtime.evaluate`.
+const RESTORE_CONFIRM_STEP: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Test-only hook (never set in production): drop the first N media clears,
+/// simulating a lost clear (the symptom the release gate hit). The restore
+/// confirmation is what repairs it, and the counter lets the retry succeed.
+fn test_drop_media_clears() -> u32 {
+    std::env::var("GLADIUS_TEST_DROP_MEDIA_CLEAR")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Consume one "drop the clear" credit, if any are left. Re-armed from the
+/// environment whenever it runs dry, so a harness may set the hook at any
+/// point in the process (the selftest does) and each capture gets its own
+/// drop.
+fn take_dropped_clear() -> bool {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static REMAINING: AtomicU32 = AtomicU32::new(0);
+    if REMAINING.load(Ordering::SeqCst) == 0 {
+        let want = test_drop_media_clears();
+        if want == 0 {
+            return false;
+        }
+        REMAINING.store(want, Ordering::SeqCst);
+    }
+    REMAINING
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
+}
+
+/// Page-level view of the restored state: metrics, freeze stylesheet gone,
+/// emulated reduced-motion gone. This is the ONLY proof that restoration is
+/// complete - a CDP reply says the agent accepted the command, not that the
+/// page has applied it.
+fn restore_probe_js() -> String {
+    format!(
+        "[window.innerWidth, window.innerHeight, window.devicePixelRatio, \
+          document.getElementById('{STYLE_ID}') === null, \
+          matchMedia('(prefers-reduced-motion: reduce)').matches]"
+    )
+}
+
+/// Poll the page (bounded) until it reports the pre-capture state: the
+/// viewport/dsf we read before overriding, no freeze stylesheet, and no
+/// emulated reduced-motion. Returns true when the page agrees.
+async fn confirm_restored(browser: &Browser, expect: (i64, i64, f64)) -> bool {
+    let (ew, eh, edpr) = expect;
+    let expr = restore_probe_js();
+    let deadline = std::time::Instant::now() + RESTORE_CONFIRM_CAP;
+    loop {
+        if let Ok(v) = browser.eval(&expr).await {
+            let a = v.as_array().cloned().unwrap_or_default();
+            let num = |i: usize| a.get(i).and_then(|x| x.as_f64());
+            let style_gone = a.get(3).and_then(|x| x.as_bool()) == Some(true);
+            let reduced_motion = a.get(4).and_then(|x| x.as_bool()) == Some(false);
+            let size_ok = num(0) == Some(ew as f64) && num(1) == Some(eh as f64);
+            let dpr_ok = num(2).map(|d| (d - edpr).abs() < 0.001).unwrap_or(false);
+            if size_ok && dpr_ok && style_gone && reduced_motion {
+                return true;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(RESTORE_CONFIRM_STEP).await;
+    }
+}
+
 /// FNV-1a 64 over `bytes`, 16 hex digits. Cheap content fingerprint: two
 /// captures of the same pixels produce the same PNG bytes and the same
 /// checksum, and any pixel change breaks it.
@@ -193,6 +280,33 @@ fn decode(r: &Value, deterministic: bool) -> Result<Capture, String> {
     })
 }
 
+/// Replay the prior device-metrics override (or clear it when there was
+/// none). Used by the restore and by its retry, so both paths are identical.
+async fn restore_metrics(browser: &Browser, prior: Option<&Value>) {
+    match prior {
+        Some(p) => {
+            if let Err(e) = browser
+                .command("Emulation.setDeviceMetricsOverride", p.clone(), true)
+                .await
+            {
+                warn(&format!(
+                    "deterministic capture: could not restore the prior viewport override: {e}"
+                ));
+            }
+        }
+        None => {
+            if let Err(e) = browser
+                .command("Emulation.clearDeviceMetricsOverride", json!({}), true)
+                .await
+            {
+                warn(&format!(
+                    "deterministic capture: could not clear the metrics override: {e}"
+                ));
+            }
+        }
+    }
+}
+
 /// Capture the active page. `deterministic: true` pins the conditions above
 /// and restores every override before returning (best effort: a restore
 /// failure is never reported as a capture failure - it is LOGGED, because a
@@ -217,7 +331,9 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
 
     // Prior override we must put back. Read BEFORE we overwrite anything.
     let prior = browser.viewport_override().await;
-    let (vw, vh, _) = browser
+    // The pre-capture read-back is also the EXPECTATION the restore must
+    // confirm later (metrics, dsf); keep all three values.
+    let (vw, vh, vdpr) = browser
         .viewport_readback()
         .await
         .unwrap_or((1280, 720, 1.0));
@@ -267,7 +383,9 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
             "deterministic capture: could not remove the freeze stylesheet: {e}"
         ));
     }
-    if let Err(e) = browser
+    if take_dropped_clear() {
+        warn("test hook: dropped the media clear (GLADIUS_TEST_DROP_MEDIA_CLEAR)");
+    } else if let Err(e) = browser
         .command("Emulation.setEmulatedMedia", json!({"features": []}), true)
         .await
     {
@@ -275,26 +393,40 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
             "deterministic capture: could not clear emulated media: {e}"
         ));
     }
-    match prior {
-        Some(p) => {
-            if let Err(e) = browser
-                .command("Emulation.setDeviceMetricsOverride", p, true)
-                .await
-            {
-                warn(&format!(
-                    "deterministic capture: could not restore the prior viewport override: {e}"
-                ));
-            }
+    restore_metrics(browser, prior.as_ref()).await;
+
+    // A CDP reply only says the agent accepted the command. The page's media
+    // query and viewport state are refreshed on the renderer's own schedule,
+    // and a clear can be lost outright (session churn), so a caller that reads
+    // the page immediately after this call can still see the emulated state -
+    // exactly the release-gate failure. Restoration therefore is not complete
+    // until the PAGE reports it: confirm (bounded), and repair once if the
+    // clear did not land.
+    let expectation = (vw, vh, vdpr);
+    if !confirm_restored(browser, expectation).await {
+        warn(
+            "deterministic capture: page did not confirm the restored state within 2s; \
+             re-applying the restore once",
+        );
+        if let Err(e) = browser.eval(&style_restore_js()).await {
+            warn(&format!(
+                "deterministic capture: retry could not remove the freeze stylesheet: {e}"
+            ));
         }
-        None => {
-            if let Err(e) = browser
-                .command("Emulation.clearDeviceMetricsOverride", json!({}), true)
-                .await
-            {
-                warn(&format!(
-                    "deterministic capture: could not clear the metrics override: {e}"
-                ));
-            }
+        if let Err(e) = browser
+            .command("Emulation.setEmulatedMedia", json!({"features": []}), true)
+            .await
+        {
+            warn(&format!(
+                "deterministic capture: retry could not clear emulated media: {e}"
+            ));
+        }
+        restore_metrics(browser, prior.as_ref()).await;
+        if !confirm_restored(browser, expectation).await {
+            warn(
+                "deterministic capture: page still reports the emulated state after a retry \
+                 (the next read-back shows the truth)",
+            );
         }
     }
 

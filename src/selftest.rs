@@ -1282,6 +1282,37 @@ pub async fn run() -> i32 {
         Err(detail) => check("cancel-entry-window", false, &detail),
     }
 
+    // ------------------------------------------- restore is confirmed by the page
+    // A CDP ACK is not proof: the release gate failed exactly here, with
+    // `matchMedia('(prefers-reduced-motion: reduce)')` still true after the
+    // call returned. The hook drops the media clear; the capture must notice
+    // and repair it before returning.
+    std::env::set_var("GLADIUS_TEST_DROP_MEDIA_CLEAR", "1");
+    let dropped_clear = crate::tools::call(
+        "screenshot",
+        &serde_json::json!({"deterministic": true}),
+        &b,
+    )
+    .await;
+    std::env::remove_var("GLADIUS_TEST_DROP_MEDIA_CLEAR");
+    let after_drop = crate::tools::call(
+        "evaluate",
+        &serde_json::json!({"expression": "[window.innerWidth, document.getElementById('__gladius_deterministic') === null, matchMedia('(prefers-reduced-motion: reduce)').matches]"}),
+        &b,
+    )
+    .await;
+    let ad = sc_of(&after_drop)
+        .get("value")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    check(
+        "restore-confirmed-from-page",
+        dropped_clear.get("isError").is_none()
+            && ad.get(1).and_then(|v| v.as_bool()) == Some(true)
+            && ad.get(2).and_then(|v| v.as_bool()) == Some(false),
+        &format!("state after a dropped clear: {ad}"),
+    );
+
     // ------------------------------------------------- background rendering
     // A tab that is NOT the active page must still render, still screenshot
     // and still run its timers (the launch flags exist for exactly this).

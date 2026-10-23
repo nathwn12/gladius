@@ -1439,3 +1439,66 @@ fn cancel_while_queued_never_enters_the_section() {
     c.call(json!(31), "close", json!({}));
     let _ = c.wait_id(&json!(31), Duration::from_secs(30), "close");
 }
+
+/// Root-cause regression for the release gate: the restore used to depend on
+/// the CDP ACK alone. `GLADIUS_TEST_DROP_MEDIA_CLEAR=1` drops the media clear
+/// (the exact symptom CI saw: `matchMedia('(prefers-reduced-motion: reduce)')`
+/// still true after the call), and the restore confirmation must notice and
+/// repair it BEFORE the call returns.
+#[test]
+fn lost_media_clear_is_repaired_before_return() {
+    const STATE: &str = "[window.innerWidth, window.innerHeight, \
+        document.getElementById('__gladius_deterministic') === null, \
+        matchMedia('(prefers-reduced-motion: reduce)').matches]";
+    let mut c = Client::spawn_extra(&[("GLADIUS_TEST_DROP_MEDIA_CLEAR", "1")]);
+    c.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18"}}));
+    let init = c.wait_id(&json!(1), Duration::from_secs(30), "initialize");
+    assert!(init.get("error").is_none(), "initialize: {init}");
+
+    let fixture = format!(
+        "file:///{}",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/layout.html")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    c.call(json!(2), "navigate", json!({"url": fixture}));
+    let nav = c.wait_id(&json!(2), Duration::from_secs(60), "navigate");
+    assert!(nav.get("error").is_none(), "navigate: {nav}");
+
+    // Two captures: the hook drops the first clear of EACH, so both must be
+    // repaired before their call returns.
+    for (i, id) in [(0, 10_i64), (1, 20_i64)] {
+        c.call(json!(id), "screenshot", json!({"deterministic": true}));
+        let shot = c.wait_id(&json!(id), Duration::from_secs(60), "capture");
+        assert!(
+            shot.pointer("/result/isError").is_none(),
+            "capture {i} succeeded: {shot}"
+        );
+        c.call(json!(id + 1), "evaluate", json!({"expression": STATE}));
+        let ev = c.wait_id(
+            &json!(id + 1),
+            Duration::from_secs(60),
+            "state after the capture",
+        );
+        let arr = ev
+            .pointer("/result/structuredContent/value")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            arr.get(2).and_then(|v| v.as_bool()),
+            Some(true),
+            "capture {i}: freeze stylesheet removed: {ev}"
+        );
+        assert_eq!(
+            arr.get(3).and_then(|v| v.as_bool()),
+            Some(false),
+            "capture {i}: the dropped media clear was repaired before the call returned: {ev}"
+        );
+    }
+
+    c.call(json!(30), "close", json!({}));
+    let _ = c.wait_id(&json!(30), Duration::from_secs(30), "close");
+}
