@@ -803,6 +803,7 @@ fn deterministic_capture_serializes_with_navigation() {
     let vp = c.wait_id(&json!(3), Duration::from_secs(30), "viewport");
     assert!(vp.get("error").is_none(), "viewport: {vp}");
 
+    let reduce_baseline = motion_baseline(&mut c);
     // Four calls in flight at once: three deterministic captures with
     // DIFFERENT forced geometry plus a navigation. The in-flight cap is 4, so
     // they really overlap. If the overrides interleaved, a capture would
@@ -878,7 +879,8 @@ fn deterministic_capture_serializes_with_navigation() {
     }
 
     // Final state: the override is intact, the freeze style is gone, the
-    // emulated media is cleared. Any interleaved restoration breaks one.
+    // motion preference is exactly what it was before the captures. Any
+    // interleaved restoration breaks one.
     c.call(
         json!(20),
         "evaluate",
@@ -907,13 +909,29 @@ fn deterministic_capture_serializes_with_navigation() {
     );
     assert_eq!(
         arr.get(3).and_then(|v| v.as_bool()),
-        Some(false),
-        "emulated reduced-motion cleared: {ev}"
+        Some(reduce_baseline),
+        "motion preference unchanged from the pre-capture value: {ev}"
     );
 
     c.call(json!(21), "close", json!({}));
     let closed = c.wait_id(&json!(21), Duration::from_secs(30), "close");
     assert!(closed.get("error").is_none(), "close: {closed}");
+}
+
+/// The page's motion preference right now. On an engine without
+/// `Emulation.setEmulatedMedia` (the pinned chrome-headless-shell) this is the
+/// HOST's preference, so it is the value a capture must leave untouched - not
+/// a constant `false`.
+fn motion_baseline(c: &mut Client) -> bool {
+    c.call(
+        json!(900),
+        "evaluate",
+        json!({"expression": "matchMedia('(prefers-reduced-motion: reduce)').matches"}),
+    );
+    c.wait_id(&json!(900), Duration::from_secs(30), "motion baseline")
+        .pointer("/result/structuredContent/value")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// A deterministic capture must WAIT for an in-flight navigation (blocking fix
@@ -956,6 +974,8 @@ fn capture_waits_for_an_in_flight_navigation() {
         "params": {"protocolVersion": "2025-06-18"}}));
     let init = c.wait_id(&json!(1), Duration::from_secs(30), "initialize");
     assert!(init.get("error").is_none(), "initialize: {init}");
+
+    let reduce_baseline = motion_baseline(&mut c);
 
     // Baseline: a deterministic capture of a settled page is fast.
     c.call(json!(2), "navigate", json!({"url": "about:blank"}));
@@ -1029,8 +1049,8 @@ fn capture_waits_for_an_in_flight_navigation() {
     );
     assert_eq!(
         arr.get(1).and_then(|v| v.as_bool()),
-        Some(false),
-        "emulated reduced-motion cleared: {ev}"
+        Some(reduce_baseline),
+        "motion preference unchanged from the pre-capture value: {ev}"
     );
     assert_eq!(
         arr.get(2).and_then(|v| v.as_str()),
@@ -1109,6 +1129,10 @@ fn cancel_during_capture_restores_everything() {
         Some(2.0),
         "the caller's dsf is in effect before the capture: {pre:?}"
     );
+    let reduce_baseline = pre
+        .get(4)
+        .and_then(|v| v.as_bool())
+        .expect("motion preference in the pre-state");
 
     // Fire the capture, then cancel INSIDE its 1200 ms mutation window.
     c.call(json!(10), "screenshot", json!({"deterministic": true}));
@@ -1146,8 +1170,8 @@ fn cancel_during_capture_restores_everything() {
     );
     assert_eq!(
         post.get(4).and_then(|v| v.as_bool()),
-        Some(false),
-        "emulated reduced-motion cleared after cancel: {post:?}"
+        Some(reduce_baseline),
+        "motion preference unchanged from the pre-capture value after cancel: {post:?}"
     );
     assert!(
         waited >= Duration::from_millis(400),
@@ -1217,6 +1241,7 @@ fn cancel_during_compare_closes_the_scratch_target() {
         "baseline saved: {saved}"
     );
 
+    let reduce_baseline = motion_baseline(&mut c);
     let base = page_count(&mut c, 4);
     assert_eq!(base, 1, "exactly the fixture tab before the compare");
 
@@ -1276,8 +1301,8 @@ fn cancel_during_compare_closes_the_scratch_target() {
     );
     assert_eq!(
         arr.get(1).and_then(|v| v.as_bool()),
-        Some(false),
-        "emulated reduced-motion cleared after a cancelled compare: {ev}"
+        Some(reduce_baseline),
+        "motion preference unchanged from the pre-capture value after a cancelled compare: {ev}"
     );
 
     c.call(json!(41), "close", json!({}));
@@ -1323,6 +1348,10 @@ fn cancel_in_the_entry_window_never_mutates() {
     let vp = c.wait_id(&json!(3), Duration::from_secs(30), "viewport");
     assert!(vp.get("error").is_none(), "viewport: {vp}");
 
+    // The motion preference before anything runs (host-derived on the pinned
+    // engine: there is no Emulation.setEmulatedMedia there).
+    let reduce_baseline = motion_baseline(&mut c);
+
     // Fire the capture, then cancel while it is parked in the entry window.
     c.call(json!(10), "screenshot", json!({"deterministic": true}));
     std::thread::sleep(Duration::from_millis(250));
@@ -1364,8 +1393,8 @@ fn cancel_in_the_entry_window_never_mutates() {
     );
     assert_eq!(
         arr.get(4).and_then(|v| v.as_bool()),
-        Some(false),
-        "no emulated reduced-motion left behind: {ev}"
+        Some(reduce_baseline),
+        "motion preference untouched by the aborted call: {ev}"
     );
     assert!(
         waited >= Duration::from_millis(300),
@@ -1467,14 +1496,35 @@ fn lost_media_clear_is_repaired_before_return() {
     let nav = c.wait_id(&json!(2), Duration::from_secs(60), "navigate");
     assert!(nav.get("error").is_none(), "navigate: {nav}");
 
-    // Two captures: the hook drops the first clear of EACH, so both must be
-    // repaired before their call returns.
+    // The motion preference BEFORE any capture. On an engine with
+    // `Emulation.setEmulatedMedia` this is `false` and the dropped clear must
+    // be repaired back to it; on the pinned chrome-headless-shell the command
+    // does not exist, so the preference is the host's and the invariant is
+    // "unchanged" (which is also what proves nothing leaked).
+    // `Emulation.setEmulatedMedia` lives on the PAGE session (a browser-level
+    // `cdp` call answers `-32601`), which is why the capability is read from
+    // the capture reply rather than probed through `cdp`.
+    let reduce_baseline = motion_baseline(&mut c);
+
+    // Two captures: the hook drops the first clear of EACH where the clear
+    // exists, so on a supporting engine both must be repaired before their
+    // call returns. On the pinned engine there is nothing to clear and the
+    // assertion is the unchanged-preference invariant.
     for (i, id) in [(0, 10_i64), (1, 20_i64)] {
         c.call(json!(id), "screenshot", json!({"deterministic": true}));
         let shot = c.wait_id(&json!(id), Duration::from_secs(60), "capture");
         assert!(
             shot.pointer("/result/isError").is_none(),
             "capture {i} succeeded: {shot}"
+        );
+        // The reply reports whether the engine actually emulated motion, so a
+        // caller can tell "frozen by emulation" from "the host already asked
+        // for reduced motion".
+        assert!(
+            shot.pointer("/result/structuredContent/reducedMotionEmulated")
+                .and_then(|v| v.as_bool())
+                .is_some(),
+            "capture {i} reports the media-emulation capability it used: {shot}"
         );
         c.call(json!(id + 1), "evaluate", json!({"expression": STATE}));
         let ev = c.wait_id(
@@ -1494,8 +1544,8 @@ fn lost_media_clear_is_repaired_before_return() {
         );
         assert_eq!(
             arr.get(3).and_then(|v| v.as_bool()),
-            Some(false),
-            "capture {i}: the dropped media clear was repaired before the call returned: {ev}"
+            Some(reduce_baseline),
+            "capture {i}: motion preference back to the pre-capture value: {ev}"
         );
     }
 

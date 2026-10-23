@@ -1287,6 +1287,20 @@ pub async fn run() -> i32 {
     // `matchMedia('(prefers-reduced-motion: reduce)')` still true after the
     // call returned. The hook drops the media clear; the capture must notice
     // and repair it before returning.
+    // The motion preference BEFORE the capture: on a host that already asks
+    // for reduced motion (CI runners disable animations) this is `true`, and
+    // the capture must leave it exactly like that - asserting `false` would
+    // test the host, not the capture.
+    let motion_probe = crate::tools::call(
+        "evaluate",
+        &serde_json::json!({"expression": "matchMedia('(prefers-reduced-motion: reduce)').matches"}),
+        &b,
+    )
+    .await;
+    let reduce_baseline = sc_of(&motion_probe)
+        .get("value")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     std::env::set_var("GLADIUS_TEST_DROP_MEDIA_CLEAR", "1");
     let dropped_clear = crate::tools::call(
         "screenshot",
@@ -1305,12 +1319,19 @@ pub async fn run() -> i32 {
         .get("value")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    let emulated = sc_of(&dropped_clear)
+        .get("reducedMotionEmulated")
+        .and_then(|v| v.as_bool());
     check(
         "restore-confirmed-from-page",
         dropped_clear.get("isError").is_none()
             && ad.get(1).and_then(|v| v.as_bool()) == Some(true)
-            && ad.get(2).and_then(|v| v.as_bool()) == Some(false),
-        &format!("state after a dropped clear: {ad}"),
+            && ad.get(2).and_then(|v| v.as_bool()) == Some(reduce_baseline)
+            && emulated.is_some(),
+        &format!(
+            "state after a dropped clear: {ad} (baseline reduce={reduce_baseline}, \
+             reducedMotionEmulated={emulated:?})"
+        ),
     );
 
     // ------------------------------------------------- background rendering

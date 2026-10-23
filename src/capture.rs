@@ -6,7 +6,14 @@
 //! - `Emulation.setDeviceMetricsOverride` fixes the viewport and forces
 //!   `deviceScaleFactor: 1` / `mobile: false` (restored afterwards: the prior
 //!   override is replayed, or cleared when there was none);
-//! - `Emulation.setEmulatedMedia` reports `prefers-reduced-motion: reduce`;
+//! - `Emulation.setEmulatedMedia` reports `prefers-reduced-motion: reduce`
+//!   while the capture runs and is cleared afterwards. The clear returns the
+//!   page to the ENGINE/HOST default, not to `false`: a host that asks for
+//!   reduced motion (CI runners disable animations) reports `reduce` again
+//!   after the clear. The invariant is therefore "unchanged from the
+//!   pre-capture value", the reply reports whether the emulation was applied
+//!   at all (`reducedMotionEmulated`), and the freeze stylesheet below is what
+//!   stops CSS animation on every engine;
 //! - a temporary style element freezes `animation`, `transition`,
 //!   `caret-color`, smooth scrolling and scrollbar gutter/width;
 //! - the page is settled before the shot: `document.fonts.ready`, every `img`
@@ -113,6 +120,11 @@ pub struct Capture {
     pub dsf: f64,
     pub url: String,
     pub deterministic: bool,
+    /// True when this engine actually emulated `prefers-reduced-motion`
+    /// (`Emulation.setEmulatedMedia` implemented). False on the pinned
+    /// `chrome-headless-shell`, where the preference stays the host's and only
+    /// the freeze stylesheet stops motion.
+    pub reduced_motion_emulated: bool,
 }
 
 impl Capture {
@@ -130,6 +142,10 @@ impl Capture {
             m.insert("deviceScaleFactor".to_string(), json!(self.dsf));
             m.insert("url".to_string(), json!(self.url));
             m.insert("checksum".to_string(), json!(self.checksum));
+            m.insert(
+                "reducedMotionEmulated".to_string(),
+                json!(self.reduced_motion_emulated),
+            );
         }
         Value::Object(m)
     }
@@ -159,6 +175,42 @@ pub(crate) async fn maybe_test_delay() {
     if let Some(ms) = test_delay_ms() {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
+}
+
+/// Does this engine implement `Emulation.setEmulatedMedia`? The pinned
+/// `chrome-headless-shell` 155 DOES, on a PAGE session (on the browser-level
+/// connection the same method answers `-32601`, which is why a capability
+/// probe must go through a session - measured on the pin). This cache only
+/// guards an engine that genuinely lacks it: the first definitive answer is
+/// cached (0 = unknown, 1 = supported, 2 = unsupported).
+static MEDIA_EMU: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn media_emu_known() -> Option<bool> {
+    use std::sync::atomic::Ordering;
+    match MEDIA_EMU.load(Ordering::SeqCst) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+fn media_emu_remember(supported: bool) {
+    use std::sync::atomic::Ordering;
+    MEDIA_EMU.store(if supported { 1 } else { 2 }, Ordering::SeqCst);
+}
+
+/// "This engine has no such command" - the CDP error for a method that is not
+/// part of the build's protocol surface.
+fn method_missing(err: &str) -> bool {
+    err.contains("-32601") || err.contains("wasn't found") || err.contains("was not found")
+}
+
+/// The explicit reset: empty media type plus an empty feature list. On an
+/// engine that implements the command this removes the emulation entirely
+/// (back to the engine/host default); it is never a "set no-preference"
+/// override, which would *change* a host that prefers reduced motion.
+fn clear_media_params() -> Value {
+    json!({"media": "", "features": []})
 }
 
 /// How long the restore may take to become visible to the PAGE. Bounded: a
@@ -200,10 +252,16 @@ fn take_dropped_clear() -> bool {
         .is_ok()
 }
 
-/// Page-level view of the restored state: metrics, freeze stylesheet gone,
-/// emulated reduced-motion gone. This is the ONLY proof that restoration is
-/// complete - a CDP reply says the agent accepted the command, not that the
-/// page has applied it.
+/// Page-level view of the restored state: metrics, freeze stylesheet gone and
+/// the motion preference back to what the page reported BEFORE the capture.
+/// That last value is deliberately the baseline, not `false`: the clear
+/// returns the page to the engine/host default, and a host that asks for
+/// reduced motion (a CI runner with animations disabled reports `reduce`)
+/// reports it again afterwards - so `false` would assert something the capture
+/// neither set nor owns.
+///
+/// This is the ONLY proof that restoration is complete - a CDP reply says the
+/// agent accepted the command, not that the page has applied it.
 fn restore_probe_js() -> String {
     format!(
         "[window.innerWidth, window.innerHeight, window.devicePixelRatio, \
@@ -215,8 +273,8 @@ fn restore_probe_js() -> String {
 /// Poll the page (bounded) until it reports the pre-capture state: the
 /// viewport/dsf we read before overriding, no freeze stylesheet, and no
 /// emulated reduced-motion. Returns true when the page agrees.
-async fn confirm_restored(browser: &Browser, expect: (i64, i64, f64)) -> bool {
-    let (ew, eh, edpr) = expect;
+async fn confirm_restored(browser: &Browser, expect: (i64, i64, f64, bool)) -> bool {
+    let (ew, eh, edpr, e_reduce) = expect;
     let expr = restore_probe_js();
     let deadline = std::time::Instant::now() + RESTORE_CONFIRM_CAP;
     loop {
@@ -224,10 +282,11 @@ async fn confirm_restored(browser: &Browser, expect: (i64, i64, f64)) -> bool {
             let a = v.as_array().cloned().unwrap_or_default();
             let num = |i: usize| a.get(i).and_then(|x| x.as_f64());
             let style_gone = a.get(3).and_then(|x| x.as_bool()) == Some(true);
-            let reduced_motion = a.get(4).and_then(|x| x.as_bool()) == Some(false);
+            // The preference must be back to the BASELINE (see the doc above).
+            let reduced_motion_restored = a.get(4).and_then(|x| x.as_bool()) == Some(e_reduce);
             let size_ok = num(0) == Some(ew as f64) && num(1) == Some(eh as f64);
             let dpr_ok = num(2).map(|d| (d - edpr).abs() < 0.001).unwrap_or(false);
-            if size_ok && dpr_ok && style_gone && reduced_motion {
+            if size_ok && dpr_ok && style_gone && reduced_motion_restored {
                 return true;
             }
         }
@@ -277,6 +336,7 @@ fn decode(r: &Value, deterministic: bool) -> Result<Capture, String> {
         dsf: 1.0,
         url: String::new(),
         deterministic,
+        reduced_motion_emulated: false,
     })
 }
 
@@ -332,11 +392,19 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
     // Prior override we must put back. Read BEFORE we overwrite anything.
     let prior = browser.viewport_override().await;
     // The pre-capture read-back is also the EXPECTATION the restore must
-    // confirm later (metrics, dsf); keep all three values.
+    // confirm later: metrics, dsf AND the motion preference the page reports
+    // before we touch it (which on an engine without media emulation is the
+    // host's, not ours).
     let (vw, vh, vdpr) = browser
         .viewport_readback()
         .await
         .unwrap_or((1280, 720, 1.0));
+    let base_reduce = browser
+        .eval("matchMedia('(prefers-reduced-motion: reduce)').matches")
+        .await
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let width = opts.width.unwrap_or(vw).max(1);
     let height = opts.height.unwrap_or(vh).max(1);
     browser
@@ -346,17 +414,35 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
             true,
         )
         .await?;
-    if let Err(e) = browser
-        .command(
-            "Emulation.setEmulatedMedia",
-            json!({"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]}),
-            true,
-        )
-        .await
-    {
-        warn(&format!(
-            "deterministic capture: setEmulatedMedia failed: {e}"
-        ));
+    // Emulate reduced motion ONLY where the engine implements the command.
+    // chrome-headless-shell 155 has no `Emulation.setEmulatedMedia` at all, so
+    // the preference stays the host's (reported as `reducedMotionEmulated:
+    // false`); the freeze stylesheet below still stops CSS animation. The first
+    // attempt doubles as the capability probe.
+    let mut media_emulated = media_emu_known().unwrap_or(true);
+    if media_emulated {
+        match browser
+            .command(
+                "Emulation.setEmulatedMedia",
+                json!({"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]}),
+                true,
+            )
+            .await
+        {
+            Ok(_) => media_emu_remember(true),
+            Err(e) if method_missing(&e) => {
+                media_emu_remember(false);
+                media_emulated = false;
+                warn(
+                    "deterministic capture: this engine has no Emulation.setEmulatedMedia; \
+                     prefers-reduced-motion is not emulated - the freeze stylesheet still \
+                     stops CSS animation",
+                );
+            }
+            Err(e) => warn(&format!(
+                "deterministic capture: setEmulatedMedia failed: {e} (preference left as-is)"
+            )),
+        }
     }
     if let Err(e) = browser.eval(&style_js()).await {
         warn(&format!("deterministic capture: freeze style failed: {e}"));
@@ -383,15 +469,17 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
             "deterministic capture: could not remove the freeze stylesheet: {e}"
         ));
     }
-    if take_dropped_clear() {
-        warn("test hook: dropped the media clear (GLADIUS_TEST_DROP_MEDIA_CLEAR)");
-    } else if let Err(e) = browser
-        .command("Emulation.setEmulatedMedia", json!({"features": []}), true)
-        .await
-    {
-        warn(&format!(
-            "deterministic capture: could not clear emulated media: {e}"
-        ));
+    if media_emulated {
+        if take_dropped_clear() {
+            warn("test hook: dropped the media clear (GLADIUS_TEST_DROP_MEDIA_CLEAR)");
+        } else if let Err(e) = browser
+            .command("Emulation.setEmulatedMedia", clear_media_params(), true)
+            .await
+        {
+            warn(&format!(
+                "deterministic capture: could not clear emulated media: {e}"
+            ));
+        }
     }
     restore_metrics(browser, prior.as_ref()).await;
 
@@ -402,7 +490,7 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
     // exactly the release-gate failure. Restoration therefore is not complete
     // until the PAGE reports it: confirm (bounded), and repair once if the
     // clear did not land.
-    let expectation = (vw, vh, vdpr);
+    let expectation = (vw, vh, vdpr, base_reduce);
     if !confirm_restored(browser, expectation).await {
         warn(
             "deterministic capture: page did not confirm the restored state within 2s; \
@@ -413,13 +501,15 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
                 "deterministic capture: retry could not remove the freeze stylesheet: {e}"
             ));
         }
-        if let Err(e) = browser
-            .command("Emulation.setEmulatedMedia", json!({"features": []}), true)
-            .await
-        {
-            warn(&format!(
-                "deterministic capture: retry could not clear emulated media: {e}"
-            ));
+        if media_emulated {
+            if let Err(e) = browser
+                .command("Emulation.setEmulatedMedia", clear_media_params(), true)
+                .await
+            {
+                warn(&format!(
+                    "deterministic capture: retry could not clear emulated media: {e}"
+                ));
+            }
         }
         restore_metrics(browser, prior.as_ref()).await;
         if !confirm_restored(browser, expectation).await {
@@ -431,6 +521,7 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
     }
 
     let mut cap = decode(&shot?, true)?;
+    cap.reduced_motion_emulated = media_emulated;
     let arr = live.as_array().cloned().unwrap_or_default();
     let num = |i: usize| arr.get(i).and_then(|v| v.as_f64());
     cap.width = num(0).map(|v| v as i64).unwrap_or(width);

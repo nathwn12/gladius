@@ -203,7 +203,15 @@ raises, focuses or moves a window on any path.
   `setInterval` keeps firing (25 ticks in 1.2 s instead of ~0-1).
 - **Deterministic pixels.** `screenshot {deterministic:true}` pins metrics,
   motion, caret and scrollbars and waits for fonts/images/frames before
-  capturing, then restores every override **and confirms the restore from the page** (bounded poll of viewport/dsf, the freeze stylesheet and matchMedia, with one re-apply if the clear did not land): an awaited CDP reply is not proof that the page has applied it, which is exactly how the release gate caught prefers-reduced-motion still set after a capture returned. Two captures of the same page
+  capturing, then restores every override **and confirms the restore from the
+  page** (bounded poll of viewport/dsf, the freeze stylesheet and
+  `matchMedia`, with one re-apply if the clear did not land): an awaited CDP
+  reply is not proof that the page has applied it. The motion preference is
+  restored to the **engine/host default**, so the guarantee is
+  "unchanged from the pre-capture value" - a host that asks for reduced motion
+  (CI runners disable animations) reports `reduce` again afterwards, and the
+  reply says whether the emulation was applied at all
+  (`reducedMotionEmulated`). Two captures of the same page
   return the same checksum - the assertion the selftest makes.
 - **Geometry without pixels.** `assert_layout` and `layout` answer "where is
   it / is it really there" from `DOM.getBoxModel` + `Runtime.evaluate`, so a
