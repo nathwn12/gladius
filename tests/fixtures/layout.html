@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Gladius Layout Fixture</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #ffffff; font: 16px/20px sans-serif; }
+  #probe { position: absolute; left: 40px; top: 40px; width: 140px; height: 60px;
+           background: #1e64c8; color: #ffffff; }
+  #under { position: absolute; left: 200px; top: 40px; width: 100px; height: 100px;
+           background: #c81e1e; }
+  #over  { position: absolute; left: 240px; top: 60px; width: 100px; height: 100px;
+           background: #1ec84a; opacity: 0.9; }
+  #spinner { position: absolute; left: 40px; top: 200px; width: 40px; height: 40px;
+             background: #333333; animation: spin 400ms linear infinite; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  #scroll { position: absolute; left: 40px; top: 280px; width: 120px; height: 60px;
+            overflow: hidden; background: #eeeeee; }
+  #scroll div { width: 400px; height: 300px; background: #dddddd; }
+  /* A focusable control with a box pinned to exact pixels: the AX snapshot
+     always stamps a ref on a button, which is what proves the ref path of
+     assert_layout/layout resolves to the same measurement as a selector. */
+  #act { position: absolute; left: 300px; top: 280px; width: 80px; height: 30px;
+         box-sizing: border-box; border: 0; padding: 0; margin: 0; background: #444444; color: #ffffff; }
+</style>
+</head>
+<body>
+<div id="probe">PROBE_MARKER</div>
+<div id="under">UNDER</div>
+<div id="over">OVER</div>
+<div id="spinner"></div>
+<div id="scroll"><div>SCROLL_CONTENT</div></div>
+<button id="act">ACT_MARKER</button>
+</body>
+</html>

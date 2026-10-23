@@ -27,13 +27,20 @@ and a headed request fails closed with an explicit unsupported error. Each
 owned instance launches the pinned `chrome-headless-shell.exe` as:
 
 ```
-chrome-headless-shell.exe --headless --remote-debugging-port=<free> --user-data-dir=<private> --no-first-run --no-default-browser-check --remote-allow-origins=http://127.0.0.1:<port> about:blank
+chrome-headless-shell.exe --headless --remote-debugging-port=<free> --user-data-dir=<private> --no-first-run --no-default-browser-check --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling --remote-allow-origins=http://127.0.0.1:<port> about:blank
 ```
 
 each flag exactly once, spawned with `CREATE_NO_WINDOW`, with readiness
 discovered by polling `GET http://127.0.0.1:<port>/json/version` for
 `webSocketDebuggerUrl`. Backend selection is `GLADIUS_CDP_URL` (attach, never
 owned) first, otherwise this Chromium launch is the only engine.
+
+The three `--disable-*` flags are the background-correctness contract: a tab
+that is not the active page must still render, still screenshot and still run
+its timers, and none of the three touch the OS (no cursor, no keyboard, no
+window, no focus). The `selftest` asserts it on the real engine - a capture
+taken on a backgrounded tab's own session is byte-identical to the foreground
+capture and its `setInterval` keeps firing (25 ticks in 1.2 s).
 
 The profile is functional, not hygiene: since Chrome 136 the
 remote-debugging switches are ignored on the default data directory, so a

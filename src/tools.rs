@@ -30,15 +30,22 @@ pub fn list() -> Value {
             "anyOf": [{"required": ["url", "title", "truncated", "nodes"]}, {"required": ["mode", "text"]}]},
          "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}},
         {"name": "screenshot", "title": "Screenshot",
-         "description": "PNG screenshot of the active page (unavailable with GLADIUS_BACKEND_CAPS=dom-only: no rendering pipeline). Optional path: an ABSOLUTE filesystem path the decoded PNG is also written to (missing parent directories are created; a failed write is a typed error, never a silent success). There is no allowlisted screenshot root: only absolute paths are accepted, and a relative path is rejected. When path is absent the reply shape is unchanged.",
-         "inputSchema": {"type": "object", "properties": {"fullPage": {"type": "boolean"}, "path": {"type": "string"}}, "additionalProperties": false},
+         "description": "PNG screenshot of the active page (unavailable with GLADIUS_BACKEND_CAPS=dom-only: no rendering pipeline). Optional path: an ABSOLUTE filesystem path the decoded PNG is also written to (missing parent directories are created; a failed write is a typed error, never a silent success). There is no allowlisted screenshot root: only absolute paths are accepted, and a relative path is rejected. When path is absent the reply shape is unchanged. deterministic:true pins the capture: device metrics fixed (current viewport, or width/height; deviceScaleFactor 1, mobile false) and restored afterwards, prefers-reduced-motion:reduce, a temporary style element freezing animation/transition/caret-color/scrollbars, then document.fonts.ready + every img complete + two animation-frame ticks before Page.captureScreenshot({format:png, fromSurface:true, captureBeyondViewport for full page}). The reply then carries viewport, deviceScaleFactor, url, byte length and a cheap content checksum, so two captures of the same page can be proven byte-identical. Everything rides CDP: no OS cursor, no OS keyboard, no window, no foreground tab.",
+         "inputSchema": {"type": "object", "properties": {
+             "fullPage": {"type": "boolean"}, "path": {"type": "string"},
+             "deterministic": {"type": "boolean"},
+             "width": {"type": "integer"}, "height": {"type": "integer"}},
+             "additionalProperties": false},
          "outputSchema": {"type": "object",
-            "properties": {"mimeType": {"type": "string"}, "bytes": {"type": "integer", "minimum": 0}},
+            "properties": {"mimeType": {"type": "string"}, "bytes": {"type": "integer", "minimum": 0},
+                "path": {"type": "string"}, "deterministic": {"type": "boolean"},
+                "viewport": {"type": "object"}, "deviceScaleFactor": {"type": "number"},
+                "url": {"type": "string"}, "checksum": {"type": "string"}},
             "required": ["mimeType", "bytes"], "additionalProperties": false},
          "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}},
         {"name": "click", "title": "Click",
-         "description": "Click an element by CSS selector (first match) or AX ref (@eN from snapshot; exact). frame=<CDP frameId> from targets scopes to that iframe (same-process CSS selectors; refs are main-frame only - with frame= use a CSS selector; OOPIF without a mapped target is a typed error, never a main-frame click)",
-         "inputSchema": {"type": "object", "properties": {"element": {"type": "string"}, "frame": {"type": "string"}}, "required": ["element"], "additionalProperties": false},
+         "description": "Click an element by CSS selector (first match) or AX ref (@eN from snapshot; exact). The click is exactly two CDP events at the element's exact float box centre: mousePressed then mouseReleased - no mouseMoved, no hover, no movement loop, no interpolation. hoverFirst:true sends ONE mouseMoved at that same point first, for pages whose handlers read hover state; the default is false. frame=<CDP frameId> from targets scopes to that iframe (same-process CSS selectors; refs are main-frame only - with frame= use a CSS selector; OOPIF without a mapped target is a typed error, never a main-frame click)",
+         "inputSchema": {"type": "object", "properties": {"element": {"type": "string"}, "frame": {"type": "string"}, "hoverFirst": {"type": "boolean"}}, "required": ["element"], "additionalProperties": false},
          "outputSchema": {"type": "object",
             "properties": {"ok": {"type": "boolean"}, "dialog": {"type": "object"}, "note": {"type": "string"}},
             "required": ["ok"], "additionalProperties": false},
@@ -195,7 +202,7 @@ pub fn list() -> Value {
     ]});
     // G5: inserted after tabs (before close) programmatically so the
     // single literal above stays under the macro recursion limit; the count
-    // in serverInfo derives from this array (now 22 tools).
+    // in serverInfo derives from this array (now 25 tools).
     {
         let tools = listed["tools"].as_array_mut().expect("tools array");
         let pos = tools
@@ -222,6 +229,97 @@ pub fn list() -> Value {
                  "fileOrigin": {"type": "string"}, "redacted": {"type": "boolean"}, "note": {"type": "string"}},
              "required": ["ok", "action"], "additionalProperties": false},
           "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false}}));
+        // Geometry + visual-regression primitives: geometry needs no pixels,
+        // appearance does - both are engine measurements, never guesses.
+        // Inserted before `close` so the shutdown tool stays last.
+        let at = tools
+            .iter()
+            .position(|t| t.get("name").and_then(|v| v.as_str()) == Some("close"))
+            .unwrap_or(tools.len());
+        tools.insert(at, json!({"name": "assert_layout", "title": "Assert Layout",
+          "description": "Prove geometry without pixels: one call, one or many targets (ref @eN and/or CSS selector, string or array), several checks. Checks: exists (default true; false asserts absence), visible (a real box, not display:none/visibility:hidden/collapse, opacity>0), stableFrames (N animation frames, identical bbox), box {x,y,w,h,tolerance} in VIEWPORT CSS px from DOM.getBoxModel, hitTarget (elementFromPoint at the exact centre is the target or a descendant - the same guard click uses), computed (subset of getComputedStyle, string-exact), noOverflow (scrollWidth/Height <= clientWidth/Height + tolerance), inViewport (whole box inside the visual viewport). Returns per-check {target, check, pass, expected, actual, delta} plus an overall pass. screenshotOnFail:true adds one deterministic capture's path/bytes/checksum. Values are engine measurements (DOM.getBoxModel + Runtime.evaluate), never guesses. Headless + CDP only: no OS cursor, no OS keyboard, no window, no foreground tab.",
+          "inputSchema": {"type": "object", "properties": {
+              "ref": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+              "selector": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+              "checks": {"type": "object", "properties": {
+                  "exists": {"type": "boolean"}, "visible": {"type": "boolean"},
+                  "stableFrames": {"type": "integer", "minimum": 1},
+                  "box": {"type": "object", "properties": {
+                      "x": {"type": "number"}, "y": {"type": "number"},
+                      "w": {"type": "number"}, "h": {"type": "number"},
+                      "tolerance": {"type": "number"}}, "additionalProperties": false},
+                  "hitTarget": {"type": "boolean"},
+                  "computed": {"type": "object"},
+                  "noOverflow": {"oneOf": [{"type": "boolean"}, {"type": "number"},
+                      {"type": "object", "properties": {"tolerance": {"type": "number"}}, "additionalProperties": false}]},
+                  "inViewport": {"type": "boolean"}},
+                  "additionalProperties": false},
+              "screenshotOnFail": {"type": "boolean"},
+              "screenshotPath": {"type": "string"}},
+              "anyOf": [{"required": ["ref"]}, {"required": ["selector"]}],
+              "additionalProperties": false},
+          "outputSchema": {"type": "object",
+             "properties": {"pass": {"type": "boolean"}, "checks": {"type": "array"},
+                 "targets": {"type": "array"}, "screenshot": {"type": "object"}},
+             "required": ["pass", "checks", "targets"], "additionalProperties": false},
+          "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}}));
+        tools.insert(at + 1, json!({"name": "layout", "title": "Layout",
+          "description": "The where-is-it-actually primitive: every match of a selector or ref list with its viewport rect, page-coordinate box (DOM.getBoxModel), content quad count, scroll size (scrollWidth/Height vs clientWidth/Height), computed display/visibility/opacity, a z-order hint (paint order, z-index, position, stacking-context flag) and every detected overlapping pair with its intersection rect and area (includeOverlaps default true). Main frame; read-only; engine measurements only. Headless + CDP only: no OS input, no window.",
+          "inputSchema": {"type": "object", "properties": {
+              "ref": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+              "selector": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+              "includeOverlaps": {"type": "boolean"}},
+              "anyOf": [{"required": ["ref"]}, {"required": ["selector"]}],
+              "additionalProperties": false},
+          "outputSchema": {"type": "object",
+             "properties": {"elements": {"type": "array"}, "overlaps": {"type": "array"},
+                 "viewport": {"type": "object"}, "count": {"type": "integer"},
+                 "requested": {"type": "integer"}},
+             "required": ["elements", "overlaps", "viewport"], "additionalProperties": false},
+          "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}}));
+        tools.insert(at + 2, json!({"name": "visual", "title": "Visual Baselines",
+          "description": "Deterministic visual-regression baselines under GLADIUS_VISUAL_DIR (default <cwd>/.gladius/visual), names sanitised to [A-Za-z0-9._-]. action save captures a deterministic PNG named <name> plus <name>.meta.json (browser, viewport, deviceScaleFactor, url, checksum, createdAt). compare captures the same deterministic shot and diffs it against the baseline in a scratch headless target created with background:true (the engine decodes both PNGs onto a canvas - no new runtime dependency), returning pass, diffPixels, totalPixels, ratio, bbox, maxChannelDelta, baselinePath, diffPath and environment {match, baseline, current}; a browser-major, viewport or deviceScaleFactor mismatch adds a baseline_environment_mismatch warning (not a failure unless requireEnvironmentMatch:true). Anti-aliasing is ignored by default with a deterministic rule: a candidate whose 3x3 luminance neighbourhood has >=32 levels of contrast in BOTH images is suppressed when its 4-connected component is no larger than minDiffCluster (default 2); the threshold is never raised for tolerance. antialias (default true) and includeAA (default false) are inverses. threshold is a per-channel fraction of the 0-255 range (default 0.1), maxDiffPixels/maxDiffRatio set the pass bar (default 0/0), maskRects skip regions; update:true rewrites the baseline and its sidecar; list and delete manage them. compare opens and closes one scratch target on the connected engine, always created with background:true so it never activates (on an external attach that is a real extra tab for a moment); an engine that refuses a background target is refused with a typed scratch_background_unsupported error, never retried in the foreground. Headless + CDP only: no OS input, no window.",
+          "inputSchema": {"type": "object", "properties": {
+              "action": {"type": "string", "enum": ["save", "compare", "list", "delete"]},
+              "name": {"type": "string"}, "fullPage": {"type": "boolean"},
+              "threshold": {"type": "number"}, "maxDiffPixels": {"type": "integer"},
+              "maxDiffRatio": {"type": "number"},
+              "antialias": {"type": "boolean"},
+              "includeAA": {"type": "boolean"},
+              "minDiffCluster": {"type": "integer", "minimum": 0},
+              "requireEnvironmentMatch": {"type": "boolean"},
+              "maskRects": {"type": "array", "items": {"type": "object", "properties": {
+                  "x": {"type": "number"}, "y": {"type": "number"},
+                  "w": {"type": "number"}, "h": {"type": "number"}},
+                  "required": ["x", "y", "w", "h"], "additionalProperties": false}},
+              "update": {"type": "boolean"}},
+              "required": ["action"], "additionalProperties": false},
+          "outputSchema": {"type": "object",
+             "properties": {"ok": {"type": "boolean"}, "action": {"type": "string"},
+                 "name": {"type": "string"}, "pass": {"type": "boolean"}, "updated": {"type": "boolean"},
+                 "diffPixels": {"type": "integer"}, "totalPixels": {"type": "integer"},
+                 "ratio": {"type": "number"},
+                 // `null` in the documented cases: bbox only exists when
+                 // something differed, diffPath only once a diff image was
+                 // written, and compare{update:true} returns neither.
+                 "bbox": {"type": ["object", "null"]},
+                 "maxChannelDelta": {"type": "integer"}, "baselinePath": {"type": "string"},
+                 "diffPath": {"type": ["string", "null"]}, "bytes": {"type": "integer"},
+                 "path": {"type": "string"}, "metaPath": {"type": "string"},
+                 "antialias": {"type": "boolean"}, "minDiffCluster": {"type": "integer"},
+                 "ignoredPixels": {"type": "integer"}, "ignoredClusters": {"type": "integer"},
+                 "scratchBackground": {"type": "boolean"},
+                 "environment": {"type": "object"},
+                 "warning": {"type": ["string", "null"]},
+                 "checksum": {"type": "string"}, "baselineChecksum": {"type": "string"},
+                 "viewport": {"type": "object"}, "url": {"type": "string"},
+                 "baselines": {"type": "array"}, "dir": {"type": "string"},
+                 "count": {"type": "integer"}, "deleted": {"type": "array"},
+                 "sizeMismatch": {"type": "boolean"}, "size": {"type": "object"},
+                 "threshold": {"type": "number"}, "maxDiffPixels": {"type": "integer"},
+                 "maxDiffRatio": {"type": "number"}, "fullPage": {"type": "boolean"}},
+             "required": ["ok", "action"], "additionalProperties": false},
+          "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false}}));
     }
     listed
 }
@@ -244,7 +342,7 @@ fn ok_text(s: String) -> Value {
 /// what it always was - clients that pattern-match English keep working -
 /// and `isError` is unchanged. `structuredContent` rides alongside; a
 /// client that ignores the new field sees the old envelope exactly.
-struct ToolErr {
+pub(crate) struct ToolErr {
     prose: String,
     sc: Value,
 }
@@ -254,20 +352,20 @@ impl ToolErr {
     /// real offending value (`ref` for an AX ref, `element` for a selector,
     /// `path` for a local file, `want` for a wanted option, `name` for an
     /// unknown tool).
-    fn typed(prose: String, sc: Value) -> Self {
+    pub(crate) fn typed(prose: String, sc: Value) -> Self {
         Self { prose, sc }
     }
 
     /// Anything that genuinely knows nothing (CDP/js-engine failures and
     /// other untyped strings): code only, never an invented reason.
-    fn fallback(prose: String) -> Self {
+    pub(crate) fn fallback(prose: String) -> Self {
         Self {
             prose,
             sc: json!({"code": "error"}),
         }
     }
 
-    fn envelope(self) -> Value {
+    pub(crate) fn envelope(self) -> Value {
         json!({"content": [{"type": "text", "text": self.prose}], "isError": true, "structuredContent": self.sc})
     }
 }
@@ -326,48 +424,78 @@ fn check_unknown(tool: &str, args: &Value, allowed: &[&str]) -> Result<(), ToolE
 }
 
 pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
-    let r: Result<Value, ToolErr> =
-        match name {
-            "navigate" => {
-                if let Err(e) = check_unknown("navigate", args, &["url"]) {
-                    return e.envelope();
-                }
-                let url = match args.get("url").and_then(|v| v.as_str()) {
+    let r: Result<Value, ToolErr> = match name {
+        "navigate" => {
+            if let Err(e) = check_unknown("navigate", args, &["url"]) {
+                return e.envelope();
+            }
+            let url = match args.get("url").and_then(|v| v.as_str()) {
                 Some(u) => u.to_string(),
                 None => return ToolErr::typed(
                     "navigate: missing required arg 'url'".to_string(),
                     json!({"code": "invalid_args", "reason": "missing_arg", "tool": "navigate"}),
-                ).envelope(),
-            };
-                tool_navigate(browser, &url).await
-            }
-            "snapshot" => {
-                if let Err(e) = check_unknown("snapshot", args, &["mode", "frame"]) {
-                    return e.envelope();
-                }
-                tool_snapshot(
-                    browser,
-                    args.get("mode").and_then(|v| v.as_str()),
-                    args.get("frame").and_then(|v| v.as_str()),
                 )
-                .await
+                .envelope(),
+            };
+            tool_navigate(browser, &url).await
+        }
+        "snapshot" => {
+            if let Err(e) = check_unknown("snapshot", args, &["mode", "frame"]) {
+                return e.envelope();
             }
-            "screenshot" => {
-                if let Err(e) = check_unknown("screenshot", args, &["fullPage", "path"]) {
-                    return e.envelope();
-                }
-                let full = args
-                    .get("fullPage")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let path = args.get("path").and_then(|v| v.as_str());
-                tool_screenshot(browser, full, path).await
+            tool_snapshot(
+                browser,
+                args.get("mode").and_then(|v| v.as_str()),
+                args.get("frame").and_then(|v| v.as_str()),
+            )
+            .await
+        }
+        "screenshot" => {
+            if let Err(e) = check_unknown(
+                "screenshot",
+                args,
+                &["fullPage", "path", "deterministic", "width", "height"],
+            ) {
+                return e.envelope();
             }
-            "click" => {
-                if let Err(e) = check_unknown("click", args, &["element", "frame"]) {
-                    return e.envelope();
-                }
-                let el = match args.get("element").and_then(|v| v.as_str()) {
+            let full = args
+                .get("fullPage")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let path = args.get("path").and_then(|v| v.as_str());
+            let deterministic = args
+                .get("deterministic")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let width = args.get("width").and_then(|v| v.as_i64());
+            let height = args.get("height").and_then(|v| v.as_i64());
+            // Metric overrides only mean something under a pinned
+            // capture; accept them otherwise and they would silently do
+            // nothing, so refuse instead.
+            if !deterministic && (width.is_some() || height.is_some()) {
+                return ToolErr::typed(
+                        "screenshot: 'width'/'height' require deterministic:true (a plain capture uses the live viewport)".to_string(),
+                        json!({"code": "invalid_args", "reason": "bad_value", "tool": "screenshot", "arg": "width"}),
+                    )
+                    .envelope();
+            }
+            tool_screenshot(browser, full, path, deterministic, width, height).await
+        }
+        "assert_layout" => {
+            // Boxed on purpose: the geometry body would otherwise be
+            // inlined into this already-large dispatch future, and the
+            // debug-profile poll frame is the tightest stack budget on
+            // the launch path (see main.rs on stack depth).
+            Box::pin(tool_assert_layout(browser, args)).await
+        }
+        "layout" => Box::pin(tool_layout(browser, args)).await,
+        "visual" => Box::pin(tool_visual(browser, args)).await,
+        "click" => {
+            if let Err(e) = check_unknown("click", args, &["element", "frame", "hoverFirst"]) {
+                return e.envelope();
+            }
+            let el =
+                match args.get("element").and_then(|v| v.as_str()) {
                     Some(e) => e.to_string(),
                     None => return ToolErr::typed(
                         "click: missing required arg 'element'".to_string(),
@@ -375,18 +503,24 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     )
                     .envelope(),
                 };
-                let frame = args
-                    .get("frame")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                tool_click(browser, &el, frame.as_deref()).await
+            let frame = args
+                .get("frame")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            // Hover is opt-in: a click sends press+release only unless the
+            // caller explicitly asks for the hover state first.
+            let hover_first = args
+                .get("hoverFirst")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            tool_click(browser, &el, frame.as_deref(), hover_first).await
+        }
+        "type" => {
+            if let Err(e) = check_unknown("type", args, &["element", "text", "submit", "frame"]) {
+                return e.envelope();
             }
-            "type" => {
-                if let Err(e) = check_unknown("type", args, &["element", "text", "submit", "frame"])
-                {
-                    return e.envelope();
-                }
-                let (el, text) = match (
+            let (el, text) =
+                match (
                     args.get("element").and_then(|v| v.as_str()),
                     args.get("text").and_then(|v| v.as_str()),
                 ) {
@@ -397,99 +531,100 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     )
                     .envelope(),
                 };
-                let submit = args
-                    .get("submit")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let frame = args
-                    .get("frame")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                tool_type(browser, &el, &text, submit, frame.as_deref()).await
+            let submit = args
+                .get("submit")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let frame = args
+                .get("frame")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            tool_type(browser, &el, &text, submit, frame.as_deref()).await
+        }
+        "evaluate" => {
+            if let Err(e) = check_unknown("evaluate", args, &["expression", "target", "frame"]) {
+                return e.envelope();
             }
-            "evaluate" => {
-                if let Err(e) = check_unknown("evaluate", args, &["expression", "target", "frame"])
-                {
-                    return e.envelope();
-                }
-                let expr = match args.get("expression").and_then(|v| v.as_str()) {
+            let expr = match args.get("expression").and_then(|v| v.as_str()) {
                 Some(e) => e.to_string(),
                 None => return ToolErr::typed(
                     "evaluate: missing required arg 'expression'".to_string(),
                     json!({"code": "invalid_args", "reason": "missing_arg", "tool": "evaluate"}),
-                ).envelope(),
-            };
-                let target = args
-                    .get("target")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let frame = args
-                    .get("frame")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                tool_evaluate(browser, &expr, target.as_deref(), frame.as_deref()).await
-            }
-            "wait_for" => {
-                if let Err(e) = check_unknown(
-                    "wait_for",
-                    args,
-                    &[
-                        "selector",
-                        "text",
-                        "ms",
-                        "networkIdle",
-                        "idleMs",
-                        "expression",
-                    ],
-                ) {
-                    return e.envelope();
-                }
-                let sel = args
-                    .get("selector")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let text = args
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let ms = args.get("ms").and_then(|v| v.as_i64());
-                let net_idle = args
-                    .get("networkIdle")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let idle_ms = args.get("idleMs").and_then(|v| v.as_i64());
-                let expr = args
-                    .get("expression")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                tool_wait_for(
-                    browser,
-                    sel.as_deref(),
-                    text.as_deref(),
-                    ms,
-                    net_idle,
-                    idle_ms,
-                    expr.as_deref(),
                 )
-                .await
+                .envelope(),
+            };
+            let target = args
+                .get("target")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let frame = args
+                .get("frame")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            tool_evaluate(browser, &expr, target.as_deref(), frame.as_deref()).await
+        }
+        "wait_for" => {
+            if let Err(e) = check_unknown(
+                "wait_for",
+                args,
+                &[
+                    "selector",
+                    "text",
+                    "ms",
+                    "networkIdle",
+                    "idleMs",
+                    "expression",
+                ],
+            ) {
+                return e.envelope();
             }
-            "console" => {
-                if let Err(e) = check_unknown("console", args, &["action", "limit"]) {
-                    return e.envelope();
-                }
-                let action = args
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("get")
-                    .to_string();
-                let limit = args.get("limit").and_then(|v| v.as_i64());
-                tool_console(browser, &action, limit).await
+            let sel = args
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let ms = args.get("ms").and_then(|v| v.as_i64());
+            let net_idle = args
+                .get("networkIdle")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let idle_ms = args.get("idleMs").and_then(|v| v.as_i64());
+            let expr = args
+                .get("expression")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            tool_wait_for(
+                browser,
+                sel.as_deref(),
+                text.as_deref(),
+                ms,
+                net_idle,
+                idle_ms,
+                expr.as_deref(),
+            )
+            .await
+        }
+        "console" => {
+            if let Err(e) = check_unknown("console", args, &["action", "limit"]) {
+                return e.envelope();
             }
-            "upload" => {
-                if let Err(e) = check_unknown("upload", args, &["element", "paths", "frame"]) {
-                    return e.envelope();
-                }
-                let el = match args.get("element").and_then(|v| v.as_str()) {
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("get")
+                .to_string();
+            let limit = args.get("limit").and_then(|v| v.as_i64());
+            tool_console(browser, &action, limit).await
+        }
+        "upload" => {
+            if let Err(e) = check_unknown("upload", args, &["element", "paths", "frame"]) {
+                return e.envelope();
+            }
+            let el =
+                match args.get("element").and_then(|v| v.as_str()) {
                     Some(e) => e.to_string(),
                     None => return ToolErr::typed(
                         "upload: missing required arg 'element'".to_string(),
@@ -497,15 +632,16 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     )
                     .envelope(),
                 };
-                let paths: Option<Vec<String>> =
-                    args.get("paths").and_then(|v| v.as_array()).and_then(|a| {
-                        let mut out = Vec::with_capacity(a.len());
-                        for x in a {
-                            out.push(x.as_str()?.to_string());
-                        }
-                        Some(out)
-                    });
-                let paths = match paths {
+            let paths: Option<Vec<String>> =
+                args.get("paths").and_then(|v| v.as_array()).and_then(|a| {
+                    let mut out = Vec::with_capacity(a.len());
+                    for x in a {
+                        out.push(x.as_str()?.to_string());
+                    }
+                    Some(out)
+                });
+            let paths =
+                match paths {
                     Some(p) => p,
                     None => return ToolErr::typed(
                         "upload: missing required arg 'paths' (array of strings)".to_string(),
@@ -513,39 +649,41 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     )
                     .envelope(),
                 };
-                tool_upload(
-                    browser,
-                    &el,
-                    &paths,
-                    args.get("frame").and_then(|v| v.as_str()),
-                )
-                .await
+            tool_upload(
+                browser,
+                &el,
+                &paths,
+                args.get("frame").and_then(|v| v.as_str()),
+            )
+            .await
+        }
+        "fetch_text" => {
+            if let Err(e) = check_unknown("fetch_text", args, &["url"]) {
+                return e.envelope();
             }
-            "fetch_text" => {
-                if let Err(e) = check_unknown("fetch_text", args, &["url"]) {
-                    return e.envelope();
-                }
-                let url = match args.get("url").and_then(|v| v.as_str()) {
+            let url = match args.get("url").and_then(|v| v.as_str()) {
                 Some(u) => u.to_string(),
                 None => return ToolErr::typed(
                     "fetch_text: missing required arg 'url'".to_string(),
                     json!({"code": "invalid_args", "reason": "missing_arg", "tool": "fetch_text"}),
-                ).envelope(),
+                )
+                .envelope(),
             };
-                match fetch_text(&url).await {
-                    Ok(t) => {
-                        let chars = t.chars().count() as i64;
-                        Ok(json!({"content": [{"type": "text", "text": t.clone()}],
+            match fetch_text(&url).await {
+                Ok(t) => {
+                    let chars = t.chars().count() as i64;
+                    Ok(json!({"content": [{"type": "text", "text": t.clone()}],
                               "structuredContent": {"text": t, "url": url, "chars": chars}}))
-                    }
-                    Err(e) => Err(ToolErr::fallback(e)),
                 }
+                Err(e) => Err(ToolErr::fallback(e)),
             }
-            "hover" => {
-                if let Err(e) = check_unknown("hover", args, &["element", "frame"]) {
-                    return e.envelope();
-                }
-                let el = match args.get("element").and_then(|v| v.as_str()) {
+        }
+        "hover" => {
+            if let Err(e) = check_unknown("hover", args, &["element", "frame"]) {
+                return e.envelope();
+            }
+            let el =
+                match args.get("element").and_then(|v| v.as_str()) {
                     Some(e) => e.to_string(),
                     None => return ToolErr::typed(
                         "hover: missing required arg 'element'".to_string(),
@@ -553,15 +691,14 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     )
                     .envelope(),
                 };
-                tool_hover(browser, &el, args.get("frame").and_then(|v| v.as_str())).await
+            tool_hover(browser, &el, args.get("frame").and_then(|v| v.as_str())).await
+        }
+        "select" => {
+            if let Err(e) = check_unknown("select", args, &["element", "value", "text", "frame"]) {
+                return e.envelope();
             }
-            "select" => {
-                if let Err(e) =
-                    check_unknown("select", args, &["element", "value", "text", "frame"])
-                {
-                    return e.envelope();
-                }
-                let el = match args.get("element").and_then(|v| v.as_str()) {
+            let el =
+                match args.get("element").and_then(|v| v.as_str()) {
                     Some(e) => e.to_string(),
                     None => return ToolErr::typed(
                         "select: missing required arg 'element'".to_string(),
@@ -569,44 +706,46 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     )
                     .envelope(),
                 };
-                let value = args
-                    .get("value")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let text = args
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                tool_select(
-                    browser,
-                    &el,
-                    value.as_deref(),
-                    text.as_deref(),
-                    args.get("frame").and_then(|v| v.as_str()),
-                )
-                .await
+            let value = args
+                .get("value")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            tool_select(
+                browser,
+                &el,
+                value.as_deref(),
+                text.as_deref(),
+                args.get("frame").and_then(|v| v.as_str()),
+            )
+            .await
+        }
+        "key" => {
+            if let Err(e) = check_unknown("key", args, &["key"]) {
+                return e.envelope();
             }
-            "key" => {
-                if let Err(e) = check_unknown("key", args, &["key"]) {
-                    return e.envelope();
+            let key = match args.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k.to_string(),
+                None => {
+                    return ToolErr::typed(
+                        "key: missing required arg 'key'".to_string(),
+                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "key"}),
+                    )
+                    .envelope()
                 }
-                let key =
-                    match args.get("key").and_then(|v| v.as_str()) {
-                        Some(k) => k.to_string(),
-                        None => return ToolErr::typed(
-                            "key: missing required arg 'key'".to_string(),
-                            json!({"code": "invalid_args", "reason": "missing_arg", "tool": "key"}),
-                        )
-                        .envelope(),
-                    };
-                tool_key(browser, &key).await
+            };
+            tool_key(browser, &key).await
+        }
+        "viewport" => tool_viewport(browser, args).await,
+        "tabs" => {
+            if let Err(e) = check_unknown("tabs", args, &["action", "url", "index"]) {
+                return e.envelope();
             }
-            "viewport" => tool_viewport(browser, args).await,
-            "tabs" => {
-                if let Err(e) = check_unknown("tabs", args, &["action", "url", "index"]) {
-                    return e.envelope();
-                }
-                let action = match args.get("action").and_then(|v| v.as_str()) {
+            let action =
+                match args.get("action").and_then(|v| v.as_str()) {
                     Some(a) => a.to_string(),
                     None => return ToolErr::typed(
                         "tabs: missing required arg 'action'".to_string(),
@@ -614,80 +753,81 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     )
                     .envelope(),
                 };
-                let url = args
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let index = args.get("index").and_then(|v| v.as_i64());
-                tool_tabs(browser, &action, url.as_deref(), index).await
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let index = args.get("index").and_then(|v| v.as_i64());
+            tool_tabs(browser, &action, url.as_deref(), index).await
+        }
+        "storage" => {
+            if let Err(e) = check_unknown(
+                "storage",
+                args,
+                &[
+                    "action",
+                    "scope",
+                    "cookies",
+                    "items",
+                    "path",
+                    "allSites",
+                    "redact",
+                    "overwrite",
+                    "force",
+                    "confirm",
+                ],
+            ) {
+                return e.envelope();
             }
-            "storage" => {
-                if let Err(e) = check_unknown(
-                    "storage",
-                    args,
-                    &[
-                        "action",
-                        "scope",
-                        "cookies",
-                        "items",
-                        "path",
-                        "allSites",
-                        "redact",
-                        "overwrite",
-                        "force",
-                        "confirm",
-                    ],
-                ) {
-                    return e.envelope();
-                }
-                tool_storage(browser, args).await
+            tool_storage(browser, args).await
+        }
+        "close" => {
+            if let Err(e) = check_unknown("close", args, &[]) {
+                return e.envelope();
             }
-            "close" => {
-                if let Err(e) = check_unknown("close", args, &[]) {
-                    return e.envelope();
-                }
-                match browser.close().await {
-                    Ok(()) => Ok(ok_text(json!({"ok": true}).to_string())),
-                    Err(e) => Err(ToolErr::fallback(e)),
-                }
+            match browser.close().await {
+                Ok(()) => Ok(ok_text(json!({"ok": true}).to_string())),
+                Err(e) => Err(ToolErr::fallback(e)),
             }
-            "targets" => {
-                if let Err(e) = check_unknown("targets", args, &["action", "target"]) {
-                    return e.envelope();
-                }
-                let action = args
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("list")
-                    .to_string();
-                let target = args
-                    .get("target")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                tool_targets(browser, &action, target.as_deref()).await
+        }
+        "targets" => {
+            if let Err(e) = check_unknown("targets", args, &["action", "target"]) {
+                return e.envelope();
             }
-            "dialog" => {
-                if let Err(e) = check_unknown("dialog", args, &["action", "accept", "promptText"]) {
-                    return e.envelope();
-                }
-                let action = args
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("get")
-                    .to_string();
-                tool_dialog(
-                    browser,
-                    &action,
-                    args.get("accept").and_then(|v| v.as_bool()),
-                    args.get("promptText").and_then(|v| v.as_str()),
-                )
-                .await
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("list")
+                .to_string();
+            let target = args
+                .get("target")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            tool_targets(browser, &action, target.as_deref()).await
+        }
+        "dialog" => {
+            if let Err(e) = check_unknown("dialog", args, &["action", "accept", "promptText"]) {
+                return e.envelope();
             }
-            "history" => {
-                if let Err(e) = check_unknown("history", args, &["action"]) {
-                    return e.envelope();
-                }
-                let action = match args.get("action").and_then(|v| v.as_str()) {
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("get")
+                .to_string();
+            tool_dialog(
+                browser,
+                &action,
+                args.get("accept").and_then(|v| v.as_bool()),
+                args.get("promptText").and_then(|v| v.as_str()),
+            )
+            .await
+        }
+        "history" => {
+            if let Err(e) = check_unknown("history", args, &["action"]) {
+                return e.envelope();
+            }
+            let action =
+                match args.get("action").and_then(|v| v.as_str()) {
                     Some(a) => a.to_string(),
                     None => return ToolErr::typed(
                         "history: missing required arg 'action'".to_string(),
@@ -695,59 +835,60 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     )
                     .envelope(),
                 };
-                tool_history(browser, &action).await
+            tool_history(browser, &action).await
+        }
+        "network" => {
+            if let Err(e) = check_unknown("network", args, &["action", "filter", "limit"]) {
+                return e.envelope();
             }
-            "network" => {
-                if let Err(e) = check_unknown("network", args, &["action", "filter", "limit"]) {
-                    return e.envelope();
-                }
-                let action = args
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("get")
-                    .to_string();
-                let filter = args
-                    .get("filter")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let limit = args.get("limit").and_then(|v| v.as_i64());
-                tool_network(browser, &action, filter.as_deref(), limit).await
+            let action = args
+                .get("action")
+                .and_then(|v| v.as_str())
+                .unwrap_or("get")
+                .to_string();
+            let filter = args
+                .get("filter")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let limit = args.get("limit").and_then(|v| v.as_i64());
+            tool_network(browser, &action, filter.as_deref(), limit).await
+        }
+        "cdp" => {
+            if let Err(e) = check_unknown("cdp", args, &["method", "params", "session"]) {
+                return e.envelope();
             }
-            "cdp" => {
-                if let Err(e) = check_unknown("cdp", args, &["method", "params", "session"]) {
-                    return e.envelope();
-                }
-                let method =
-                    match args.get("method").and_then(|v| v.as_str()) {
-                        Some(m) => m.to_string(),
-                        None => return ToolErr::typed(
-                            "cdp: missing required arg 'method'".to_string(),
-                            json!({"code": "invalid_args", "reason": "missing_arg", "tool": "cdp"}),
-                        )
-                        .envelope(),
-                    };
-                let params = args.get("params").cloned().unwrap_or(json!({}));
-                if !params.is_object() {
+            let method = match args.get("method").and_then(|v| v.as_str()) {
+                Some(m) => m.to_string(),
+                None => {
                     return ToolErr::typed(
-                        "cdp: 'params' must be an object".to_string(),
-                        json!({"code": "invalid_args", "reason": "bad_value", "tool": "cdp"}),
+                        "cdp: missing required arg 'method'".to_string(),
+                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "cdp"}),
                     )
-                    .envelope();
+                    .envelope()
                 }
-                let session = args
-                    .get("session")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                tool_cdp(browser, &method, params, session).await
-            }
-            other => {
+            };
+            let params = args.get("params").cloned().unwrap_or(json!({}));
+            if !params.is_object() {
                 return ToolErr::typed(
-                    format!("unknown tool: {other}"),
-                    json!({"code": "invalid_args", "reason": "unknown_tool", "name": other}),
+                    "cdp: 'params' must be an object".to_string(),
+                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "cdp"}),
                 )
-                .envelope()
+                .envelope();
             }
-        };
+            let session = args
+                .get("session")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            tool_cdp(browser, &method, params, session).await
+        }
+        other => {
+            return ToolErr::typed(
+                format!("unknown tool: {other}"),
+                json!({"code": "invalid_args", "reason": "unknown_tool", "name": other}),
+            )
+            .envelope()
+        }
+    };
     match r {
         Ok(v) => v,
         Err(e) => e.envelope(),
@@ -1915,6 +2056,9 @@ async fn tool_screenshot(
     browser: &Browser,
     full_page: bool,
     path: Option<&str>,
+    deterministic: bool,
+    width: Option<i64>,
+    height: Option<i64>,
 ) -> Result<Value, ToolErr> {
     // Capability gate: a dom-only backend has no rendering pipeline, so
     // there are no pixels to capture. Refuse with the backend and the
@@ -1933,45 +2077,312 @@ async fn tool_screenshot(
         Ok(crate::browser::BackendCaps::Render) => {}
         Err(e) => return Err(ToolErr::fallback(format!("screenshot: {e}"))),
     }
-    let params = if full_page {
-        json!({"format": "png", "captureBeyondViewport": true, "fromSurface": true})
-    } else {
-        json!({"format": "png", "fromSurface": true})
-    };
-    let r = browser
-        .command("Page.captureScreenshot", params, true)
-        .await?;
-    let data = r
-        .get("data")
-        .and_then(|v| v.as_str())
-        .ok_or("screenshot: no data returned".to_string())?
-        .to_string();
-    // Decoded with the `base64` crate (never hand-rolled). The byte count
-    // is the decoded length; the text/structured blocks never carry pixels.
-    use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data.as_bytes())
-        .map_err(|e| {
-            ToolErr::fallback(format!(
-                "screenshot: capture payload is not valid base64: {e}"
-            ))
-        })?;
-    let len = bytes.len() as i64;
+    let cap = crate::capture::capture(
+        browser,
+        &crate::capture::Options {
+            full_page,
+            deterministic,
+            width,
+            height,
+        },
+    )
+    .await?;
     if let Some(p) = path {
-        write_screenshot_file(p, &bytes)?;
+        write_screenshot_file(p, &cap.bytes)?;
     }
-    let mut meta = serde_json::Map::new();
-    meta.insert("mimeType".to_string(), json!("image/png"));
-    meta.insert("bytes".to_string(), json!(len));
+    let mut meta = match cap.meta() {
+        Value::Object(m) => m,
+        _ => serde_json::Map::new(),
+    };
     if let Some(p) = path {
         meta.insert("path".to_string(), json!(p));
     }
     let meta = Value::Object(meta);
     Ok(
-        json!({"content": [{"type": "image", "data": data, "mimeType": "image/png"},
+        json!({"content": [{"type": "image", "data": cap.base64, "mimeType": "image/png"},
                           {"type": "text", "text": meta.to_string()}],
               "structuredContent": meta}),
     )
+}
+
+/// Parse the `ref` / `selector` targeting of the geometry tools (string or
+/// array of strings; refs must be `@eN` and known to the last snapshot; an
+/// empty target set is refused rather than silently measuring nothing).
+async fn layout_specs(
+    browser: &Browser,
+    tool: &str,
+    args: &Value,
+) -> Result<Vec<crate::layout::Spec>, ToolErr> {
+    let mut out: Vec<crate::layout::Spec> = Vec::new();
+    for key in ["ref", "selector"] {
+        let Some(v) = args.get(key) else { continue };
+        if v.is_null() {
+            continue;
+        }
+        let items: Vec<String> = match v {
+            Value::String(s) => vec![s.clone()],
+            Value::Array(a) => {
+                let mut acc = Vec::with_capacity(a.len());
+                for x in a {
+                    match x.as_str() {
+                        Some(s) => acc.push(s.to_string()),
+                        None => {
+                            return Err(ToolErr::typed(
+                                format!("{tool}: '{key}' array must contain strings"),
+                                json!({"code": "invalid_args", "reason": "bad_value", "tool": tool, "arg": key}),
+                            ))
+                        }
+                    }
+                }
+                acc
+            }
+            _ => {
+                return Err(ToolErr::typed(
+                    format!("{tool}: '{key}' must be a string or an array of strings"),
+                    json!({"code": "invalid_args", "reason": "bad_value", "tool": tool, "arg": key}),
+                ))
+            }
+        };
+        for s in items {
+            if key == "ref" {
+                let Some(id) = parse_ref(&s) else {
+                    return Err(ToolErr::typed(
+                        format!("{tool}: ref '{s}' must look like @eN (from snapshot)"),
+                        json!({"code": "invalid_args", "reason": "bad_value", "tool": tool, "arg": "ref"}),
+                    ));
+                };
+                guard_ref(browser, tool, &s, &id).await?;
+                out.push(crate::layout::Spec::Ref(id));
+            } else {
+                out.push(crate::layout::Spec::Selector(s));
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(ToolErr::typed(
+            format!("{tool}: need 'ref' (@eN) or 'selector'"),
+            json!({"code": "invalid_args", "reason": "missing_arg", "tool": tool}),
+        ));
+    }
+    Ok(out)
+}
+
+fn not_found_baseline(name: &str) -> ToolErr {
+    ToolErr::typed(
+        format!(
+            "visual: no baseline named '{name}' in {} (save it first)",
+            crate::visual::visual_dir().display()
+        ),
+        json!({"code": "invalid_target", "reason": "not_found", "tool": "visual", "name": name}),
+    )
+}
+
+/// `assert_layout` body (kept out of the dispatch match: see the boxed arms).
+async fn tool_assert_layout(browser: &Browser, args: &Value) -> Result<Value, ToolErr> {
+    check_unknown(
+        "assert_layout",
+        args,
+        &[
+            "ref",
+            "selector",
+            "checks",
+            "screenshotOnFail",
+            "screenshotPath",
+        ],
+    )?;
+    let specs = layout_specs(browser, "assert_layout", args).await?;
+    let on_fail = args
+        .get("screenshotOnFail")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let shot_path = args.get("screenshotPath").and_then(|v| v.as_str());
+    if shot_path.is_some() && !on_fail {
+        return Err(ToolErr::typed(
+            "assert_layout: 'screenshotPath' requires screenshotOnFail:true".to_string(),
+            json!({"code": "invalid_args", "reason": "need_option", "tool": "assert_layout", "arg": "screenshotPath"}),
+        ));
+    }
+    crate::layout::assert_layout(browser, &specs, args.get("checks"), on_fail, shot_path)
+        .await
+        .map(|v| ok_text(v.to_string()))
+}
+
+/// `layout` body.
+async fn tool_layout(browser: &Browser, args: &Value) -> Result<Value, ToolErr> {
+    check_unknown("layout", args, &["ref", "selector", "includeOverlaps"])?;
+    let specs = layout_specs(browser, "layout", args).await?;
+    let overlaps = args
+        .get("includeOverlaps")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    crate::layout::layout(browser, &specs, overlaps)
+        .await
+        .map(|v| ok_text(v.to_string()))
+}
+
+/// `visual` body: save / compare / list / delete.
+async fn tool_visual(browser: &Browser, args: &Value) -> Result<Value, ToolErr> {
+    check_unknown(
+        "visual",
+        args,
+        &[
+            "action",
+            "name",
+            "fullPage",
+            "threshold",
+            "maxDiffPixels",
+            "maxDiffRatio",
+            "maskRects",
+            "update",
+            "antialias",
+            "includeAA",
+            "minDiffCluster",
+            "requireEnvironmentMatch",
+        ],
+    )?;
+    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    // save/compare need a rendering pipeline; list/delete touch files only.
+    if matches!(action, "save" | "compare") {
+        match crate::browser::backend_caps() {
+            Ok(crate::browser::BackendCaps::DomOnly) => {
+                return Err(ToolErr::typed(
+                    format!("visual: action '{action}' is unavailable with GLADIUS_BACKEND_CAPS=dom-only (no rendering pipeline; refusing instead of comparing nothing)"),
+                    json!({"code": "capability_gated", "reason": "dom_only", "tool": "visual"}),
+                ));
+            }
+            Ok(crate::browser::BackendCaps::Render) => {}
+            Err(e) => return Err(ToolErr::fallback(format!("visual: {e}"))),
+        }
+    }
+    let name = match action {
+        "list" => None,
+        _ => match args.get("name").and_then(|v| v.as_str()) {
+            Some(n) => Some(n.to_string()),
+            None => {
+                return Err(ToolErr::typed(
+                    format!("visual: action '{action}' needs 'name'"),
+                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "visual", "arg": "name"}),
+                ))
+            }
+        },
+    };
+    let safe = match &name {
+        Some(n) => Some(crate::visual::sanitise_name(n).map_err(|e| {
+            ToolErr::typed(
+                e,
+                json!({"code": "invalid_args", "reason": "bad_value", "tool": "visual", "arg": "name"}),
+            )
+        })?),
+        None => None,
+    };
+    let safe = safe.as_deref().unwrap_or_default();
+    match action {
+        "save" => {
+            let full = args
+                .get("fullPage")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            crate::visual::save(browser, safe, full)
+                .await
+                .map(|v| ok_text(v.to_string()))
+                .map_err(ToolErr::from)
+        }
+        "list" => crate::visual::list()
+            .map(|v| ok_text(v.to_string()))
+            .map_err(ToolErr::from),
+        "delete" => {
+            if !crate::visual::exists(safe) {
+                return Err(not_found_baseline(safe));
+            }
+            crate::visual::delete(safe)
+                .map(|v| ok_text(v.to_string()))
+                .map_err(ToolErr::from)
+        }
+        "compare" => {
+            if !crate::visual::exists(safe) {
+                return Err(not_found_baseline(safe));
+            }
+            // `antialias` (default true) and `includeAA` (default false) are
+            // inverses. Both may be sent only when they agree; a contradiction
+            // is refused rather than silently resolved.
+            let antialias_arg = args.get("antialias").and_then(|v| v.as_bool());
+            let include_aa = args.get("includeAA").and_then(|v| v.as_bool());
+            if let (Some(a), Some(i)) = (antialias_arg, include_aa) {
+                if a == i {
+                    return Err(ToolErr::typed(
+                        "visual: 'antialias' and 'includeAA' are inverses; send one, or send both with opposite values (antialias = !includeAA)".to_string(),
+                        json!({"code": "invalid_args", "reason": "bad_value", "tool": "visual", "arg": "antialias"}),
+                    ));
+                }
+            }
+            let antialias = match (antialias_arg, include_aa) {
+                (Some(a), _) => a,
+                (None, Some(i)) => !i,
+                (None, None) => true,
+            };
+            let min_cluster = args
+                .get("minDiffCluster")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(2);
+            if !(0..=1000).contains(&min_cluster) {
+                return Err(ToolErr::typed(
+                    "visual: 'minDiffCluster' must be an integer in 0..=1000 (0 counts every pixel)".to_string(),
+                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "visual", "arg": "minDiffCluster"}),
+                ));
+            }
+            let opt = crate::visual::DiffOpts {
+                threshold: args
+                    .get("threshold")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.1),
+                max_diff_pixels: args
+                    .get("maxDiffPixels")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
+                max_diff_ratio: args
+                    .get("maxDiffRatio")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                mask_rects: args
+                    .get("maskRects")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+                full_page: args
+                    .get("fullPage")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                update: args
+                    .get("update")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                antialias,
+                min_diff_cluster: min_cluster,
+                require_environment_match: args
+                    .get("requireEnvironmentMatch")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            };
+            // A per-channel threshold is a 0..1 fraction; a value outside
+            // that range would silently compare nothing (or everything), so
+            // refuse it instead.
+            if !(0.0..=1.0).contains(&opt.threshold) {
+                return Err(ToolErr::typed(
+                    "visual: 'threshold' must be a fraction in 0..=1 (per-channel share of the 0-255 range)".to_string(),
+                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "visual", "arg": "threshold"}),
+                ));
+            }
+            // `compare` carries its own typed errors (scratch refusal, unknown
+            // baseline environment), so they pass through unchanged.
+            crate::visual::compare(browser, safe, &opt)
+                .await
+                .map(|v| ok_text(v.to_string()))
+        }
+        other => Err(ToolErr::typed(
+            format!("visual: unknown action '{other}' (want save|compare|list|delete)"),
+            json!({"code": "invalid_args", "reason": "unknown_action", "tool": "visual", "arg": "action"}),
+        )),
+    }
 }
 
 /// Main-frame click preflight (shared by the ref and selector paths): resolve,
@@ -2004,8 +2415,17 @@ fn click_preflight_sel(sel: &str) -> String {
 /// same shape the old in-page click reported (h0 from preflight, h1/rs read
 /// live after dispatch). A CDP dispatch failure is a typed error at the call
 /// site (never a silent no-op); the settle/dialog/`click_ok` path is unchanged.
-async fn click_dispatch(browser: &Browser, x: f64, y: f64, h0: &str) -> Result<String, ToolErr> {
-    browser.mouse_click(x, y).await.map_err(ToolErr::from)?;
+async fn click_dispatch(
+    browser: &Browser,
+    x: f64,
+    y: f64,
+    h0: &str,
+    hover_first: bool,
+) -> Result<String, ToolErr> {
+    browser
+        .mouse_click(x, y, hover_first)
+        .await
+        .map_err(ToolErr::from)?;
     let live = browser.eval("[location.href, document.readyState]").await?;
     let h1 = live.get(0).and_then(|v| v.as_str()).unwrap_or(h0);
     let rs = live.get(1).and_then(|v| v.as_str()).unwrap_or("complete");
@@ -2017,6 +2437,7 @@ async fn tool_click(
     browser: &Browser,
     element: &str,
     frame: Option<&str>,
+    hover_first: bool,
 ) -> Result<Value, ToolErr> {
     // Drain any earlier dialog record so one found below belongs to THIS click.
     browser.take_dialog().await;
@@ -2026,7 +2447,7 @@ async fn tool_click(
         if parse_ref(element).is_some() {
             return Err(ref_in_frame("click", element, f));
         }
-        return tool_click_frame(browser, element, f).await;
+        return tool_click_frame(browser, element, f, hover_first).await;
     }
     if let Some(id) = parse_ref(element) {
         let at_id = guard_ref(browser, "click", element, &id).await?;
@@ -2053,7 +2474,7 @@ async fn tool_click(
                     .and_then(|n| n.as_str())
                     .unwrap_or("")
                     .to_string();
-                let st = click_dispatch(browser, x, y, &h0).await?;
+                let st = click_dispatch(browser, x, y, &h0, hover_first).await?;
                 click_settle(browser, &st).await;
                 Ok(click_ok(browser).await)
             }
@@ -2119,7 +2540,7 @@ async fn tool_click(
                 .and_then(|n| n.as_str())
                 .unwrap_or("")
                 .to_string();
-            let st = click_dispatch(browser, x, y, &h0).await?;
+            let st = click_dispatch(browser, x, y, &h0, hover_first).await?;
             click_settle(browser, &st).await;
             Ok(click_ok(browser).await)
         }
@@ -2153,7 +2574,12 @@ async fn tool_click(
 /// chain, never getContentQuads), a parent-side overlay guard hit-tests the
 /// final point, and the trusted CDP pointer sequence dispatches on the page
 /// session at main-frame viewport px. OOPIF/unmapped frames are typed errors.
-async fn tool_click_frame(browser: &Browser, element: &str, fid: &str) -> Result<Value, ToolErr> {
+async fn tool_click_frame(
+    browser: &Browser,
+    element: &str,
+    fid: &str,
+    hover_first: bool,
+) -> Result<Value, ToolErr> {
     let sel = serde_json::to_string(element).map_err(|e| e.to_string())?;
     // Bounded presence wait inside the frame realm (same 3s cap shape as main).
     {
@@ -2206,7 +2632,7 @@ async fn tool_click_frame(browser: &Browser, element: &str, fid: &str) -> Result
             // at ANY level is typed occluded, never a click into the wrong
             // surface.
             let (mx, my) = frame_owner_hit_ok(browser, "click", element, fid, lx, ly).await?;
-            let st = click_dispatch(browser, mx, my, &h0).await?;
+            let st = click_dispatch(browser, mx, my, &h0, hover_first).await?;
             click_settle(browser, &st).await;
             Ok(click_ok(browser).await)
         }

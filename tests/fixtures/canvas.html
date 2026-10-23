@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Gladius Canvas Fixture</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #ffffff; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c" width="200" height="100"></canvas>
+<script>
+  // Flat black left half, flat white right half (a hard edge at x = 100) and
+  // a flat grey band across the bottom. The visual-regression tests paint
+  // single pixels into these regions: on the edge (AA-eligible) or inside a
+  // flat fill (a real change).
+  const c = document.getElementById('c');
+  const g = c.getContext('2d');
+  g.fillStyle = '#000000';
+  g.fillRect(0, 0, 200, 100);
+  g.fillStyle = '#ffffff';
+  g.fillRect(100, 0, 100, 100);
+  g.fillStyle = '#808080';
+  g.fillRect(0, 80, 200, 20);
+  window.__gladiusCanvas = function () { return c; };
+</script>
+</body>
+</html>

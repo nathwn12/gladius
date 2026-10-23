@@ -824,7 +824,13 @@ fn storage_schema_keys_and_order() {
         .position(|n| *n == "storage")
         .expect("storage listed");
     assert_eq!(names[pos - 1], "tabs", "storage follows tabs: {names:?}");
-    assert_eq!(names[pos + 1], "close", "close follows storage: {names:?}");
+    // The geometry/visual primitives ride between storage and close; close
+    // stays last so the shutdown tool is always the final entry.
+    assert_eq!(
+        &names[pos + 1..],
+        &["assert_layout", "layout", "visual", "close"][..],
+        "storage leads the geometry/visual primitives, close last: {names:?}"
+    );
     let schema = tools[pos]
         .get("outputSchema")
         .expect("storage outputSchema");

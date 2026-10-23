@@ -195,7 +195,7 @@ fn discover_contract() {
 #[test]
 fn tools_list_versioning() {
     let mut c = Client::spawn();
-    // modern -> resultType complete + 22 tools
+    // modern -> resultType complete + 25 tools
     let modern = c.result(
         "tools/list",
         json!({"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}),
@@ -209,7 +209,7 @@ fn tools_list_versioning() {
         .get("tools")
         .and_then(|t| t.as_array())
         .expect("tools array");
-    assert_eq!(tools.len(), 22, "22 tools, got {}", tools.len());
+    assert_eq!(tools.len(), 25, "25 tools, got {}", tools.len());
 
     // legacy -> no resultType
     let legacy = c.result("tools/list", json!({}));
@@ -221,7 +221,7 @@ fn tools_list_versioning() {
         .get("tools")
         .and_then(|t| t.as_array())
         .expect("tools array");
-    assert_eq!(tools.len(), 22, "22 tools legacy");
+    assert_eq!(tools.len(), 25, "25 tools legacy");
 }
 
 #[test]
@@ -434,6 +434,12 @@ fn expected_hints(name: &str) -> (bool, bool, bool, bool) {
         "tabs" => (false, true, false, true),
         "close" => (false, true, true, false),
         "storage" => (false, true, false, false),
+        // Geometry without pixels: read-only. `assert_layout` may write
+        // one screenshot on failure, which is still a read of the page.
+        "assert_layout" => (true, false, true, false),
+        "layout" => (true, false, true, false),
+        // Writes baseline files (and can delete them): not read-only.
+        "visual" => (false, true, false, false),
         other => panic!("unexpected tool {other}"),
     }
 }
@@ -443,7 +449,7 @@ fn assert_tool_schemas(listed: &Value, label: &str) {
         .get("tools")
         .and_then(|t| t.as_array())
         .expect("tools array");
-    assert_eq!(tools.len(), 22, "22 tools ({label})");
+    assert_eq!(tools.len(), 25, "25 tools ({label})");
     for t in tools {
         let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("?");
         let out = t

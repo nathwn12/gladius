@@ -22,12 +22,19 @@ struct Client {
 
 impl Client {
     fn spawn() -> Self {
+        Self::spawn_extra(&[])
+    }
+
+    fn spawn_extra(env_extra: &[(&str, &str)]) -> Self {
         let bin = env!("CARGO_BIN_EXE_gladius");
         let mut cmd = Command::new(bin);
         cmd.arg("mcp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        for (k, v) in env_extra {
+            cmd.env(k, v);
+        }
         #[cfg(windows)]
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         let mut child = cmd.spawn().expect("spawn gladius mcp");
@@ -723,7 +730,7 @@ fn eof_with_call_in_flight_exits_clean() {
 #[test]
 fn result_type_preserved_after_dispatch_rewrite() {
     let mut c = Client::spawn();
-    // Modern tools/list carries resultType complete + 22 tools.
+    // Modern tools/list carries resultType complete + 25 tools.
     c.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
         "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}}));
     let modern = c.wait_id(&json!(1), Duration::from_secs(10), "modern tools/list");
@@ -738,8 +745,8 @@ fn result_type_preserved_after_dispatch_rewrite() {
             .get("tools")
             .and_then(|t| t.as_array())
             .map(|a| a.len()),
-        Some(22),
-        "22 tools: {modern}"
+        Some(25),
+        "25 tools: {modern}"
     );
     // Legacy tools/list carries no resultType.
     c.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}));
@@ -753,4 +760,682 @@ fn result_type_preserved_after_dispatch_rewrite() {
     c.send(&json!({"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}}));
     let pong = c.wait_id(&json!(3), Duration::from_secs(10), "ping");
     assert_eq!(pong.get("result"), Some(&json!({})), "ping: {pong}");
+}
+
+/// Capture serialization (blocking fix 2): a deterministic capture mutates
+/// page-visible state for its duration - device metrics override, emulated
+/// media, an injected freeze stylesheet - and restores it. `screenshot` and
+/// `assert_layout` therefore hold the same execution lock as `visual` and the
+/// mutating tools. This test fires concurrent deterministic captures AND a
+/// navigation at one server and asserts the invariants that only hold when
+/// nothing interleaves:
+///
+/// - every capture reports the PRE-EXISTING viewport override (900x700), never
+///   the engine default or another capture's temporary geometry;
+/// - the two captures are byte-identical (same pixels, so no torn state);
+/// - after everything settles the page still carries the caller's override,
+///   the freeze stylesheet is gone and emulated reduced-motion is cleared.
+#[test]
+fn deterministic_capture_serializes_with_navigation() {
+    let mut c = Client::spawn();
+    c.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18"}}));
+    let init = c.wait_id(&json!(1), Duration::from_secs(30), "initialize");
+    assert!(init.get("error").is_none(), "initialize: {init}");
+
+    let fixture = format!(
+        "file:///{}",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/layout.html")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    c.call(json!(2), "navigate", json!({"url": fixture}));
+    let nav = c.wait_id(&json!(2), Duration::from_secs(60), "navigate");
+    assert!(nav.get("error").is_none(), "navigate: {nav}");
+
+    // A caller-owned override the captures must read and put back.
+    c.call(
+        json!(3),
+        "viewport",
+        json!({"width": 900, "height": 700, "deviceScaleFactor": 1}),
+    );
+    let vp = c.wait_id(&json!(3), Duration::from_secs(30), "viewport");
+    assert!(vp.get("error").is_none(), "viewport: {vp}");
+
+    // Four calls in flight at once: three deterministic captures with
+    // DIFFERENT forced geometry plus a navigation. The in-flight cap is 4, so
+    // they really overlap. If the overrides interleaved, a capture would
+    // report a viewport it never asked for (or restore the wrong one).
+    c.call(
+        json!(10),
+        "screenshot",
+        json!({"deterministic": true, "width": 640, "height": 480}),
+    );
+    c.call(
+        json!(11),
+        "screenshot",
+        json!({"deterministic": true, "width": 720, "height": 540}),
+    );
+    c.call(
+        json!(12),
+        "screenshot",
+        json!({"deterministic": true, "width": 900, "height": 700}),
+    );
+    c.call(json!(13), "navigate", json!({"url": fixture}));
+    let got = c.wait_ids(
+        &[json!(10), json!(11), json!(12), json!(13)],
+        Duration::from_secs(120),
+        "concurrent captures + navigate",
+    );
+
+    for (i, r) in got.iter().enumerate() {
+        assert!(
+            r.get("error").is_none(),
+            "call {} answered without a protocol error: {r}",
+            i + 10
+        );
+        assert!(
+            r.pointer("/result/isError").is_none(),
+            "call {} succeeded: {r}",
+            i + 10
+        );
+    }
+    let shots: Vec<Value> = [&got[0], &got[1], &got[2]]
+        .iter()
+        .map(|r| {
+            r.pointer("/result/structuredContent")
+                .cloned()
+                .unwrap_or(Value::Null)
+        })
+        .collect();
+    for (i, (sc, want)) in shots
+        .iter()
+        .zip([(640_i64, 480_i64), (720, 540), (900, 700)])
+        .enumerate()
+    {
+        assert_eq!(
+            sc.get("deterministic").and_then(|d| d.as_bool()),
+            Some(true),
+            "capture {i} is deterministic: {sc}"
+        );
+        assert_eq!(
+            sc.pointer("/viewport/width").and_then(|w| w.as_i64()),
+            Some(want.0),
+            "capture {i} reported ITS OWN forced width, never another capture's \
+             override or the engine default: {sc}"
+        );
+        assert_eq!(
+            sc.pointer("/viewport/height").and_then(|h| h.as_i64()),
+            Some(want.1),
+            "capture {i} reported ITS OWN forced height: {sc}"
+        );
+        assert_eq!(
+            sc.get("deviceScaleFactor").and_then(|d| d.as_f64()),
+            Some(1.0),
+            "capture {i} pinned dsf 1: {sc}"
+        );
+    }
+
+    // Final state: the override is intact, the freeze style is gone, the
+    // emulated media is cleared. Any interleaved restoration breaks one.
+    c.call(
+        json!(20),
+        "evaluate",
+        json!({"expression": "[window.innerWidth, window.innerHeight, document.getElementById('__gladius_deterministic') === null, matchMedia('(prefers-reduced-motion: reduce)').matches]"}),
+    );
+    let ev = c.wait_id(&json!(20), Duration::from_secs(30), "evaluate");
+    let arr = ev
+        .pointer("/result/structuredContent/value")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        arr.first().and_then(|v| v.as_i64()),
+        Some(900),
+        "override restored after concurrent captures: {ev}"
+    );
+    assert_eq!(
+        arr.get(1).and_then(|v| v.as_i64()),
+        Some(700),
+        "override height restored: {ev}"
+    );
+    assert_eq!(
+        arr.get(2).and_then(|v| v.as_bool()),
+        Some(true),
+        "no freeze stylesheet left behind: {ev}"
+    );
+    assert_eq!(
+        arr.get(3).and_then(|v| v.as_bool()),
+        Some(false),
+        "emulated reduced-motion cleared: {ev}"
+    );
+
+    c.call(json!(21), "close", json!({}));
+    let closed = c.wait_id(&json!(21), Duration::from_secs(30), "close");
+    assert!(closed.get("error").is_none(), "close: {closed}");
+}
+
+/// A deterministic capture must WAIT for an in-flight navigation (blocking fix
+/// 2, discriminating direction). The exec lock is what serializes them: the
+/// navigate holds it for its whole load wait, so a capture sent while the
+/// navigation is still loading cannot start until the navigation returns.
+///
+/// The page is served by a loopback server that signals the test when it has
+/// received the request (so the navigation is provably in flight) and then
+/// holds its response for 800 ms. With the lock the capture answers only after
+/// the navigation completes; without it the capture answers in ~150 ms, before
+/// the navigation it should have waited for.
+#[test]
+fn capture_waits_for_an_in_flight_navigation() {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
+    let ln = TcpListener::bind("127.0.0.1:0").expect("loopback bind");
+    let port = ln.local_addr().expect("addr").port();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let srv = std::thread::spawn(move || {
+        for _ in 0..1 {
+            let Ok((mut s, _)) = ln.accept() else { return };
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let _ = ready_tx.send(());
+            std::thread::sleep(Duration::from_millis(800));
+            let body = "<!doctype html><html><head><title>slow</title></head><body><h1>SLOW_MARKER</h1></body></html>";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(resp.as_bytes());
+        }
+    });
+
+    let mut c = Client::spawn();
+    c.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18"}}));
+    let init = c.wait_id(&json!(1), Duration::from_secs(30), "initialize");
+    assert!(init.get("error").is_none(), "initialize: {init}");
+
+    // Baseline: a deterministic capture of a settled page is fast.
+    c.call(json!(2), "navigate", json!({"url": "about:blank"}));
+    let nav0 = c.wait_id(&json!(2), Duration::from_secs(60), "about:blank");
+    assert!(nav0.get("error").is_none(), "about:blank: {nav0}");
+    let t0 = Instant::now();
+    c.call(json!(3), "screenshot", json!({"deterministic": true}));
+    let _ = c.wait_id(&json!(3), Duration::from_secs(60), "baseline capture");
+    let baseline = t0.elapsed();
+
+    // The real thing: start a slow navigation, wait until the server has the
+    // request (so the navigation is in flight and holds the exec lock), then
+    // send the capture.
+    let url = format!("http://127.0.0.1:{port}/slow");
+    c.call(json!(10), "navigate", json!({"url": url}));
+    ready_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the navigation reached the server");
+    let shot_sent = Instant::now();
+    c.call(json!(11), "screenshot", json!({"deterministic": true}));
+
+    // Collect both frames with arrival stamps (order asserted, not assumed).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut nav: Option<(Instant, Value)> = None;
+    let mut shot: Option<(Instant, Value)> = None;
+    while nav.is_none() || shot.is_none() {
+        let now = Instant::now();
+        assert!(now < deadline, "timeout waiting for both answers");
+        let v = c.next(deadline - now).expect("stdout frame");
+        let at = Instant::now();
+        match v.get("id") {
+            Some(id) if id == &json!(10) => nav = Some((at, v)),
+            Some(id) if id == &json!(11) => shot = Some((at, v)),
+            other => panic!("unexpected frame while waiting: {other:?} {v}"),
+        }
+    }
+    let (nav_at, nav_v) = nav.expect("navigate answered");
+    let (shot_at, shot_v) = shot.expect("screenshot answered");
+    assert!(nav_v.get("error").is_none(), "navigate ok: {nav_v}");
+    assert!(shot_v.get("error").is_none(), "screenshot ok: {shot_v}");
+    assert!(
+        shot_at > nav_at,
+        "the capture must be answered AFTER the navigation it waited for \
+         (navigate {:?}, capture {:?})",
+        nav_at.duration_since(shot_sent),
+        shot_at.duration_since(shot_sent)
+    );
+    let shot_wait = shot_at.duration_since(shot_sent);
+    assert!(
+        shot_wait >= baseline + Duration::from_millis(300),
+        "the capture waited for the in-flight navigation: baseline {baseline:?}, \
+         with-navigation {shot_wait:?}"
+    );
+
+    // And it still restored everything it touched.
+    c.call(
+        json!(20),
+        "evaluate",
+        json!({"expression": "[document.getElementById('__gladius_deterministic') === null, matchMedia('(prefers-reduced-motion: reduce)').matches, document.querySelector('h1') ? document.querySelector('h1').textContent : '']"}),
+    );
+    let ev = c.wait_id(&json!(20), Duration::from_secs(30), "evaluate");
+    let arr = ev
+        .pointer("/result/structuredContent/value")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        arr.first().and_then(|v| v.as_bool()),
+        Some(true),
+        "no freeze stylesheet left behind: {ev}"
+    );
+    assert_eq!(
+        arr.get(1).and_then(|v| v.as_bool()),
+        Some(false),
+        "emulated reduced-motion cleared: {ev}"
+    );
+    assert_eq!(
+        arr.get(2).and_then(|v| v.as_str()),
+        Some("SLOW_MARKER"),
+        "the capture ran on the navigated page: {ev}"
+    );
+
+    c.call(json!(21), "close", json!({}));
+    let closed = c.wait_id(&json!(21), Duration::from_secs(30), "close");
+    assert!(closed.get("error").is_none(), "close: {closed}");
+    // The loopback thread is detached: it served its one request and the
+    // listener is already dropped, so nothing is left waiting on it.
+    drop(srv);
+}
+
+/// Cancellation must not drop a capture mid-override (blocking defect). The
+/// cancel path waits for the call's critical section to finish before it
+/// aborts, so on cancel the device metrics, emulated media and freeze
+/// stylesheet are STILL restored, and the execution lock is released only
+/// after that cleanup.
+///
+/// The page starts under a caller-owned override with a distinct dsf (2), so
+/// only a real restore brings `innerWidth/innerHeight/devicePixelRatio` back -
+/// the capture itself pins them to its own geometry and dsf 1.
+#[test]
+fn cancel_during_capture_restores_everything() {
+    const STATE: &str = "[window.innerWidth, window.innerHeight, window.devicePixelRatio, \
+        document.getElementById('__gladius_deterministic') === null, \
+        matchMedia('(prefers-reduced-motion: reduce)').matches]";
+    let mut c = Client::spawn_extra(&[("GLADIUS_TEST_CRITICAL_DELAY_MS", "1200")]);
+    c.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18"}}));
+    let init = c.wait_id(&json!(1), Duration::from_secs(30), "initialize");
+    assert!(init.get("error").is_none(), "initialize: {init}");
+
+    let fixture = format!(
+        "file:///{}",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/layout.html")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    c.call(json!(2), "navigate", json!({"url": fixture}));
+    let nav = c.wait_id(&json!(2), Duration::from_secs(60), "navigate");
+    assert!(nav.get("error").is_none(), "navigate: {nav}");
+
+    c.call(
+        json!(3),
+        "viewport",
+        json!({"width": 900, "height": 700, "deviceScaleFactor": 2}),
+    );
+    let vp = c.wait_id(&json!(3), Duration::from_secs(30), "viewport");
+    assert!(vp.get("error").is_none(), "viewport: {vp}");
+
+    let state = |c: &mut Client, id: i64, what: &str| -> Vec<Value> {
+        c.call(json!(id), "evaluate", json!({"expression": STATE}));
+        let r = c.wait_id(&json!(id), Duration::from_secs(60), what);
+        r.pointer("/result/structuredContent/value")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let pre = state(&mut c, 4, "pre-capture state");
+    assert_eq!(
+        pre.first().and_then(|v| v.as_f64()),
+        Some(900.0),
+        "pre width: {pre:?}"
+    );
+    assert_eq!(
+        pre.get(1).and_then(|v| v.as_f64()),
+        Some(700.0),
+        "pre height: {pre:?}"
+    );
+    assert_eq!(
+        pre.get(2).and_then(|v| v.as_f64()),
+        Some(2.0),
+        "the caller's dsf is in effect before the capture: {pre:?}"
+    );
+
+    // Fire the capture, then cancel INSIDE its 1200 ms mutation window.
+    c.call(json!(10), "screenshot", json!({"deterministic": true}));
+    std::thread::sleep(Duration::from_millis(350));
+    c.send(
+        &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": {"requestId": 10}}),
+    );
+    let cancelled_at = Instant::now();
+
+    // This needs the execution lock, so it cannot answer until the cancelled
+    // capture has finished cleaning up: "lock released only after cleanup".
+    let post = state(&mut c, 20, "post-cancel state");
+    let waited = cancelled_at.elapsed();
+
+    assert_eq!(
+        post.first().and_then(|v| v.as_f64()),
+        Some(900.0),
+        "innerWidth restored after cancel: {post:?}"
+    );
+    assert_eq!(
+        post.get(1).and_then(|v| v.as_f64()),
+        Some(700.0),
+        "innerHeight restored after cancel: {post:?}"
+    );
+    assert_eq!(
+        post.get(2).and_then(|v| v.as_f64()),
+        Some(2.0),
+        "deviceScaleFactor restored after cancel: {post:?}"
+    );
+    assert_eq!(
+        post.get(3).and_then(|v| v.as_bool()),
+        Some(true),
+        "freeze stylesheet removed after cancel: {post:?}"
+    );
+    assert_eq!(
+        post.get(4).and_then(|v| v.as_bool()),
+        Some(false),
+        "emulated reduced-motion cleared after cancel: {post:?}"
+    );
+    assert!(
+        waited >= Duration::from_millis(400),
+        "the state read had to wait for the rest of the capture ({waited:?}), \
+         which proves the lock was held until cleanup"
+    );
+    // `wait_id` fails on any unexpected frame, so it also proves the
+    // cancelled call emitted no response.
+
+    c.call(json!(30), "viewport", json!({"reset": true}));
+    let _ = c.wait_id(&json!(30), Duration::from_secs(30), "viewport reset");
+    c.call(json!(31), "close", json!({}));
+    let _ = c.wait_id(&json!(31), Duration::from_secs(30), "close");
+}
+
+/// Cancelling `visual compare` while its scratch target is open must still
+/// close that target: the cancel waits for the critical section, and the
+/// section includes the `Target.closeTarget`.
+#[test]
+fn cancel_during_compare_closes_the_scratch_target() {
+    fn page_count(c: &mut Client, id: i64) -> usize {
+        c.call(json!(id), "targets", json!({"action": "list"}));
+        let t = c.wait_id(&json!(id), Duration::from_secs(30), "targets list");
+        t.pointer("/result/structuredContent/targets")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter(|x| x.get("type").and_then(|t| t.as_str()) == Some("page"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    // Longer hook: the compare runs capture (hook) then diff (hook), so the
+    // scratch target is open for a full 2 s window. The visual dir is a temp
+    // dir so a test run never leaves a baseline in the repo.
+    let vdir = tempfile::tempdir().expect("tempdir");
+    let vdir_s = vdir.path().to_string_lossy().to_string();
+    let mut c = Client::spawn_extra(&[
+        ("GLADIUS_TEST_CRITICAL_DELAY_MS", "2000"),
+        ("GLADIUS_VISUAL_DIR", vdir_s.as_str()),
+    ]);
+    c.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18"}}));
+    let init = c.wait_id(&json!(1), Duration::from_secs(30), "initialize");
+    assert!(init.get("error").is_none(), "initialize: {init}");
+
+    let fixture = format!(
+        "file:///{}",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/layout.html")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    c.call(json!(2), "navigate", json!({"url": fixture}));
+    let nav = c.wait_id(&json!(2), Duration::from_secs(60), "navigate");
+    assert!(nav.get("error").is_none(), "navigate: {nav}");
+
+    c.call(
+        json!(3),
+        "visual",
+        json!({"action": "save", "name": "cancel-probe"}),
+    );
+    let saved = c.wait_id(&json!(3), Duration::from_secs(120), "visual save");
+    assert!(
+        saved.pointer("/result/isError").is_none(),
+        "baseline saved: {saved}"
+    );
+
+    let base = page_count(&mut c, 4);
+    assert_eq!(base, 1, "exactly the fixture tab before the compare");
+
+    c.call(
+        json!(30),
+        "visual",
+        json!({"action": "compare", "name": "cancel-probe"}),
+    );
+    // Wait for the scratch target to exist (targets list is lock-free, so it
+    // answers while the compare holds the execution lock).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if page_count(&mut c, 31) > base {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the scratch diff target never appeared"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Cancel while the target is provably open.
+    c.send(
+        &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": {"requestId": 30}}),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if page_count(&mut c, 32) == base {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a cancelled compare left its scratch target behind"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // The page is clean as well, and the cancelled compare emitted nothing
+    // (wait_id fails on unexpected frames).
+    c.call(
+        json!(40),
+        "evaluate",
+        json!({"expression": "[document.getElementById('__gladius_deterministic') === null, matchMedia('(prefers-reduced-motion: reduce)').matches]"}),
+    );
+    let ev = c.wait_id(&json!(40), Duration::from_secs(60), "state after cancel");
+    let arr = ev
+        .pointer("/result/structuredContent/value")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        arr.first().and_then(|v| v.as_bool()),
+        Some(true),
+        "no freeze stylesheet after a cancelled compare: {ev}"
+    );
+    assert_eq!(
+        arr.get(1).and_then(|v| v.as_bool()),
+        Some(false),
+        "emulated reduced-motion cleared after a cancelled compare: {ev}"
+    );
+
+    c.call(json!(41), "close", json!({}));
+    let _ = c.wait_id(&json!(41), Duration::from_secs(30), "close");
+}
+
+/// Cancellation in the ENTRY window (blocking item 1). The hooks make the race
+/// deterministic: the dispatch task parks between its liveness check and the
+/// section gate, the cancel lands there, and the abort waiter takes the gate.
+///
+/// Case A exercises the real abort: the call must never mutate the page, emit
+/// no response, and the execution lock must be released only after the abort.
+#[test]
+fn cancel_in_the_entry_window_never_mutates() {
+    const STATE: &str = "[window.innerWidth, window.innerHeight, window.devicePixelRatio, \
+        document.getElementById('__gladius_deterministic') === null, \
+        matchMedia('(prefers-reduced-motion: reduce)').matches]";
+    let mut c = Client::spawn_extra(&[
+        ("GLADIUS_TEST_ENTRY_MS", "1500"),
+        ("GLADIUS_TEST_ABORT_HOLD_MS", "700"),
+        ("GLADIUS_TEST_CRITICAL_DELAY_MS", "1200"),
+    ]);
+    c.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18"}}));
+    let init = c.wait_id(&json!(1), Duration::from_secs(30), "initialize");
+    assert!(init.get("error").is_none(), "initialize: {init}");
+
+    let fixture = format!(
+        "file:///{}",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/layout.html")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    c.call(json!(2), "navigate", json!({"url": fixture}));
+    let nav = c.wait_id(&json!(2), Duration::from_secs(60), "navigate");
+    assert!(nav.get("error").is_none(), "navigate: {nav}");
+    c.call(
+        json!(3),
+        "viewport",
+        json!({"width": 900, "height": 700, "deviceScaleFactor": 2}),
+    );
+    let vp = c.wait_id(&json!(3), Duration::from_secs(30), "viewport");
+    assert!(vp.get("error").is_none(), "viewport: {vp}");
+
+    // Fire the capture, then cancel while it is parked in the entry window.
+    c.call(json!(10), "screenshot", json!({"deterministic": true}));
+    std::thread::sleep(Duration::from_millis(250));
+    c.send(
+        &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": {"requestId": 10}}),
+    );
+    let cancelled_at = Instant::now();
+
+    // The exec lock is held by the parked task, so this can only answer once
+    // the cancel has been honoured and the task dropped.
+    c.call(json!(20), "evaluate", json!({"expression": STATE}));
+    let ev = c.wait_id(&json!(20), Duration::from_secs(60), "state after cancel");
+    let waited = cancelled_at.elapsed();
+    let arr = ev
+        .pointer("/result/structuredContent/value")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        arr.first().and_then(|v| v.as_f64()),
+        Some(900.0),
+        "width untouched: {ev}"
+    );
+    assert_eq!(
+        arr.get(1).and_then(|v| v.as_f64()),
+        Some(700.0),
+        "height untouched: {ev}"
+    );
+    assert_eq!(
+        arr.get(2).and_then(|v| v.as_f64()),
+        Some(2.0),
+        "deviceScaleFactor untouched: {ev}"
+    );
+    assert_eq!(
+        arr.get(3).and_then(|v| v.as_bool()),
+        Some(true),
+        "no freeze stylesheet was ever left behind: {ev}"
+    );
+    assert_eq!(
+        arr.get(4).and_then(|v| v.as_bool()),
+        Some(false),
+        "no emulated reduced-motion left behind: {ev}"
+    );
+    assert!(
+        waited >= Duration::from_millis(300),
+        "the state read waited for the parked call to be aborted ({waited:?}), \
+         which is the lock-released-after-abort guarantee"
+    );
+    // `wait_id` fails on unexpected frames, so the cancelled call emitted
+    // nothing.
+
+    c.call(json!(30), "viewport", json!({"reset": true}));
+    let _ = c.wait_id(&json!(30), Duration::from_secs(30), "viewport reset");
+    c.call(json!(31), "close", json!({}));
+    let _ = c.wait_id(&json!(31), Duration::from_secs(30), "close");
+}
+
+/// Case B isolates the LIVENESS RECHECK under the gate: the abort is skipped
+/// (`GLADIUS_TEST_ABORT_SKIP`), the waiter holds the gate for 1.5 s, and the
+/// cancelled task is queued behind it. When the gate is handed over the task
+/// must bail on the recheck instead of entering a 3 s capture that would leave
+/// the freeze stylesheet and the capture's dsf visible.
+///
+/// The observation is deliberately lock-free (`wait_for` polls the page
+/// without the execution lock): if the task had entered, the page would show
+/// the overrides for three seconds and the wait would time out.
+#[test]
+fn cancel_while_queued_never_enters_the_section() {
+    let mut c = Client::spawn_extra(&[
+        ("GLADIUS_TEST_ENTRY_MS", "300"),
+        ("GLADIUS_TEST_ABORT_HOLD_MS", "1500"),
+        ("GLADIUS_TEST_ABORT_SKIP", "1"),
+        ("GLADIUS_TEST_CRITICAL_DELAY_MS", "3000"),
+    ]);
+    c.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18"}}));
+    let init = c.wait_id(&json!(1), Duration::from_secs(30), "initialize");
+    assert!(init.get("error").is_none(), "initialize: {init}");
+
+    let fixture = format!(
+        "file:///{}",
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/layout.html")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    c.call(json!(2), "navigate", json!({"url": fixture}));
+    let nav = c.wait_id(&json!(2), Duration::from_secs(60), "navigate");
+    assert!(nav.get("error").is_none(), "navigate: {nav}");
+
+    c.call(json!(10), "screenshot", json!({"deterministic": true}));
+    std::thread::sleep(Duration::from_millis(100));
+    c.send(
+        &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": {"requestId": 10}}),
+    );
+
+    // Wait until the queued task has had the gate handed to it (entry 300 ms,
+    // abort hold 1500 ms) and would be inside the section if the recheck were
+    // missing. 2 s is inside the 3 s section delay.
+    std::thread::sleep(Duration::from_millis(2000));
+    c.call(
+        json!(20),
+        "wait_for",
+        json!({"expression": "document.getElementById('__gladius_deterministic') === null && window.devicePixelRatio === 1", "ms": 1500}),
+    );
+    let w = c.wait_id(&json!(20), Duration::from_secs(30), "lock-free state probe");
+    assert!(
+        w.pointer("/result/isError").is_none(),
+        "the cancelled task never entered the section (no freeze style, dsf untouched): {w}"
+    );
+
+    c.call(json!(31), "close", json!({}));
+    let _ = c.wait_id(&json!(31), Duration::from_secs(30), "close");
 }

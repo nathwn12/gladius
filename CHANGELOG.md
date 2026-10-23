@@ -4,6 +4,65 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.5.0] - 2026-10-23
+
+- Deterministic capture: `screenshot` gained `deterministic:true`, which pins
+  the conditions instead of trusting the page - `Emulation.setDeviceMetricsOverride`
+  (current viewport, or the requested width/height, at deviceScaleFactor 1,
+  mobile false; the prior override is replayed or cleared afterwards),
+  `prefers-reduced-motion: reduce`, a temporary style element freezing
+  animation/transition/caret/smooth-scroll/scrollbar, then
+  `document.fonts.ready`, every `img` complete, and two rAF ticks (each raced
+  against a timer, so a background tab that starves rAF still settles). The
+  reply carries viewport, deviceScaleFactor, url, byte length and a checksum,
+  so two captures of the same page can be proven byte-identical.
+- `layout`: the where-is-it-actually primitive - every match of a selector or
+  ref list with its viewport rect, page-coordinate box, quad count, scroll
+  size, computed display/visibility/opacity, a z-order hint and every
+  detected overlapping pair with its intersection rect and area.
+- `assert_layout`: geometry proven without pixels - exists/absence,
+  visible, stableFrames, box with tolerance, hitTarget (the same
+  `elementFromPoint` guard `click` uses), computed subset, noOverflow and
+  inViewport, returning per-check `{target, check, pass, expected, actual,
+  delta}` plus an overall pass; `screenshotOnFail:true` attaches one
+  deterministic capture. Values are engine measurements, never guesses.
+- `visual` baselines under `GLADIUS_VISUAL_DIR` (default
+  `<cwd>/.gladius/visual`): `save` / `compare` / `list` / `delete`, with a
+  `<name>.meta.json` sidecar (browser major, viewport, deviceScaleFactor, url,
+  checksum, createdAt). `compare` reports `environment: {match, baseline,
+  current}` and warns `baseline_environment_mismatch` on browser/viewport/DSF
+  drift (`requireEnvironmentMatch:true` makes it fail). Anti-aliasing is
+  ignored by default under one mechanical rule: a pixel is a candidate only
+  when its channel delta exceeds `threshold`, and a candidate is suppressed
+  only when it sits on a >=32-level 3x3 luminance edge in BOTH images and its
+  4-connected component is no larger than `minDiffCluster` (default 2). The
+  threshold is never raised to buy tolerance; flat-area and 2x2 changes still
+  fail.
+- `click` is exactly two CDP events at the element's exact box centre
+  (mousePressed, mouseReleased) - no mouseMoved, no implicit hover, no
+  movement loop. `hoverFirst:true` sends one `mouseMoved` first for pages
+  whose handlers read hover state; the default stays false.
+- Focus without foreground: every session enables
+  `Emulation.setFocusEmulationEnabled`, so `document.hasFocus()` and
+  `:focus`-gated handlers behave while the tab never owns OS focus and no
+  window is raised - background capture that keeps the headless-only
+  contract.
+- Cancellation-safe scope: `screenshot`, `assert_layout` and `visual` hold a
+  critical section for the whole call, and a `notifications/cancelled` abort
+  waits on that section (bounded by a 60 s grace) instead of dropping the
+  future mid-restore, so a cancelled capture cannot leave a stale
+  device-metrics/media override or a leaked scratch target behind.
+- `visual compare` opens exactly one scratch target, always created with
+  `background:true`, and closes it on success, error and cancel. There is no
+  foreground fallback: an engine that refuses a background target gets a
+  typed `scratch_background_unsupported` error and no target is created. On
+  an external attach this is a real extra tab for a moment, created in the
+  background - never one that activates.
+- Test suite: new `capture`, `layout` and `visual` coverage (fixtures
+  `tests/fixtures/layout.html`, `tests/fixtures/canvas.html`) plus
+  cancellation and scratch-target assertions in `tests/concurrency.rs`.
+- No dependency change.
+
 ## [0.4.4] - 2026-10-23
 
 - Release gate: the pre-publish cleanroom installed the tarball and booted
