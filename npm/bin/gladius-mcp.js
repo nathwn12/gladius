@@ -372,6 +372,264 @@ function walkFiles(dir) {
   return out;
 }
 
+// --- concurrent provisioning ---------------------------------------------
+//
+// Two MCP clients (two project directories in the same editor, two agents in
+// the same session) start this launcher at the same instant and resolve the
+// SAME cache leaf. Both then staged and renamed onto the same final path, and
+// each deleted that path on entry and on failure, so on Windows one process
+// got `EPERM ... rename` from the move and its cleanup deleted the tree the
+// other had just published; the winner then reported "server binary missing
+// after provisioning" and the whole tool namespace vanished (observed
+// 2026-10-23 against v0.4.5, engine 0.4.5-997b287f, two pids seconds apart).
+//
+// The shape below makes a shared cache safe without weakening any check:
+//   - ONE writer at a time, via an atomically-created `<cache>.lock` directory
+//     (`mkdirSync` is the only exclusive-create primitive Node has on Windows).
+//     Waiters poll; a lock whose owner pid is gone, or that outlives the hard
+//     ceiling without a heartbeat, is broken by renaming it aside so exactly
+//     one waiter can win the break.
+//   - A bounded retry on the transient Windows errors only (EPERM/EACCES/
+//     EBUSY: an indexer, an AV scanner, or a just-closed handle), never on a
+//     real failure. Every retry re-runs the same size/sha256 assertions.
+//   - "The final directory now verifies" is SUCCESS, not failure: that is the
+//     other process having just produced the exact bytes. A rename that loses
+//     the race therefore reuses the winner's cache instead of erroring.
+//   - Staging leftovers from a crashed run are reaped so they cannot pile up.
+//   - The final path is never deleted outside the lock, and never deleted in
+//     a failure path at all: a loser can no longer destroy a winner's cache.
+const LOCK_WAIT_MS = 25 * 60 * 1000;
+// A live owner heartbeats the lock directory at every phase, so this ceiling
+// only fires for a lock whose process is wedged, not for a slow download.
+const LOCK_STALE_MS = 30 * 60 * 1000;
+const STAGING_STALE_MS = 60 * 60 * 1000;
+const TRANSIENT_FS_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const RENAME_BACKOFF_MS = [0, 50, 150, 400, 1000, 2000, 4000];
+const LOCK_POLL_MS = [25, 50, 100, 200, 400, 800];
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientFsError(err) {
+  return Boolean(err) && TRANSIENT_FS_CODES.has(err.code);
+}
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the pid exists but belongs to someone we may not signal.
+    return err.code === 'EPERM';
+  }
+}
+
+function readLockOwner(lockDir) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function heartbeatLock(lockDir) {
+  const now = new Date();
+  try {
+    fs.utimesSync(lockDir, now, now);
+  } catch {
+    // The lock may have been broken and taken over; the release owner check
+    // below is what keeps that safe.
+  }
+}
+
+function releaseProvisionLock(lockDir) {
+  if (!lockDir) return;
+  const owner = readLockOwner(lockDir);
+  if (owner && Number.isInteger(owner.pid) && owner.pid !== process.pid) return; // someone else's
+  try {
+    fs.rmSync(lockDir, { recursive: true, force: true });
+  } catch {
+    // Best effort: a leftover lock is broken by the stale rule on the next run.
+  }
+}
+
+// Returns true when this caller moved a dead/slow lock out of the way. The
+// rename is the race-breaker: only one waiter can perform it.
+function breakStaleLock(lockDir, label) {
+  let st;
+  try {
+    st = fs.statSync(lockDir);
+  } catch {
+    return false; // released between our mkdir attempt and now
+  }
+  const owner = readLockOwner(lockDir);
+  const age = Date.now() - st.mtimeMs;
+  const ownerDead = owner && Number.isInteger(owner.pid) ? !pidAlive(owner.pid) : false;
+  // A lock is a directory. Anything else sitting on that path is corruption,
+  // not a live holder, so it is cleared without waiting for the ceiling.
+  if (st.isDirectory() && !ownerDead && age < LOCK_STALE_MS) return false;
+  const park = `${lockDir}.broken-${process.pid}-${Date.now()}`;
+  try {
+    fs.renameSync(lockDir, park);
+  } catch {
+    return false; // another waiter broke it first
+  }
+  const who = owner && owner.pid ? `pid ${owner.pid}${ownerDead ? ', gone' : ', still running'}` : 'no owner file';
+  log(`clearing a stale ${label} provision lock at ${lockDir} (${who}, ${Math.round(age / 1000)}s old)`);
+  fs.rmSync(park, { recursive: true, force: true });
+  return true;
+}
+
+async function acquireProvisionLock(cacheDir, label) {
+  const lockDir = `${cacheDir}.lock`;
+  fs.mkdirSync(path.dirname(cacheDir), { recursive: true });
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let announced = false;
+  let poll = 0;
+  for (;;) {
+    try {
+      fs.mkdirSync(lockDir); // exclusive create: EEXIST means held
+      try {
+        fs.writeFileSync(
+          path.join(lockDir, 'owner.json'),
+          JSON.stringify({ pid: process.pid, host: os.hostname(), since: new Date().toISOString(), label }, null, 2)
+        );
+      } catch {
+        // The directory itself is the lock; the owner file only names it.
+      }
+      return lockDir;
+    } catch (err) {
+      if (err.code !== 'EEXIST') {
+        throw new Error(`cannot create the ${label} provision lock ${lockDir}: ${err.message}`);
+      }
+    }
+    if (breakStaleLock(lockDir, label)) continue;
+    if (!announced) {
+      const owner = readLockOwner(lockDir);
+      log(
+        `another gladius-mcp process is provisioning the ${label} cache` +
+        (owner && owner.pid ? ` (pid ${owner.pid} since ${owner.since})` : '') +
+        `; waiting for it to finish: ${cacheDir}`
+      );
+      announced = true;
+    }
+    if (Date.now() > deadline) {
+      const owner = readLockOwner(lockDir);
+      throw new Error(
+        `timed out after ${Math.round(LOCK_WAIT_MS / 60000)} min waiting for the ${label} provision lock ${lockDir}` +
+        (owner && owner.pid
+          ? ` held by pid ${owner.pid} on ${owner.host || 'this host'} since ${owner.since}`
+          : ' (holder unknown: the lock has no readable owner.json)')
+      );
+    }
+    await sleep(LOCK_POLL_MS[Math.min(poll, LOCK_POLL_MS.length - 1)] + Math.floor(Math.random() * 25));
+    poll++;
+  }
+}
+
+// Runs fn under the single-writer lock and always releases it, including when
+// fn throws. fn must throw on failure and must NOT call fail(): process.exit()
+// would skip the release.
+async function withProvisionLock(cacheDir, label, fn) {
+  const lockDir = await acquireProvisionLock(cacheDir, label);
+  try {
+    return await fn(lockDir);
+  } finally {
+    releaseProvisionLock(lockDir);
+  }
+}
+
+// A directory rename that loses to a concurrent mover, or to a handle an
+// indexer/AV has open, fails with one of the transient codes. Retry those
+// with short backoff; any other error is real and propagates at once.
+async function renameWithRetry(from, to, label) {
+  let last = null;
+  for (let i = 0; i < RENAME_BACKOFF_MS.length; i++) {
+    if (RENAME_BACKOFF_MS[i] > 0) await sleep(RENAME_BACKOFF_MS[i]);
+    try {
+      fs.renameSync(from, to);
+      return { ok: true, error: null };
+    } catch (err) {
+      last = err;
+      if (!isTransientFsError(err)) throw err;
+      const next = RENAME_BACKOFF_MS[i + 1];
+      log(`publishing the ${label} cache was blocked transiently (${err.code}); ` +
+        (next === undefined ? 'no retries left' : `retrying in ${next}ms`));
+    }
+  }
+  return { ok: false, error: last };
+}
+
+// Remove a cache tree that cannot be used. Moved out of the final path first:
+// a half-deleted tree must never sit where the next run reads it as a cache.
+// Only called while holding the lock.
+async function removeCacheTree(target) {
+  const park = `${target}.stale-${process.pid}-${Date.now()}`;
+  const moved = await (async () => {
+    for (const delay of [0, 50, 250]) {
+      if (delay > 0) await sleep(delay);
+      try {
+        fs.renameSync(target, park);
+        return true;
+      } catch (err) {
+        if (!isTransientFsError(err)) return false;
+      }
+    }
+    return false;
+  })();
+  if (!moved) {
+    fs.rmSync(target, { recursive: true, force: true });
+    return;
+  }
+  fs.rmSync(park, { recursive: true, force: true });
+}
+
+// Reap leftovers of an earlier crashed provision next to this cache: staging
+// and parked trees whose pid is gone or that are older than any live run can
+// be. Best effort: a live or unreadable sibling is left alone.
+function reapStaleSiblings(cacheDir) {
+  const parent = path.dirname(cacheDir);
+  const base = path.basename(cacheDir) + '.';
+  const reusable = ['staging-', 'stale-', 'lock.broken-'];
+  let entries;
+  try {
+    entries = fs.readdirSync(parent);
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    if (!name.startsWith(base)) continue;
+    const suffix = name.slice(base.length);
+    const kind = reusable.find((prefix) => suffix.startsWith(prefix));
+    if (!kind) continue;
+    const full = path.join(parent, name);
+    let st;
+    try {
+      st = fs.statSync(full);
+    } catch {
+      continue;
+    }
+    const tail = suffix.slice(kind.length);
+    const pid = Number.parseInt(kind === 'stale-' ? tail.split('-')[0] : tail, 10);
+    const abandoned = !Number.isInteger(pid) || !pidAlive(pid) || Date.now() - st.mtimeMs > STAGING_STALE_MS;
+    if (!abandoned) continue;
+    try {
+      fs.rmSync(full, { recursive: true, force: true });
+      log(`removed an abandoned provisioning leftover: ${full}`);
+    } catch {
+      // In use after all; the next run tries again.
+    }
+  }
+}
+
+function describeCacheStatus(status) {
+  if (status === 'ok') return 'present and verified';
+  if (status === 'absent') return 'absent';
+  return `present but did not verify (${status})`;
+}
+
 // The ONLY fetch call site in this package. The diagnostic path returns
 // before the ensure* functions, so --doctor/--print-manifest provably reach
 // no network: grep `fetch(` — it appears exactly once, here.
@@ -390,6 +648,32 @@ async function downloadToMemory(url) {
   return Buffer.from(await res.arrayBuffer());
 }
 
+// Cache state without trusting the marker: 'ok' means the server binary at
+// the final path matches the manifest name/size/sha256 exactly.
+function runtimeCacheStatus(cacheDir, rt) {
+  let st;
+  try {
+    st = fs.statSync(cacheDir);
+  } catch {
+    return 'absent';
+  }
+  if (!st.isDirectory()) return 'invalid';
+  const bad = checkFile(path.join(cacheDir, rt.server.name), rt.server);
+  if (bad === 'missing') return 'incomplete';
+  if (bad) return `invalid: ${bad}`;
+  return 'ok';
+}
+
+// The marker records what this launcher verified for the tree it published. It
+// is written INSIDE the staged tree, so the rename publishes a cache that is
+// already marked and a reader can never observe an unmarked final directory.
+function writeRuntimeMarker(dir, manifest, rt) {
+  fs.writeFileSync(
+    path.join(dir, '.ready'),
+    JSON.stringify({ serverVersion: manifest.serverVersion, bundleSha256: rt.archive.sha256.toLowerCase() }, null, 2)
+  );
+}
+
 async function ensureRuntime(manifest, cacheDir) {
   const rt = manifest.runtime;
   if (isPlaceholderSha(rt.archive.sha256) || !(rt.archive.size > 0)) {
@@ -403,7 +687,7 @@ async function ensureRuntime(manifest, cacheDir) {
   }
 
   const markerPath = path.join(cacheDir, '.ready');
-  const reuse = (() => {
+  const reusable = (announce) => {
     try {
       const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
       if (marker.serverVersion !== manifest.serverVersion) return false;
@@ -413,16 +697,52 @@ async function ensureRuntime(manifest, cacheDir) {
     }
     const bad = checkFile(path.join(cacheDir, rt.server.name), rt.server);
     if (bad) {
-      log(`cached ${rt.server.name} invalid (${bad}); re-provisioning.`);
+      if (announce) log(`cached ${rt.server.name} invalid (${bad}); re-provisioning.`);
       return false;
     }
     return true;
-  })();
-  if (reuse) {
+  };
+  if (reusable(true)) {
     log(`runtime cache ready (reused): ${cacheDir}`);
     return cacheDir;
   }
 
+  try {
+    await withProvisionLock(cacheDir, 'runtime', async (lockDir) => {
+      // The process we may have just waited behind can have finished: re-check
+      // under the lock before spending a download on the same bytes.
+      if (reusable(false)) {
+        log(`runtime cache ready (reused): ${cacheDir}`);
+        return;
+      }
+      const status = runtimeCacheStatus(cacheDir, rt);
+      if (status === 'ok') {
+        // A previous run published these exact bytes but never got to write
+        // the marker (killed between rename and marker). Adopt, don't refetch.
+        log(`runtime cache bytes verify but are unmarked; adopting ${cacheDir}`);
+        writeRuntimeMarker(cacheDir, manifest, rt);
+        return;
+      }
+      if (status !== 'absent') {
+        log(`runtime cache at ${cacheDir} is unusable (${status}); replacing it`);
+        await removeCacheTree(cacheDir);
+      }
+      await provisionRuntime(manifest, cacheDir, rt, lockDir);
+    });
+  } catch (err) {
+    const status = runtimeCacheStatus(cacheDir, rt);
+    const detail = String(err.message).replace(/\.\s*$/, '');
+    fail(
+      `provisioning runtime cache ${cacheDir} failed: ${detail}. ` +
+      `Cache dir: ${describeCacheStatus(status)}. ` +
+      `Retry \`npx -y gladius-mcp@latest\`; if it keeps failing, delete ${cacheDir} ` +
+      `and any sibling ${path.basename(cacheDir)}.lock / .staging-* directories, then retry.`
+    );
+  }
+  return cacheDir;
+}
+
+async function provisionRuntime(manifest, cacheDir, rt, lockDir) {
   // Local bundle override: the pre-publish cleanroom builds the archive in
   // this same job, before any GitHub Release exists, so it hands the zip over
   // instead of fetching a URL that cannot exist yet. The size and sha256
@@ -437,7 +757,7 @@ async function ensureRuntime(manifest, cacheDir) {
     try {
       data = fs.readFileSync(localBundle);
     } catch (err) {
-      fail(`cannot read local bundle ${localBundle}: ${err.message}`);
+      throw new Error(`cannot read local bundle ${localBundle}: ${err.message}`);
     }
   } else {
     const url = `${rt.source}/${rt.archive.name}`;
@@ -446,40 +766,57 @@ async function ensureRuntime(manifest, cacheDir) {
     try {
       data = await downloadToMemory(url);
     } catch (err) {
-      fail(err.message);
+      throw new Error(err.message);
     }
   }
+  heartbeatLock(lockDir);
+
+  // Integrity: mandatory on every path, first attempt or retry. A retry can
+  // never skip or weaken these two checks.
   if (data.length !== rt.archive.size) {
-    fail(`${origin} size ${data.length} != manifest ${rt.archive.size}; wrote nothing.`);
+    throw new Error(`${origin} size ${data.length} != manifest ${rt.archive.size}; wrote nothing.`);
   }
   const digest = crypto.createHash('sha256').update(data).digest('hex');
   if (digest !== rt.archive.sha256.toLowerCase()) {
-    fail(`${origin} sha256 mismatch; wrote nothing.`);
+    throw new Error(`${origin} sha256 mismatch; wrote nothing.`);
   }
 
-  // Extract into a staging dir, verify, then rename: the target dir is
-  // never observed half-written.
+  reapStaleSiblings(cacheDir);
+
+  // Extract into a staging dir, verify, then rename: the target dir is never
+  // observed half-written.
   const staging = `${cacheDir}.staging-${process.pid}`;
   fs.rmSync(staging, { recursive: true, force: true });
-  fs.rmSync(cacheDir, { recursive: true, force: true });
-  fs.mkdirSync(staging, { recursive: true });
   try {
+    fs.mkdirSync(staging, { recursive: true });
     const names = extractZip(data, staging);
     log(`extracted ${names.length} entries`);
     const bad = checkFile(path.join(staging, rt.server.name), rt.server);
     if (bad) throw new Error(`extracted ${rt.server.name} invalid (${bad})`);
-    fs.renameSync(staging, cacheDir);
-    fs.writeFileSync(
-      markerPath,
-      JSON.stringify({ serverVersion: manifest.serverVersion, bundleSha256: rt.archive.sha256.toLowerCase() }, null, 2)
-    );
+    writeRuntimeMarker(staging, manifest, rt);
+    heartbeatLock(lockDir);
+    const moved = await renameWithRetry(staging, cacheDir, 'runtime');
+    if (!moved.ok) {
+      // Windows refuses to move a directory onto one a concurrent process has
+      // just published. If that directory holds exactly the bytes this process
+      // verified, the race was won elsewhere and provisioning has SUCCEEDED.
+      const status = runtimeCacheStatus(cacheDir, rt);
+      if (status !== 'ok') {
+        throw new Error(`${moved.error.message} (final dir ${describeCacheStatus(status)})`);
+      }
+      log(`another gladius-mcp process published the runtime cache first; using it`);
+      writeRuntimeMarker(cacheDir, manifest, rt);
+      fs.rmSync(staging, { recursive: true, force: true });
+      return;
+    }
   } catch (err) {
+    // Staging only. The final path is NEVER deleted here: it may hold the other
+    // process's good cache, and deleting it is what produced the original
+    // "server binary missing after provisioning" crash.
     fs.rmSync(staging, { recursive: true, force: true });
-    fs.rmSync(cacheDir, { recursive: true, force: true });
-    fail(`provisioning failed (${err.message}); wrote nothing.`);
+    throw err;
   }
   log(`runtime cache ready (provisioned): ${cacheDir}`);
-  return cacheDir;
 }
 
 function checkBrowserPin(browser) {
@@ -533,7 +870,8 @@ async function ensureBrowser(manifest, cacheDir) {
   const asset = browser.asset;
 
   const markerPath = path.join(cacheDir, '.ready');
-  const reuse = (() => {
+  const browserExeIn = (dir) => path.join(dir, ...`${browser.root}/chrome-headless-shell.exe`.split('/'));
+  const reusable = (announce) => {
     let marker;
     try {
       marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
@@ -544,40 +882,102 @@ async function ensureBrowser(manifest, cacheDir) {
     if (String(marker.zipSha256).toLowerCase() !== asset.sha256.toLowerCase()) return false;
     const reason = reverifyBrowserCache(cacheDir, browser);
     if (reason) {
-      log(`cached browser invalid (${reason}); re-provisioning.`);
+      if (announce) log(`cached browser invalid (${reason}); re-provisioning.`);
       return false;
     }
     return true;
-  })();
-  if (reuse) {
+  };
+  if (reusable(true)) {
+    const ready = browserExeIn(cacheDir);
     log(`browser cache ready (reused): ${cacheDir}`);
-    return path.join(cacheDir, ...`${browser.root}/chrome-headless-shell.exe`.split('/'));
+    return ready;
   }
 
+  try {
+    await withProvisionLock(cacheDir, 'browser', async (lockDir) => {
+      // The process we may have waited behind can have finished: re-check
+      // before downloading ~120 MB of the same bytes.
+      if (reusable(false)) {
+        log(`browser cache ready (reused): ${cacheDir}`);
+        return;
+      }
+      const reason = reverifyBrowserCache(cacheDir, browser);
+      if (reason === null) {
+        // Exact manifest set present, only the marker is missing (a run killed
+        // between rename and marker). Adopt the bytes, don't refetch them.
+        log(`browser cache verifies but is unmarked; adopting ${cacheDir}`);
+        writeBrowserMarker(cacheDir, browser, asset);
+        return;
+      }
+      let present = false;
+      try {
+        present = fs.statSync(cacheDir).isDirectory();
+      } catch {
+        present = false;
+      }
+      if (present) {
+        log(`browser cache at ${cacheDir} is unusable (${reason}); replacing it`);
+        await removeCacheTree(cacheDir);
+      }
+      await provisionBrowser(manifest, cacheDir, browser, asset, lockDir);
+    });
+  } catch (err) {
+    const reason = reverifyBrowserCache(cacheDir, browser);
+    const state = reason === null ? 'present and verified' : (() => {
+      try {
+        fs.statSync(cacheDir);
+        return `present but did not verify (${reason})`;
+      } catch {
+        return 'absent';
+      }
+    })();
+    fail(
+      `browser provisioning failed for ${cacheDir}: ${String(err.message).replace(/\.\s*$/, '')}. Cache dir: ${state}. ` +
+      `The browser is fetched from Google's Chrome-for-Testing endpoint at first run and is never bundled; ` +
+      `check network access to ${asset.url}. Retry \`npx -y gladius-mcp@latest\`; if it keeps failing, delete ${cacheDir} ` +
+      `and any sibling ${path.basename(cacheDir)}.lock / .staging-* directories, then retry.`
+    );
+  }
+  const ready = browserExeIn(cacheDir);
+  return ready;
+}
+
+function writeBrowserMarker(dir, browser, asset) {
+  fs.writeFileSync(
+    path.join(dir, '.ready'),
+    JSON.stringify({ version: browser.version, zipSha256: asset.sha256.toLowerCase() }, null, 2)
+  );
+}
+
+async function provisionBrowser(manifest, cacheDir, browser, asset, lockDir) {
   log(`provisioning browser cache: ${cacheDir}`);
   log(`downloading ${asset.url} (${asset.size} bytes)`);
   let data;
   try {
     data = await downloadToMemory(asset.url);
   } catch (err) {
-    fail(`cannot provision the pinned browser (${err.message}). The browser is fetched from Google's Chrome-for-Testing endpoint at first run and is never bundled; check network access to ${asset.url}.`);
+    throw new Error(`cannot provision the pinned browser (${err.message})`);
   }
+  heartbeatLock(lockDir);
+
+  // Integrity: mandatory on every path, first attempt or retry.
   if (data.length !== asset.size) {
-    fail(`browser download size ${data.length} != manifest ${asset.size}; wrote nothing.`);
+    throw new Error(`browser download size ${data.length} != manifest ${asset.size}; wrote nothing.`);
   }
   const digest = crypto.createHash('sha256').update(data).digest('hex');
   if (digest !== asset.sha256.toLowerCase()) {
-    fail('browser download sha256 mismatch; wrote nothing.');
+    throw new Error('browser download sha256 mismatch; wrote nothing.');
   }
+
+  reapStaleSiblings(cacheDir);
 
   // Extract into a staging dir, verify EVERY file against the manifest
   // (exact set, no extras), then rename: the target dir is never observed
   // half-written.
   const staging = `${cacheDir}.staging-${process.pid}`;
   fs.rmSync(staging, { recursive: true, force: true });
-  fs.rmSync(cacheDir, { recursive: true, force: true });
-  fs.mkdirSync(staging, { recursive: true });
   try {
+    fs.mkdirSync(staging, { recursive: true });
     const names = extractZip(data, staging);
     log(`extracted ${names.length} entries`);
     const want = new Map(browser.files.map((f) => [f.name, f]));
@@ -600,24 +1000,44 @@ async function ensureBrowser(manifest, cacheDir) {
     const exeHash = sha256File(path.join(staging, ...exeRel.split('/')));
     const exeLen = fs.statSync(path.join(staging, ...exeRel.split('/'))).size;
     log(`check staged ${exeRel}: computed=${exeHash} expected=${exeEntry.sha256} size=${exeLen} expected-size=${exeEntry.size}`);
-    fs.renameSync(staging, cacheDir);
-    fs.writeFileSync(
-      markerPath,
-      JSON.stringify({ version: browser.version, zipSha256: asset.sha256.toLowerCase() }, null, 2)
-    );
+    writeBrowserMarker(staging, browser, asset);
+    heartbeatLock(lockDir);
+    const moved = await renameWithRetry(staging, cacheDir, 'browser');
+    if (!moved.ok) {
+      // Same rule as the runtime: if the final dir now matches the manifest
+      // exactly, another process won the race and provisioning succeeded.
+      const reason = reverifyBrowserCache(cacheDir, browser);
+      if (reason !== null) {
+        throw new Error(`${moved.error.message} (final dir did not verify: ${reason})`);
+      }
+      log(`another gladius-mcp process published the browser cache first; using it`);
+      writeBrowserMarker(cacheDir, browser, asset);
+      fs.rmSync(staging, { recursive: true, force: true });
+      return;
+    }
   } catch (err) {
+    // Staging only: the final path may hold the other process's good cache.
     fs.rmSync(staging, { recursive: true, force: true });
-    fs.rmSync(cacheDir, { recursive: true, force: true });
-    fail(`browser provisioning failed (${err.message}); wrote nothing.`);
+    throw err;
   }
   log(`browser cache ready (provisioned): ${cacheDir}`);
-  return path.join(cacheDir, ...`${browser.root}/chrome-headless-shell.exe`.split('/'));
 }
 
 function runServer(cacheDir, manifest, browserExe) {
   const exe = path.join(cacheDir, manifest.runtime.server.name);
   if (!fs.existsSync(exe)) {
-    fail(`server binary missing after provisioning: ${exe}`);
+    // Provisioning reported success, so this is a filesystem surprise, not a
+    // download problem: name the tree, its siblings, and what is left in it.
+    let listing = '<unreadable>';
+    try {
+      listing = fs.readdirSync(cacheDir).join(', ') || '<empty>';
+    } catch { /* missing entirely */ }
+    fail(
+      `server binary missing after provisioning: ${exe}. ` +
+      `Cache dir ${cacheDir} contains: ${listing}. ` +
+      `Delete ${cacheDir} and any sibling ${path.basename(cacheDir)}.lock / .staging-* directories, then retry ` +
+      '`npx -y gladius-mcp@latest --doctor`.'
+    );
   }
   // Bare gladius with no args serves MCP over stdio (src/main.rs:
   // None | Some("mcp") => serve). stdio is inherited so the child IS the

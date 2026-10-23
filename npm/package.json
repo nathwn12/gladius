@@ -1,6 +1,6 @@
 {
   "name": "gladius-mcp",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "MCP browser-use server (npx launcher): provisions the pinned Chromium (chrome-headless-shell) plus the server runtime on first run, then serves MCP over stdio",
   "license": "MIT",
   "repository": {
