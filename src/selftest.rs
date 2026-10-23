@@ -448,9 +448,16 @@ pub async fn run() -> i32 {
     // each reports exactly its own width/height; if the overrides interleaved,
     // a capture would report someone else's geometry and the restoration
     // afterwards would leave a stale override or freeze stylesheet behind.
+    //
+    // The pre-state read also records the motion preference, because the
+    // capture's restore returns the page to the ENGINE/HOST default: on a host
+    // that asks for reduced motion (a CI runner with animations disabled) that
+    // value is `true` before and after, and asserting `false` would test the
+    // host instead of the capture.
     let pre = crate::tools::call(
         "evaluate",
-        &serde_json::json!({"expression": "[window.innerWidth, window.innerHeight]"}),
+        &serde_json::json!({"expression": "[window.innerWidth, window.innerHeight, \
+            matchMedia('(prefers-reduced-motion: reduce)').matches]"}),
         &b,
     )
     .await;
@@ -460,6 +467,7 @@ pub async fn run() -> i32 {
         .unwrap_or(serde_json::Value::Null);
     let pre_w = pv.get(0).and_then(|v| v.as_i64()).unwrap_or(-1);
     let pre_h = pv.get(1).and_then(|v| v.as_i64()).unwrap_or(-1);
+    let pre_reduce = pv.get(2).and_then(|v| v.as_bool());
     let cap_a = serde_json::json!({"deterministic": true, "width": 640, "height": 480});
     let cap_b = serde_json::json!({"deterministic": true, "width": 720, "height": 540});
     let cap_c = serde_json::json!({"deterministic": true, "width": 900, "height": 700});
@@ -493,11 +501,11 @@ pub async fn run() -> i32 {
     let state_ok = rn(0).as_i64() == Some(pre_w)
         && rn(1).as_i64() == Some(pre_h)
         && rn(2).as_bool() == Some(true)
-        && rn(3).as_bool() == Some(false);
+        && rn(3).as_bool() == pre_reduce;
     check(
         "concurrent-captures-serialized",
         conc_ok && state_ok,
-        &format!("each={conc_detail} restored={rv}"),
+        &format!("each={conc_detail} restored={rv} (pre-capture baseline reduce={pre_reduce:?})"),
     );
 
     // assert_layout: the static probe passes a box/visibility/stable-frames
