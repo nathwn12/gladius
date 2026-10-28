@@ -334,6 +334,50 @@ fn panic_response(id: &Value) -> Value {
         "error": {"code": -32603, "message": "internal error"}})
 }
 
+/// One stdin frame, read as bytes so a non-UTF-8 byte is a recoverable
+/// protocol error instead of a fatal reader failure.
+#[derive(Debug, PartialEq, Eq)]
+enum FrameRead {
+    Frame(String),
+    NotUtf8,
+    Eof,
+}
+
+/// Read one frame from stdin: bytes up to and including the next `\n`, or every
+/// remaining byte when the stream ends without one.
+///
+/// The terminator is stripped exactly as `BufRead::lines` strips it (tokio
+/// `io/util/lines.rs`): drop ONE trailing `\n`, then at most ONE `\r`. So `x\n`
+/// and `x\r\n` are both `x`, `x\r\r\n` is `x\r` (the inner `\r` is payload), and
+/// a `\r` with no `\n` after it is payload too. Nothing else is touched, so the
+/// frame reaching `serde_json` is the rest of the bytes the client sent.
+///
+/// `Eof` means a read that consumed zero bytes, nothing more: a final frame
+/// arriving WITHOUT a trailing `\n` is delivered first as `Frame`/`NotUtf8`
+/// data, and only the following call returns `Eof`. A frame that is not valid
+/// UTF-8 is `NotUtf8`, never an `io::Error`: JSON text is UTF-8 by definition,
+/// so the caller answers `-32700` and keeps serving.
+async fn read_frame<R>(reader: &mut R) -> std::io::Result<FrameRead>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    let n = reader.read_until(b'\n', &mut buf).await?;
+    if n == 0 {
+        return Ok(FrameRead::Eof);
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    }
+    match std::str::from_utf8(&buf) {
+        Ok(frame) => Ok(FrameRead::Frame(frame.to_string())),
+        Err(_) => Ok(FrameRead::NotUtf8),
+    }
+}
+
 /// Serve MCP over stdio: newline-delimited JSON-RPC 2.0.
 /// STDOUT carries only protocol frames; ALL logs go to STDERR.
 ///
@@ -379,21 +423,42 @@ pub async fn serve() -> Result<(), String> {
         let _ = writer_done_tx.send(());
     });
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    // Raw bytes, not `lines()`: `Lines` refuses a frame that is not valid
+    // UTF-8 with an `io::Error` (InvalidData), and that used to end the whole
+    // session on ONE malformed byte - a valid JSON-RPC answer to a bad frame
+    // is `-32700 parse error`, not process death. `read_frame` therefore reads
+    // bytes, strips the frame terminator like `lines()` did, and reports
+    // invalid UTF-8 as its own variant so the loop can answer and keep serving.
+    let mut reader = BufReader::new(tokio::io::stdin());
     loop {
-        let line: Option<String> = tokio::select! {
+        let next: FrameRead = tokio::select! {
             biased;
             _ = &mut writer_done_rx => {
                 // Writer exited (stdout gone or broken): stop accepting.
                 // Shared shutdown below closes the browser and exits 0.
                 break;
             }
-            next = lines.next_line() => {
+            next = read_frame(&mut reader) => {
                 next.map_err(|e| format!("stdin: {e}"))?
             }
         };
-        let Some(line) = line else {
-            break; // EOF: cleanup below.
+        let line = match next {
+            FrameRead::Eof => break, // EOF: cleanup below.
+            FrameRead::NotUtf8 => {
+                // A frame that is not valid UTF-8 cannot be JSON text, so it is
+                // a parse error like any other (id null: no id is recoverable).
+                if send_resp(
+                    &tx,
+                    json!({"jsonrpc": "2.0", "id": null,
+                           "error": {"code": -32700, "message": "parse error"}}),
+                )
+                .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
+            FrameRead::Frame(s) => s,
         };
         if line.trim().is_empty() {
             continue;
@@ -889,6 +954,123 @@ async fn handle_fast(req: &Value, _browser: &Arc<Browser>) -> Option<Value> {
                 "error": {"code": -32601, "message": "method not found"}})),
         _ => Some(json!({"jsonrpc": "2.0", "id": id,
                 "error": {"code": -32601, "message": "method not found"}})),
+    }
+}
+
+#[cfg(test)]
+mod frame_read_tests {
+    use super::{read_frame, FrameRead};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    /// Every payload our reader produces from `bytes`, plus the count of
+    /// non-UTF-8 frames it reported.
+    async fn ours(bytes: &[u8]) -> (Vec<String>, usize) {
+        let mut reader = BufReader::new(bytes);
+        let mut frames = Vec::new();
+        let mut not_utf8 = 0;
+        loop {
+            match read_frame(&mut reader)
+                .await
+                .expect("a byte slice never fails to read")
+            {
+                FrameRead::Eof => break,
+                FrameRead::Frame(s) => frames.push(s),
+                FrameRead::NotUtf8 => not_utf8 += 1,
+            }
+        }
+        (frames, not_utf8)
+    }
+
+    /// The reference implementation: tokio's own `Lines` over the same bytes.
+    async fn reference(bytes: &[u8]) -> Result<Vec<String>, std::io::Error> {
+        let mut lines = BufReader::new(bytes).lines();
+        let mut out = Vec::new();
+        while let Some(line) = lines.next_line().await? {
+            out.push(line);
+        }
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn terminator_shapes_match_lines() {
+        // `\n` and `\r\n` terminators are removed whole...
+        assert_eq!(ours(b"x\n").await.0, vec!["x".to_string()]);
+        assert_eq!(ours(b"x\r\n").await.0, vec!["x".to_string()]);
+        // ...but only ONE `\r` goes: the inner one is payload (this case read
+        // `x` for `x\r\r\n` before the terminal fix).
+        assert_eq!(ours(b"x\r\r\n").await.0, vec!["x\r".to_string()]);
+        // A `\r` with no `\n` after it is payload, not a terminator.
+        assert_eq!(ours(b"x\r").await.0, vec!["x\r".to_string()]);
+        // Consecutive frames keep their own shape.
+        assert_eq!(
+            ours(b"a\r\r\nb\r").await.0,
+            vec!["a\r".to_string(), "b\r".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn unterminated_final_frame_is_data_then_eof() {
+        let mut reader = BufReader::new(&b"x\r"[..]);
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap(),
+            FrameRead::Frame("x\r".to_string()),
+            "an unterminated frame is delivered as data"
+        );
+        assert_eq!(
+            read_frame(&mut reader).await.unwrap(),
+            FrameRead::Eof,
+            "only the following zero-byte read is EOF"
+        );
+    }
+
+    /// Differential: our reader and tokio's `Lines` run the same bytes through
+    /// two independent implementations and the resulting sequences must be
+    /// equal value-for-value. Any future change to the stripping logic that
+    /// diverges from `Lines` fails here even if the five named shapes above
+    /// still pass, because the vector list covers mixed, repeated, bare and
+    /// missing terminators (and the fixture set is asserted non-trivial and
+    /// non-empty, so a reader that produced nothing cannot agree by accident).
+    #[tokio::test]
+    async fn differential_against_tokio_lines() {
+        let vectors: Vec<&[u8]> = vec![
+            b"",
+            b"\n",
+            b"\r\n",
+            b"\r",
+            b"\r\r\n",
+            b"x\n",
+            b"x\r\n",
+            b"x\r\r\n",
+            b"x\r",
+            b"x\r\r",
+            b"a\nb\nc",
+            b"a\r\nb\n\r\r\nc\r",
+            br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\r\n",
+            b"no-terminator-then-a-newline\nand-a-tail",
+        ];
+        let mut total_payloads = 0;
+        for bytes in vectors {
+            let (mine, not_utf8) = ours(bytes).await;
+            assert_eq!(not_utf8, 0, "fixture {bytes:?} is valid UTF-8");
+            let theirs = reference(bytes).await.expect("fixture is valid UTF-8");
+            assert_eq!(
+                mine, theirs,
+                "terminator handling diverged from Lines for {bytes:?}"
+            );
+            total_payloads += mine.len();
+        }
+        assert!(
+            total_payloads > 10,
+            "differential compared too little to mean anything: {total_payloads} payloads"
+        );
+
+        // The one intended divergence: `Lines` refuses invalid UTF-8 with an
+        // io::Error, ours reports `NotUtf8` so the session can answer -32700
+        // and keep serving. Pinned so the difference stays deliberate.
+        let invalid = &b"{\"jsonrpc\":\"2.0\",\"x\":\"\x80\"}\n"[..];
+        assert!(reference(invalid).await.is_err(), "Lines must reject it");
+        assert_eq!(ours(invalid).await.1, 1, "ours must report NotUtf8");
     }
 }
 

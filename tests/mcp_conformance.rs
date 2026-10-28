@@ -59,6 +59,14 @@ impl Client {
         self.stdin.flush().expect("flush stdin");
     }
 
+    /// Raw byte frame, for frames that are not valid UTF-8 (`send_line` cannot
+    /// carry them).
+    fn send_bytes(&mut self, bytes: &[u8]) {
+        self.stdin.write_all(bytes).expect("write stdin bytes");
+        self.stdin.write_all(b"\n").expect("write stdin newline");
+        self.stdin.flush().expect("flush stdin");
+    }
+
     fn recv_timeout(&self, dur: Duration, what: &str) -> Value {
         let line = self
             .rx
@@ -372,6 +380,57 @@ fn strict_framing_invalid_id_types() {
             "invalid id {raw} no result: {resp}"
         );
     }
+}
+
+#[test]
+fn strict_framing_non_utf8_is_a_parse_error_and_the_session_survives() {
+    let mut c = Client::spawn();
+    // One invalid UTF-8 byte inside an otherwise well-formed frame. A JSON-RPC
+    // peer answers -32700 and keeps serving; it must not die on the byte (the
+    // reader used to surface this as an io::Error and end the whole session).
+    let mut frame = br#"{"jsonrpc":"2.0","id":7,"method":"ping","x":""#.to_vec();
+    frame.push(0x80);
+    frame.push(b'"');
+    frame.push(b'}');
+    c.send_bytes(&frame);
+    let resp = c.recv_timeout(Duration::from_secs(10), "non-utf8 frame");
+    let err = resp.get("error").expect("non-utf8 frame must be error");
+    assert_eq!(err.get("code"), Some(&json!(-32700)), "code: {resp}");
+    assert_eq!(resp.get("id"), Some(&json!(null)), "id null: {resp}");
+    // The session is still alive: a normal frame after the bad one round-trips.
+    let ping = c.request("ping", json!({}));
+    assert!(ping.get("error").is_none(), "session must survive: {ping}");
+    assert_eq!(ping.get("result"), Some(&json!({})), "ping: {ping}");
+}
+
+#[test]
+fn unterminated_final_frame_is_answered_then_eof_exits_clean() {
+    let bin = env!("CARGO_BIN_EXE_gladius");
+    let mut cmd = Command::new(bin);
+    cmd.arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let mut child = cmd.spawn().expect("spawn gladius mcp");
+    {
+        let mut stdin = child.stdin.take().expect("child stdin");
+        // No trailing newline, then close: the frame is data, the next read is EOF.
+        stdin
+            .write_all(br#"{"jsonrpc":"2.0","id":11,"method":"ping"}"#)
+            .expect("write unterminated frame");
+        stdin.flush().expect("flush stdin");
+    }
+    let mut out = String::new();
+    BufReader::new(child.stdout.take().expect("child stdout"))
+        .read_line(&mut out)
+        .expect("read reply");
+    let resp: Value = serde_json::from_str(out.trim_end()).expect("reply is json");
+    assert_eq!(resp.get("id"), Some(&json!(11)), "id echo: {resp}");
+    assert_eq!(resp.get("result"), Some(&json!({})), "ping result: {resp}");
+    let status = child.wait().expect("child wait");
+    assert_eq!(status.code(), Some(0), "clean EOF exit: {status:?}");
 }
 
 #[test]
