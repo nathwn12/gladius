@@ -1,6 +1,6 @@
 {
   "name": "gladius-mcp",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "MCP browser-use server (npx launcher): provisions the pinned Chromium (chrome-headless-shell) plus the server runtime on first run, then serves MCP over stdio",
   "license": "MIT",
   "repository": {
@@ -15,7 +15,7 @@
     "gladius-mcp": "./bin/gladius-mcp.js"
   },
   "scripts": {
-    "preinstall": "node -e \"if(process.env.npm_config_global==='true'){console.error('gladius-mcp: global install refused \u2014 use npx gladius-mcp@0.5.0');process.exit(1)}\""
+    "preinstall": "node -e \"if(process.env.npm_config_global==='true'){console.error('gladius-mcp: global install refused \u2014 use npx gladius-mcp@0.5.1');process.exit(1)}\""
   },
   "files": [
     "bin/",

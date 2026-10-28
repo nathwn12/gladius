@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+## [0.5.1] - 2026-10-28
+
+### Fixed
+
+- Invalid UTF-8 stdin frames now return JSON-RPC error `-32700` with a null id instead of ending the MCP session.
+
+### Changed
+
+- Updated 25 locked dependency versions within the existing version requirements.
+
 ## [0.5.0] - 2026-10-23
 
 - Deterministic capture: `screenshot` gained `deterministic:true`, which pins
