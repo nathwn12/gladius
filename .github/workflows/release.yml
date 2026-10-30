@@ -72,6 +72,17 @@ jobs:
         run: cargo build --release --locked
       - name: test
         run: cargo test --release --locked
+      # Real-browser end-to-end, restored to the release path: unit tests never
+      # drive the pinned browser, so this is the only check that would catch a
+      # runtime bundle that cannot actually launch it. Invoked exactly as the
+      # merge gate did before it was narrowed (origin/main ci.yml), from the
+      # repo root, against the same provisioned browser: this job does not set
+      # GLADIUS_CHROMIUM_CACHE, so the provision step above wrote to
+      # %LOCALAPPDATA%\gladius\chromium and the binary resolves that same
+      # default. Sits after build/test and before assembly, so a failure
+      # aborts the release before any artifact exists to publish.
+      - name: selftest (real browser end-to-end)
+        run: target\release\gladius.exe selftest
       - name: assemble archives
         shell: pwsh
         run: |
