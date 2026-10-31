@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- `base64` 0.22 -> 0.23. Additive for the `general_purpose::STANDARD`
+  encode/decode calls used here. 0.23 turns on SIMD engines through a
+  default-on `simd-unsafe` feature, so the default configuration now includes
+  unsafe SIMD paths (same results, different code path). The only observable
+  message change is that `DecodeError::InvalidLastSymbol` now carries the
+  decoded value, which is formatted into the screenshot-decode error text.
 - `reqwest` 0.12 -> 0.13. Upstream removed the `rustls-tls` feature; the
   equivalent is `rustls`, which also changes two things that are not visible at
   the call sites: the crypto provider moves from ring to aws-lc-rs, and the
