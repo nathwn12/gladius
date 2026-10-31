@@ -30,7 +30,7 @@ tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Screenshot `path` writes decode the CDP base64 payload with this direct
 # dep (already in the resolved tree transitively); never hand-rolled.
-base64 = "0.22"
+base64 = "0.23"
 
 # ---------------------------------------------------------------- build speed
 # Fast inner loop. `line-tables-only` keeps file:line backtraces but drops
