@@ -21,13 +21,13 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["full"] }
 # `rustls-tls-webpki-roots` compiles the TLS transport so `wss://` attach
 # endpoints work (the attach path accepts whatever the user points at). It
-# reuses the exact rustls/tokio-rustls/webpki-roots crates already in the
-# tree via reqwest's rustls-tls, so it adds no new dependency versions.
+# reuses the rustls/tokio-rustls crates already in the tree via reqwest's
+# rustls feature, so it adds no new dependency versions.
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "stream", "rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 serde_json = "1"
 tempfile = "3"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Screenshot `path` writes decode the CDP base64 payload with this direct
 # dep (already in the resolved tree transitively); never hand-rolled.
 base64 = "0.22"

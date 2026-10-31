@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- `reqwest` 0.12 -> 0.13. Upstream removed the `rustls-tls` feature; the
+  equivalent is `rustls`, which also changes two things that are not visible at
+  the call sites: the crypto provider moves from ring to aws-lc-rs, and the
+  trust store moves from the bundled webpki-roots to `rustls-platform-verifier`
+  (the OS certificate store). `https://` / `wss://` attach endpoints now trust
+  whatever the host trusts, including locally installed roots.
+
 ## [0.5.1] - 2026-10-28
 
 ### Fixed
