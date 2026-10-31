@@ -19,14 +19,22 @@ path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-# `rustls-tls-webpki-roots` compiles the TLS transport so `wss://` attach
-# endpoints work (the attach path accepts whatever the user points at). It
-# reuses the rustls/tokio-rustls crates already in the tree via reqwest's
-# rustls feature, so it adds no new dependency versions.
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "stream", "rustls-tls-webpki-roots"] }
+# `rustls-tls-native-roots` compiles the TLS transport so `wss://` attach
+# endpoints work (the attach path accepts whatever the user points at), and it
+# keeps ONE trust store per binary: `reqwest` 0.13 offers no bundled-roots
+# feature (only `rustls` / `rustls-no-provider`, both of which pin
+# `rustls-platform-verifier`), so the OS store is the only store both halves can
+# share. `rustls-tls-webpki-roots` here would leave HTTP on the host store and
+# WS on bundled roots. It reuses the rustls/tokio-rustls crates already in the
+# tree via reqwest's rustls feature; the only addition is rustls-native-certs,
+# which reqwest's own verifier already depends on for unix targets.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "stream", "rustls-tls-native-roots"] }
 futures-util = "0.3"
 serde_json = "1"
 tempfile = "3"
+# `rustls` is 0.13's only rustls transport feature besides `rustls-no-provider`
+# (which drops the crypto provider). Both hard-wire `rustls-platform-verifier`,
+# so HTTP trust is the OS store; the WS side is matched to it above.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 # Screenshot `path` writes decode the CDP base64 payload with this direct
 # dep (already in the resolved tree transitively); never hand-rolled.
