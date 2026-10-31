@@ -6,6 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- `tokio-tungstenite` 0.26 -> 0.30, which brings `tungstenite` 0.26 -> 0.30.
+  No call site changed. What each minor did that could have reached this code:
+  0.27 caps reads at `read_buffer_size` (large-message throughput) and makes
+  `Hash` consistent for `Utf8Bytes`; 0.28 shrinks `Error` from 136 to 32 bytes
+  by boxing the `Http` / `WriteBufferFull` / `InvalidHeader` / `TlsError`
+  internals, and adds `WebSocket::into_inner()`; 0.29 accepts non-visible-ASCII
+  header values; 0.30 rejects server-side clients whose `Sec-WebSocket-Key` is
+  malformed and moves `rand`/`sha1` forward. The `Error` boxing is invisible
+  here because no variant is matched by name. The one behaviour that does
+  reach this code is 0.30's stricter handshake on the `accept_async` paths.
+- `base64` 0.22 -> 0.23. Additive for the `general_purpose::STANDARD`
+  encode/decode calls used here: `STANDARD` is still the scalar
+  `GeneralPurpose` engine, and the new SIMD engines are separate opt-in types
+  (`Simd`/`Avx2`/`Neon`) behind the default-on `simd-unsafe` feature that this
+  crate never names, so no SIMD path is taken. 0.23 also collapses the
+  duplicate `base64` in the tree: `0.22.1` (direct) and `0.23.1` (via
+  `hyper-util`) become one `0.23.1`. The only observable message change is that
+  `DecodeError::InvalidLastSymbol` now carries the decoded value, which is
+  formatted into the screenshot-decode error text.
+- `reqwest` 0.12 -> 0.13. Upstream removed the `rustls-tls` feature and its
+  bundled webpki-roots; the surviving rustls features are `rustls` and
+  `rustls-no-provider`, both of which pin `rustls-platform-verifier`. So the
+  crypto provider moves from ring to aws-lc-rs, and TLS trust moves from the
+  bundled webpki-roots to the OS certificate store. `https://` and `wss://`
+  attach endpoints now both trust whatever the host trusts, including locally
+  installed roots: `tokio-tungstenite` moved from `rustls-tls-webpki-roots` to
+  `rustls-tls-native-roots` in the same commit, because a webpki-roots feature
+  no longer exists on the `reqwest` side and the binary must not verify HTTP and
+  WS against two different stores. `webpki-roots` leaves the dependency graph;
+  `rustls-native-certs` joins it.
+
 ## [0.5.1] - 2026-10-28
 
 ### Fixed
