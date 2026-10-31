@@ -13,6 +13,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `derive-release.mjs --check` ships 21 fixture cases covering the major/minor/patch hops, the 0.x rule, every refusal, the forward-only write, the changelog close (twice), a rerun at a released tag and a hand-cut tag checked against the derivation.
 - The GitHub Release body is now the changelog section the run closed (`dist/release-notes.md`) instead of boilerplate.
 - A `v*` tag push no longer defines the version: it is checked against the derivation, so a hand-cut tag is accepted only when it names the version the history implies.
+
+### Changed
+
+- `reqwest` 0.12 -> 0.13. Upstream removed the `rustls-tls` feature; the
+  equivalent is `rustls`, which also changes two things that are not visible at
+  the call sites: the crypto provider moves from ring to aws-lc-rs, and the
+  trust store moves from the bundled webpki-roots to `rustls-platform-verifier`
+  (the OS certificate store). `https://` / `wss://` attach endpoints now trust
+  whatever the host trusts, including locally installed roots.
+
 ## [0.6.2] - 2026-11-01
 
 ### Fixed
