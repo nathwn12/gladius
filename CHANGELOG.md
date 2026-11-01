@@ -39,9 +39,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   bundled webpki-roots; the surviving rustls features are `rustls` and
   `rustls-no-provider`, both of which pin `rustls-platform-verifier`. So the
   crypto provider moves from ring to aws-lc-rs, and TLS trust moves from the
-  bundled webpki-roots to the OS certificate store. `https://` and `wss://`
-  attach endpoints now both trust whatever the host trusts, including locally
-  installed roots: `tokio-tungstenite` moved from `rustls-tls-webpki-roots` to
+  bundled webpki-roots to the host certificate store: the bundled roots are gone
+  from both transports. `https://` attach endpoints verify through
+  `rustls-platform-verifier`, `wss://` through `rustls-native-certs`; both read
+  the host store, but they share the store and not the verifier, so acceptance
+  can differ at the edges - `rustls-platform-verifier` applies OS distrust
+  decisions that `rustls-native-certs` does not, and `rustls-native-certs`
+  honours `SSL_CERT_FILE` / `SSL_CERT_DIR` on the WS side.
+  `tokio-tungstenite` moved from `rustls-tls-webpki-roots` to
   `rustls-tls-native-roots` in the same commit, because a webpki-roots feature
   no longer exists on the `reqwest` side and the binary must not verify HTTP and
   WS against two different stores. `webpki-roots` leaves the dependency graph;
