@@ -185,9 +185,11 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 ### Read the page
 
 #### `snapshot`
-- **Args:** `mode?: "ax" | "legacy" | "text"` (default `ax`), `frame?: string` (CDP frameId)
-- **Returns:** the real Accessibility tree, one line per actionable node with a stable ref (`@e1`, `@e2`, ...), role/name/value, plus page text capped at 8000 chars. Hidden and `aria-hidden` subtrees are excluded; `legacy` keeps the old DOM heuristic, `text` is text-only. `frame` scopes it to that iframe.
-- **Example:** `{}`
+- **Args:** `mode?: "ax" | "legacy" | "text"` (default `ax`), `frame?: string` (CDP frameId), `offset?: number` (line index, default `0`), `snapshotId?: string` (from the previous reply)
+- **Returns:** the real Accessibility tree, one line per actionable node with a stable ref (`@e1`, `@e2`, ...), role/name/value, plus page text capped at 8000 chars per page. Hidden and `aria-hidden` subtrees are excluded; `legacy` keeps the old DOM heuristic, `text` is text-only. `frame` scopes it to that iframe.
+- **Paging:** when the render exceeds 8000 chars the reply carries `snapshotId`, `totalLines` and `nextOffset`; call again with that `offset` (and the same `snapshotId`/`mode`) to read the next page. Pages are slices of one cached render, so refs stay valid across pages - a ref from page 2 acts exactly like a ref from page 1. `nextOffset` is `null` on the last page.
+- **Refs:** refs are backend node ids, not page attributes. No `data-gladius-ref` is written into your page, and a ref inside an open shadow root is actionable by `click`/`type`/`hover`/`select`/`upload`.
+- **Example:** `{}` then `{"offset": 120, "snapshotId": "s7"}`
 
 #### `evaluate`
 - **Args:** `expression: string`, `target?: string` (CDP targetId), `frame?: string` (CDP frameId)
@@ -218,7 +220,7 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 
 #### `type`
 - **Args:** `element: string`, `text: string`, `submit?: bool`, `frame?: string`
-- **Returns:** `{ "ok": true }` after focus, select-all and a trusted `Input.insertText`; the seed is replaced, not appended. File/date-like and non-editable targets are a typed `not_editable`.
+- **Returns:** `{ "ok": true, "valueLength": N }` after focus, select-all and a trusted `Input.insertText`; the seed is replaced, not appended. `valueLength` is the field's real length after the insert (never its value); when it differs from the typed text's UTF-16 length the reply adds a `note` (a `maxlength`, `pattern`, or an input handler transformed it) - the call still succeeds. File/date-like and non-editable targets are a typed `not_editable`.
 - **Example:** `{"element": "#q", "text": "gladius", "submit": true}`
 
 #### `hover`
@@ -262,12 +264,12 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 
 #### `screenshot`
 - **Args:** `fullPage?: bool`, `path?: string` (absolute only), `deterministic?: bool` (default `false`), `width?: number`, `height?: number` (only with `deterministic`)
-- **Returns:** an `image` content part with base64 PNG, plus `viewport`, `deviceScaleFactor`, `url`, `bytes` and a FNV-1a `checksum`. `deterministic: true` fixes metrics, forces `prefers-reduced-motion`, freezes animation/transition/caret/scrollbars, waits for fonts and images, and restores everything afterwards - two captures of the same page are provably identical. Refuses with `capability_gated` under `dom-only`.
+- **Returns:** an `image` content part with base64 PNG, plus `size` (the PNG's real pixel width/height, parsed from its IHDR chunk - on `fullPage` this is taller than `viewport` by construction), `viewport`, `deviceScaleFactor`, `url`, `bytes` and a FNV-1a `checksum`. `deterministic: true` fixes metrics, forces `prefers-reduced-motion`, freezes animation/transition/caret/scrollbars, waits for fonts and images, and restores everything afterwards - two captures of the same page are provably identical. Refuses with `capability_gated` under `dom-only`.
 - **Example:** `{"deterministic": true, "fullPage": true}`
 
 #### `visual`
-- **Args:** `action: "save" | "compare" | "list" | "delete"`, `name?: string`, `fullPage?: bool`, `threshold?: number` (per-channel, default `0.1`), `maxDiffPixels?: number`, `maxDiffRatio?: number`, `maskRects?: {x,y,w,h}[]`, `update?: bool`, `antialias?: bool` (default `true`), `includeAA?: bool` (default `false`), `minDiffCluster?: number` (default `2`), `requireEnvironmentMatch?: bool`
-- **Returns:** `save` writes `<name>.png` plus a `<name>.meta.json` sidecar (browser, browserMajor, viewport, deviceScaleFactor, url, checksum, createdAt). `compare` returns `{ pass, diffPixels, totalPixels, ratio, bbox, maxChannelDelta, ignoredPixels, ignoredClusters, baselinePath, diffPath, scratchBackground, environment { match, baseline, current } }`. A browser-major, viewport or deviceScaleFactor mismatch is a `baseline_environment_mismatch` warning unless `requireEnvironmentMatch: true`. Anti-aliasing is ignored mechanically: a candidate is suppressed only when its 3x3 luminance neighbourhood has at least 32 levels of contrast in **both** images.
+- **Args:** `action: "save" | "compare" | "list" | "delete"`, `name?: string`, `fullPage?: bool`, `threshold?: number` (per-channel, default `0.1`), `maxDiffPixels?: number`, `maxDiffRatio?: number`, `maskRects?: {x,y,w,h}[]`, `update?: bool`, `antialias?: bool` (default `true`), `includeAA?: bool` (default `false`), `allowIgnoredAA?: bool` (default `true`), `minDiffCluster?: number` (default `2`), `requireEnvironmentMatch?: bool`
+- **Returns:** `save` writes `<name>.png` plus a `<name>.meta.json` sidecar (browser, browserMajor, viewport, deviceScaleFactor, url, checksum, createdAt). `compare` returns `{ pass, diffPixels, totalPixels, ratio, bbox, maxChannelDelta, ignoredPixels, ignoredClusters, baselinePath, diffPath, scratchBackground, environment { match, baseline, current } }`. A browser-major, viewport or deviceScaleFactor mismatch is a `baseline_environment_mismatch` warning unless `requireEnvironmentMatch: true`. Anti-aliasing is ignored mechanically: a candidate is suppressed only when its 3x3 luminance neighbourhood has at least 32 levels of contrast in **both** images. Whenever `ignoredPixels > 0` the reply carries a `warning` naming the subtraction; `allowIgnoredAA: false` additionally makes `pass` require `ignoredPixels == 0` (so a 1-2 px edge change cannot pass silently).
 - **Example:** `{"action": "compare", "name": "home", "maxDiffRatio": 0.001}`
 
 ### State
@@ -295,7 +297,7 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 | `version mismatch: launcher X, engine Y` | A stale runtime cache paired with a newer launcher. | Run `--doctor` to see the skew, then reinstall at `@latest` the way the README's Install section shows. |
 | Provisioning refuses and writes nothing | A download hash or size did not match the pinned manifest. | Delete the versioned cache folder named by `--doctor` and retry; if it repeats, the network path is rewriting bytes. |
 | First tool call takes seconds | The browser is provisioning or spawning. | Expected once. `--doctor` shows the resolved paths without downloading. |
-| `stale_ref` | The `@eN` ref came from an older `snapshot`, or points into a hidden subtree. | Re-run `snapshot` and use the new ref. Acting on a shadow-DOM ref is not supported yet. |
+| `stale_ref` | The `@eN` ref came from an older `snapshot`, the node was removed, or the page navigated. | Re-run `snapshot` and use the new ref. Shadow-DOM refs are supported. |
 | `not_actionable` | The target is covered by another element or never became clickable. | Close the overlay, scroll it into view, or assert with `assert_layout` first. |
 | `not_editable` | `type` hit a file/date-like or non-editable node. | Use `upload` for file inputs; use `evaluate` for exotic editors. |
 | `capability_gated` / `dom_only` on `screenshot` or `visual` | `GLADIUS_BACKEND_CAPS=dom-only` is set. | Unset it to get the `render` pipeline back. |

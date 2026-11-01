@@ -36,7 +36,7 @@ Your first real tool call provisions the pinned server runtime and the pinned br
 | Group | Tools | What it does for you |
 |---|---|---|
 | Navigate and manage the session | `navigate`, `history`, `tabs`, `targets`, `viewport`, `dialog`, `close` | Opens URLs, walks back/forward/reload, lists and switches tabs and CDP targets, sets viewport metrics, handles JS dialogs, shuts the browser down. |
-| Read the page | `snapshot`, `evaluate`, `console`, `network`, `fetch_text` | Real Accessibility tree with stable `@eN` refs, JS evaluation, buffered console and network logs, and plain-text HTTP fetches with no browser at all. |
+| Read the page | `snapshot`, `evaluate`, `console`, `network`, `fetch_text` | Real Accessibility tree with stable `@eN` refs, pageable past the 8000-char cap (`offset`/`nextOffset`), shadow-DOM refs actionable, JS evaluation, buffered console and network logs, and plain-text HTTP fetches with no browser at all. |
 | Act on the page | `click`, `type`, `hover`, `select`, `key`, `upload` | Trusted CDP pointer and text input (`isTrusted:true`) after scroll and hit-test, keyboard combos, `<select>` choices, file uploads, all optionally scoped into an iframe. |
 | Wait and prove layout | `wait_for`, `assert_layout`, `layout` | Waits on a selector, text, network idle or JS predicate; proves geometry without pixels (`exists`, `visible`, `box`, `hitTarget`, `computed`, `noOverflow`, `inViewport`); reports boxes, scroll sizes and overlaps. |
 | Pixels | `screenshot`, `visual` | Deterministic screenshots with a content checksum, and stored visual baselines that diff inside the engine and pass or fail on a real threshold. |
