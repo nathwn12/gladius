@@ -1028,7 +1028,7 @@ async fn guard_ref(
     Ok(format!("@{id}"))
 }
 
-fn stale_gone(tool: &str, element: &str, id: &str) -> ToolErr {
+pub(crate) fn stale_gone(tool: &str, element: &str, id: &str) -> ToolErr {
     let _ = element;
     ToolErr::typed(
         format!("stale ref: {tool}: ref @{id} is stale (node gone; take a fresh snapshot)"),
@@ -1040,7 +1040,9 @@ fn stale_gone(tool: &str, element: &str, id: &str) -> ToolErr {
 /// `Ok(None)` means the ref came from the explicit legacy path (no backend
 /// id recorded), so the caller keeps its selector resolver. A backend id the
 /// DOM no longer knows is a typed node-gone, never a wrong-element action.
-async fn resolve_ref_object(
+/// Shared by every ref consumer - the action tools and the geometry tools -
+/// so one resolver decides what a ref means.
+pub(crate) async fn resolve_ref_object(
     browser: &Browser,
     tool: &str,
     id: &str,
@@ -1076,7 +1078,7 @@ async fn resolve_ref_object(
 
 /// Call `func` ON the resolved element (`this` is the element) and return the
 /// by-value result. The same function body runs for light DOM and shadow DOM.
-async fn call_on_object(
+pub(crate) async fn call_on_object(
     browser: &Browser,
     object_id: &str,
     func: &str,

@@ -533,3 +533,88 @@ fn type_reports_truncated_length() {
     );
     finish(c);
 }
+
+/// A ref `snapshot` returned must mean the same node in the geometry tools as
+/// it does in every action tool. `assert_layout` judges the element the ref
+/// names - not an empty match - and a ref whose node was removed is the same
+/// typed `stale_ref`/node-gone `click` reports, never a silent `exists:false`.
+/// Fails on the bytes that moved refs to node identity but left the geometry
+/// tools on the dropped `data-gladius-ref` attribute lookup.
+#[test]
+fn assert_layout_by_ref_is_live_and_typed_stale() {
+    let mut c = launch_on_fixture();
+    let snap = content_text(&c.call("snapshot", json!({})));
+    let r = find_ref(&snap, "CLICK_ME");
+
+    // Live ref: the invariant holds and the node is found BY the ref.
+    let by_ref = c.call(
+        "assert_layout",
+        json!({"ref": r, "checks": {"exists": true, "visible": true}}),
+    );
+    assert!(!is_error(&by_ref), "assert_layout by live ref: {by_ref}");
+    let rep: Value =
+        serde_json::from_str(&content_text(&by_ref)).expect("assert_layout reply is JSON");
+    assert_eq!(
+        rep.get("pass"),
+        Some(&json!(true)),
+        "assert_layout by live ref must pass: {rep}"
+    );
+    let checks = rep
+        .get("checks")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let exists = checks
+        .iter()
+        .find(|k| k.get("check").and_then(|v| v.as_str()) == Some("exists"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        exists.get("actual"),
+        Some(&json!(true)),
+        "the ref resolved to a live node: {rep}"
+    );
+
+    // Same element, same geometry: the ref path and the selector path agree.
+    let ref_layout = c.call("layout", json!({"ref": r, "includeOverlaps": false}));
+    assert!(!is_error(&ref_layout), "layout by ref: {ref_layout}");
+    let sel_layout = c.call("layout", json!({"selector": "#toggle"}));
+    assert!(!is_error(&sel_layout), "layout by selector: {sel_layout}");
+    let rl: Value = serde_json::from_str(&content_text(&ref_layout)).expect("layout JSON");
+    let sl: Value = serde_json::from_str(&content_text(&sel_layout)).expect("layout JSON");
+    let one = |v: &Value, key: &str| -> Value {
+        let els = v
+            .get("elements")
+            .and_then(|e| e.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(els.len(), 1, "exactly one element for {key}: {v}");
+        els[0].get(key).cloned().unwrap_or(Value::Null)
+    };
+    assert_eq!(
+        one(&rl, "rect"),
+        one(&sl, "rect"),
+        "the ref measures the same element the selector does: {rl} vs {sl}"
+    );
+    assert_eq!(
+        one(&rl, "box"),
+        one(&sl, "box"),
+        "same engine box on both targets: {rl} vs {sl}"
+    );
+
+    // Removed node: typed stale on BOTH geometry tools.
+    c.call(
+        "evaluate",
+        json!({"expression": "document.getElementById('toggle').remove(); 'removed'"}),
+    );
+    for tool in ["assert_layout", "layout"] {
+        let gone = c.call(tool, json!({"ref": r}));
+        assert!(is_error(&gone), "{tool} on a removed ref isError: {gone}");
+        let m = content_text(&gone);
+        assert!(
+            m.contains("stale ref") && m.contains("node gone"),
+            "{tool} typed node-gone, got: {m}"
+        );
+    }
+    finish(c);
+}

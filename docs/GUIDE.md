@@ -188,7 +188,7 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 - **Args:** `mode?: "ax" | "legacy" | "text"` (default `ax`), `frame?: string` (CDP frameId), `offset?: number` (line index, default `0`), `snapshotId?: string` (from the previous reply)
 - **Returns:** the real Accessibility tree, one line per actionable node with a stable ref (`@e1`, `@e2`, ...), role/name/value, plus page text capped at 8000 chars per page. Hidden and `aria-hidden` subtrees are excluded; `legacy` keeps the old DOM heuristic, `text` is text-only. `frame` scopes it to that iframe.
 - **Paging:** when the render exceeds 8000 chars the reply carries `snapshotId`, `totalLines` and `nextOffset`; call again with that `offset` (and the same `snapshotId`/`mode`) to read the next page. Pages are slices of one cached render, so refs stay valid across pages - a ref from page 2 acts exactly like a ref from page 1. `nextOffset` is `null` on the last page.
-- **Refs:** refs are backend node ids, not page attributes. No `data-gladius-ref` is written into your page, and a ref inside an open shadow root is actionable by `click`/`type`/`hover`/`select`/`upload`.
+- **Refs:** refs are backend node ids, not page attributes. No `data-gladius-ref` is written into your page, and a ref inside an open shadow root is actionable by `click`/`type`/`hover`/`select`/`upload`. `layout`/`assert_layout` measure the same element a ref names, and a ref whose node was removed is a typed `stale_ref` on every one of them.
 - **Example:** `{}` then `{"offset": 120, "snapshotId": "s7"}`
 
 #### `evaluate`

@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-01
+
+### Fixed
+
+- `assert_layout` and `layout` resolve a ref (`@eN`) through the same node identity every action tool uses (`DOM.resolveNode` + `Runtime.callFunctionOn`) instead of the `data-gladius-ref` attribute lookup the default AX snapshot no longer stamps. `assert_layout {ref:"@eN"}` reported `exists:false` for a live ref while `assert-ref-found` passed; it now measures the element the ref names, and a removed node is the same typed `stale_ref`/`node_gone` `click` returns. The attribute lookup survives only for refs issued by `snapshot {mode:"legacy"}`, which still stamps the page.
+- `tests/refs.rs` now exercises `assert_layout`/`layout` by ref (live element, and a removed one), which the unit suites did not cover while the end-to-end selftest did.
+
 ## [0.6.0] - 2026-11-01
 
 ### Added
