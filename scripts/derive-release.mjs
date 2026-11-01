@@ -10,6 +10,15 @@
 // changelog are checked against it, and the tag is created from it at the end
 // of the publish job (see .github/workflows/release.yml).
 //
+// MANIFESTS ARE ASSERTED, NEVER WRITTEN. This script reads Cargo.toml,
+// Cargo.lock, npm/package.json and npm/engine-manifest.json and refuses unless
+// every one of them ALREADY carries the derived version, so the release either
+// matches its history or stops in seconds. The release lane never repairs a
+// version: a tree that disagrees with its own commits is a defect to land in
+// that commit range, not a number for CI to guess. The only files written here
+// are CHANGELOG.md and the release-notes body, in --changelog mode, after the
+// gate is green.
+//
 // LEVEL
 //   major  a commit with `!` before the `:` in its subject, or a
 //          `BREAKING CHANGE:` / `BREAKING-CHANGE:` trailer in its body
@@ -20,12 +29,8 @@
 //   On 0.x a major hop moves the MINOR, so 0.6.2 + breaking -> 0.7.0.
 //
 // MODES
-//   (default)          derive + validate, then write the version into
-//                      Cargo.toml, Cargo.lock, npm/package.json and
-//                      npm/engine-manifest.json. The release run is the only
-//                      writer of the version; the workflow step named
-//                      "assert versions" only compares and never repairs.
-//   --dry-run          derive + validate, print the derivation, write nothing.
+//   (default)          derive + validate, print the derivation, write nothing.
+//   --dry-run          same, spelled out, and said so in the output.
 //   --json             derive + validate, print machine JSON, write nothing.
 //   --changelog        derive + validate, then close `## [Unreleased]` into
 //                      `## [X.Y.Z] - <UTC date>`. Idempotent: a second run
@@ -37,7 +42,7 @@
 //
 // No dependencies beyond Node stdlib and git.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -241,7 +246,7 @@ function readManifestVersions(root) {
     refuse("bad-manifest", `${FILES.pkg} has no X.Y.Z version`);
   }
   return {
-    texts: { cargo: cargoText, lock: lockText, pkg: pkgText },
+    pkgText,
     versions: {
       cargo: cargoVersion,
       lock: lockVersion,
@@ -252,7 +257,11 @@ function readManifestVersions(root) {
   };
 }
 
-function checkManifests(versions, derived) {
+// Every manifest must ALREADY name the derived version. There is no repair
+// path on purpose: the release run is not the writer of the version, so a
+// disagreement is a tree defect that fails the run before it builds or tags
+// anything.
+function checkManifests(versions, manifest, pkgText, derived) {
   const rows = [["Cargo.toml", versions.cargo], ["npm/package.json", versions.pkg], ["npm/engine-manifest.json", versions.man]];
   const disagree = rows.filter(([, v]) => v !== versions.cargo);
   if (disagree.length) {
@@ -269,13 +278,38 @@ function checkManifests(versions, derived) {
         "a --locked build would fail (or ship a stale version)",
     );
   }
-  // The run produces the version; a committed version AHEAD of it has no
-  // history behind it (a hand edit), which is the mismatch this refuses.
-  if (versions.cargo !== derived && cmpSemver(versions.cargo, derived) > 0) {
+  if (versions.cargo !== derived) {
     refuse(
       "version-mismatch",
-      `derived ${derived} != committed manifest version ${versions.cargo}` +
-        " (Cargo.toml, npm/package.json, npm/engine-manifest.json agree): the tree is ahead of its history",
+      `history derives ${derived} but the committed manifests say ${versions.cargo} ` +
+        `(${FILES.cargo}, ${FILES.pkg}, ${FILES.man} agree): land the version bump in the same ` +
+        "commit range as the change it releases; this lane asserts the version, it never writes it",
+    );
+  }
+  // The launcher resolves the archive from runtime.source/archive.name, so a
+  // bumped serverVersion with a stale URL fails the publish assert instead of
+  // shipping a release that 404s on first run. Catch it here, at derive time.
+  const source = manifest?.runtime?.source ?? "";
+  const archive = manifest?.runtime?.archive?.name ?? "";
+  if (!source.endsWith(`/v${derived}`) || !archive.includes(`v${derived}`)) {
+    refuse(
+      "manifest-paths",
+      `${FILES.man} runtime.source/archive do not name v${derived}:\n` +
+        `  runtime.source: ${source || "(missing)"}\n` +
+        `  runtime.archive.name: ${archive || "(missing)"}`,
+    );
+  }
+  // package.json carries the version twice: `version` and the npx hint inside
+  // the global-install-refusal preinstall guard. A stale hint tells the user to
+  // install a version that no longer exists, so it is asserted too.
+  const stale = [...pkgText.matchAll(/gladius-mcp@(\d+\.\d+\.\d+)/g)]
+    .map((m) => m[1])
+    .filter((v) => v !== derived);
+  if (stale.length) {
+    refuse(
+      "pkg-hint-drift",
+      `${FILES.pkg} tells the user to install gladius-mcp@${stale.join(", gladius-mcp@")} ` +
+        `but the history derives ${derived}; this lane asserts the version, it never writes it`,
     );
   }
 }
@@ -329,58 +363,6 @@ function closeChangelog(text, version, date) {
   return { changed: true, reason: `closed ## [Unreleased] into ## [${version}] - ${date}`, text: lines.join("\n"), parsed };
 }
 
-// ---------------------------------------------------------------- writers
-
-function applyVersion(root, files, derived) {
-  const written = [];
-
-  const cargoNext = files.texts.cargo.replace(/^version\s*=\s*"([^"]+)"/m, `version = "${derived}"`);
-  if (cargoNext !== files.texts.cargo) {
-    writeFileSync(join(root, FILES.cargo), cargoNext);
-    written.push(FILES.cargo);
-  }
-
-  if (files.versions.lock !== null) {
-    const lockNext = files.texts.lock.replace(/(name = "gladius"\r?\nversion = ")[^"]+(")/, `$1${derived}$2`);
-    if (lockNext !== files.texts.lock) {
-      writeFileSync(join(root, FILES.lock), lockNext);
-      written.push(`${FILES.lock} (crate stanza)`);
-    }
-  }
-
-  // package.json carries the version twice: `version` and the npx hint inside
-  // the global-install-refusal preinstall guard. A stale hint there tells the
-  // user to install a version that no longer exists.
-  const pkgNext = files.texts.pkg
-    .replace(/("version":\s*")[^"]+(")/, `$1${derived}$2`)
-    .replace(/gladius-mcp@\d+\.\d+\.\d+/g, `gladius-mcp@${derived}`);
-  if (pkgNext !== files.texts.pkg) {
-    writeFileSync(join(root, FILES.pkg), pkgNext);
-    written.push(FILES.pkg);
-  }
-
-  const man = files.manifest;
-  const manNext = JSON.parse(JSON.stringify(man));
-  manNext.serverVersion = derived;
-  if (manNext.runtime) {
-    manNext.runtime.source = `${REPO_URL}/releases/download/v${derived}`;
-    if (manNext.runtime.archive) {
-      manNext.runtime.archive.name = `gladius-v${derived}-windows-x86_64.zip`;
-    }
-  }
-  const before = readFileSync(join(root, FILES.man), "utf8");
-  // Preserve the committed file's own shape: 2-space indent, and a trailing
-  // newline only if it had one, so an apply that changes one version prints a
-  // one-line diff instead of reformatting the integrity root.
-  const manText = `${JSON.stringify(manNext, null, 2)}${before.endsWith("\n") ? "\n" : ""}`;
-  if (manText !== before) {
-    writeFileSync(join(root, FILES.man), manText);
-    written.push(FILES.man);
-  }
-
-  return written;
-}
-
 // ------------------------------------------------------------------ derive
 
 function deriveAll(opts = {}) {
@@ -414,7 +396,6 @@ function deriveAll(opts = {}) {
         unreleasedEntries: parsed.entries.length,
         alreadyClosed: parsed.has(version),
       },
-      files,
     };
   }
 
@@ -446,7 +427,7 @@ function deriveAll(opts = {}) {
         "the tag is produced from the derivation, never the other way round",
     );
   }
-  checkManifests(files.versions, derived);
+  checkManifests(files.versions, files.manifest, files.pkgText, derived);
 
   const changelogText = readFileSync(join(root, FILES.changelog), "utf8");
   const parsed = parseChangelog(changelogText);
@@ -481,7 +462,6 @@ function deriveAll(opts = {}) {
       unreleasedEntries: parsed.entries.length,
       alreadyClosed,
     },
-    files,
   };
 }
 
@@ -518,52 +498,75 @@ function report(result) {
 
 // ------------------------------------------------------------------ --check
 
-const CHECK_FILES = {
-  "Cargo.toml": (v) => `[package]\nname = "gladius"\nversion = "${v}"\nedition = "2021"\n`,
-  "Cargo.lock": (v) => `version = 4\n\n[[package]]\nname = "gladius"\nversion = "${v}"\ndependencies = []\n`,
-  "npm/package.json": (v) => JSON.stringify({
+const CHECK_CHANGELOG = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- something real.\n";
+
+function fixtureCargo(v) {
+  return `[package]\nname = "gladius"\nversion = "${v}"\nedition = "2021"\n`;
+}
+
+function fixtureLock(v) {
+  return `version = 4\n\n[[package]]\nname = "gladius"\nversion = "${v}"\ndependencies = []\n`;
+}
+
+// package.json carries the version twice: `version` and the npx hint inside the
+// global-install-refusal preinstall guard. `hintAt` lets one fixture leave the
+// hint behind while the version field moves, which is the drift asserted below.
+function fixturePkg(v, hintAt = v) {
+  const hint = `gladius-mcp: global install refused - use npx gladius-mcp@${hintAt}`;
+  return JSON.stringify({
     name: "gladius-mcp",
     version: v,
-    scripts: { preinstall: `node -e "console.error('use npx gladius-mcp@${v}')"` },
-  }, null, 2) + "\n",
-  "npm/engine-manifest.json": (v) => JSON.stringify({
+    scripts: { preinstall: `node -e "console.error('${hint}')"` },
+  }, null, 2) + "\n";
+}
+
+function fixtureManifest(v, pathVersion = v) {
+  return JSON.stringify({
     package: "gladius-mcp",
     serverVersion: v,
     runtime: {
-      source: `${REPO_URL}/releases/download/v${v}`,
-      archive: { name: `gladius-v${v}-windows-x86_64.zip`, sha256: "RELEASE_WORKFLOW_FILLS_THIS", size: 0 },
+      source: `${REPO_URL}/releases/download/v${pathVersion}`,
+      archive: { name: `gladius-v${pathVersion}-windows-x86_64.zip`, sha256: "RELEASE_WORKFLOW_FILLS_THIS", size: 0 },
     },
-  }, null, 2) + "\n",
-  "CHANGELOG.md": () => "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- something real.\n",
-};
+  }, null, 2) + "\n";
+}
 
-function makeFixture(version, commits, { unreleased = true, changelogExtra = "" } = {}) {
+function writeFixtureManifests(dir, version, { pathVersion = version, hintAt = version } = {}) {
+  const write = (rel, text) => {
+    const p = join(dir, rel);
+    mkdirSync(dirname(p), { recursive: true });
+    writeFileSync(p, text);
+  };
+  write(FILES.cargo, fixtureCargo(version));
+  write(FILES.lock, fixtureLock(version));
+  write(FILES.pkg, fixturePkg(version, hintAt));
+  write(FILES.man, fixtureManifest(version, pathVersion));
+}
+
+// A fixture repo: manifests at <manifestAt> (landed as a `chore:` commit, so the
+// bump itself carries no release hop — the shape the lane now demands), a base
+// tag at <base>, then the commits under test. `pathVersion` and `hintAt` leave
+// one version-bearing field behind on purpose.
+function makeFixture({ base, manifestAt = base, commits = [], changelog = CHECK_CHANGELOG, pathVersion = null, hintAt = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "derive-release-"));
-  const run = (args) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+  const run = (args) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   run(["init", "-q"]);
   run(["config", "user.email", "fixture@localhost"]);
   run(["config", "user.name", "fixture"]);
   run(["config", "commit.gpgsign", "false"]);
   run(["config", "tag.gpgsign", "false"]);
   run(["config", "core.autocrlf", "false"]);
-  for (const [rel, make] of Object.entries(CHECK_FILES)) {
-    const p = join(dir, rel);
-    mkdirSync(dirname(p), { recursive: true });
-    writeFileSync(p, rel === "CHANGELOG.md" ? CHECK_FILES[rel]() : make(version));
-  }
+  writeFixtureManifests(dir, base, { pathVersion: pathVersion ?? base, hintAt: hintAt ?? base });
+  writeFileSync(join(dir, FILES.changelog), changelog);
   run(["add", "-A"]);
   run(["commit", "-q", "-m", "chore: fixture base"]);
-  run(["tag", `v${version}`]);
-  if (!unreleased) {
-    const p = join(dir, "CHANGELOG.md");
-    writeFileSync(p, readFileSync(p, "utf8").replace(/- something real\.\n/, ""));
+  run(["tag", `v${base}`]);
+  if (manifestAt !== base) {
+    writeFixtureManifests(dir, manifestAt, { pathVersion: pathVersion ?? manifestAt, hintAt: hintAt ?? manifestAt });
+    run(["add", "-A"]);
+    run(["commit", "-q", "-m", `chore: bump manifests to ${manifestAt}`]);
   }
-  if (changelogExtra) {
-    writeFileSync(join(dir, "CHANGELOG.md"), changelogExtra);
-  }
-  let n = 0;
   for (const c of commits) {
-    n += 1;
     run(["commit", "-q", "--allow-empty", "-m", c.subject, ...(c.body ? ["-m", c.body] : [])]);
   }
   return dir;
@@ -578,10 +581,14 @@ function tryDerive(root) {
   }
 }
 
-function applyFixtureVersion(root) {
-  const result = deriveAll({ root });
-  applyVersion(root, result.files, result.version);
-  return { result, versions: readManifestVersions(root).versions };
+// The consumer's own path: the release lane runs the script, not deriveAll.
+// Exit status and stderr are what the workflow sees, so the refusal cases run
+// this too.
+function runCli(dir, args = []) {
+  const got = spawnSync(process.execPath, [fileURLToPath(import.meta.url), "--repo", dir, ...args], {
+    encoding: "utf8",
+  });
+  return { status: got.status, stdout: got.stdout ?? "", stderr: got.stderr ?? "" };
 }
 
 function runCheck() {
@@ -589,16 +596,26 @@ function runCheck() {
   const record = (name, ok, detail) => rows.push([name, ok ? "PASS" : "FAIL", detail]);
   const fixtures = [];
 
-  const expect = (name, version, commits, want, opts) => {
-    const dir = makeFixture(version, commits, opts);
+  // want.version implies the manifests must already carry it, which is the
+  // lane's contract: derive AND assert in one call.
+  const expect = (name, base, commits, want, opts = {}) => {
+    const dir = makeFixture({
+      base,
+      commits,
+      ...opts,
+      manifestAt: opts.manifestAt ?? want.version ?? base,
+    });
     fixtures.push(dir);
     const got = tryDerive(dir);
+    const brief = (r) => (r.ok ? `${r.result.version} (${r.result.level})` : `${r.code}: ${r.message.split("\n")[0]}`);
     if (want.code) {
       const ok = !got.ok && got.code === want.code;
-      record(name, ok, ok ? `refused ${want.code}` : `wanted refusal ${want.code}, got ${got.ok ? got.result.version : got.code}`);
+      record(name, ok, ok ? `refused ${want.code}` : `wanted refusal ${want.code}, got ${brief(got)}`);
     } else {
       const ok = got.ok && got.result.version === want.version && got.result.level === want.level;
-      record(name, ok, ok ? `${want.version} (${want.level})` : `wanted ${want.version} (${want.level}), got ${got.ok ? `${got.result.version} (${got.result.level})` : got.code}`);
+      record(name, ok, ok
+        ? `${want.version} (${want.level})`
+        : `wanted ${want.version} (${want.level}), got ${brief(got)}`);
     }
     return { dir, got };
   };
@@ -614,9 +631,9 @@ function runCheck() {
     // A real empty range: the base tag sits on an ancestor and HEAD is only a
     // merge, so `--no-merges base..HEAD` yields nothing to derive from.
     {
-      const dir = makeFixture("1.0.0", [{ subject: "docs: release note" }]);
+      const dir = makeFixture({ base: "1.0.0", commits: [{ subject: "docs: release note" }] });
       fixtures.push(dir);
-      const run = (args, input) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", input });
+      const run = (args, input) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", input, stdio: ["pipe", "pipe", "pipe"] });
       run(["tag", "-f", "v1.0.0", "HEAD"]);
       const tree = run(["rev-parse", "HEAD^{tree}"]).trim();
       const parent = run(["rev-parse", "HEAD~1"]).trim();
@@ -629,11 +646,60 @@ function runCheck() {
     expect("refuse-only-chore", "1.0.0", [{ subject: "chore: deps" }, { subject: "docs: readme" }], { code: "no-release-type" });
     expect("refuse-non-conventional", "1.0.0", [{ subject: "Fixed the thing" }], { code: "non-conventional" });
     expect("refuse-unknown-type", "1.0.0", [{ subject: "wip: half a feature" }], { code: "non-conventional" });
-    expect("refuse-empty-unreleased", "1.0.0", [{ subject: "feat: thing" }], { code: "changelog-empty" }, { unreleased: false });
+
+    // THE CONTRACT: the lane asserts the version, it never writes it. A tree
+    // whose manifests were not bumped alongside its commits is refused, not
+    // repaired — this is the exact case the deleted writer used to paper over.
+    // Run through the CLI because exit status and stderr are what the release
+    // workflow consumes.
+    {
+      const dir = makeFixture({ base: "1.0.0", manifestAt: "1.0.0", commits: [{ subject: "feat: thing" }] });
+      fixtures.push(dir);
+      const got = runCli(dir, ["--dry-run"]);
+      const line = got.stderr.split("\n").find((l) => l.startsWith("refuse: version-mismatch:")) ?? "";
+      const ok = got.status === 1
+        && line.includes("history derives 1.1.0 but the committed manifests say 1.0.0")
+        && line.includes("this lane asserts the version, it never writes it");
+      record("refuse-manifest-not-bumped", ok, ok
+        ? "exit 1, version-mismatch on stderr"
+        : `exit ${got.status}, stderr: ${line || got.stderr.trim().split("\n")[0] || "(empty)"}`);
+      record("refuse-manifest-not-bumped-bytes", !readFileSync(join(dir, "Cargo.toml"), "utf8").includes("1.1.0"),
+        "the refused run left Cargo.toml at 1.0.0");
+    }
+
+    // An accepted tree is still not touched: derive + assert writes nothing, so
+    // the working tree is byte-identical and git reports it clean.
+    {
+      const dir = makeFixture({ base: "1.0.0", manifestAt: "1.1.0", commits: [{ subject: "feat: thing" }] });
+      fixtures.push(dir);
+      const got = runCli(dir);
+      const dirty = execFileSync("git", ["-C", dir, "status", "--porcelain"], { encoding: "utf8" }).trim();
+      const ok = got.status === 0 && dirty === "" && got.stdout.includes("manifests    asserted at 1.1.0, nothing written");
+      record("assert-writes-nothing", ok, ok ? "exit 0, tree clean, manifests asserted" : `exit ${got.status}, dirty: ${dirty || "(clean but output wrong)"}`);
+    }
+
+    // The writer cannot come back unnoticed: no manifest path may be written by
+    // this script, and the writer function must be gone.
+    {
+      const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
+      const manifestWrite = /writeFileSync\([^)]*FILES\.(cargo|lock|pkg|man)\b/.test(src);
+      const writerFn = /\bfunction applyVersion\b/.test(src);
+      const ok = !manifestWrite && !writerFn;
+      record("no-manifest-writer", ok, ok ? "no writeFileSync on a manifest, no applyVersion" : `manifestWrite=${manifestWrite} applyVersion=${writerFn}`);
+    }
+
+    // Empty `## [Unreleased]` refuses...
+    {
+      const dir = makeFixture({ base: "1.0.0", manifestAt: "1.1.0", commits: [{ subject: "feat: thing" }], changelog: "# Changelog\n\n## [Unreleased]\n" });
+      fixtures.push(dir);
+      const got = tryDerive(dir);
+      const ok = !got.ok && got.code === "changelog-empty";
+      record("refuse-empty-unreleased", ok, ok ? "refused changelog-empty" : `got ${got.ok ? got.result.version : got.code}`);
+    }
 
     // Idempotent changelog close: second run over the closed section is a no-op.
     {
-      const dir = makeFixture("1.0.0", [{ subject: "feat: thing" }]);
+      const dir = makeFixture({ base: "1.0.0", manifestAt: "1.1.0", commits: [{ subject: "feat: thing" }] });
       fixtures.push(dir);
       const text = readFileSync(join(dir, "CHANGELOG.md"), "utf8");
       const first = closeChangelog(text, "1.1.0", "2026-11-02");
@@ -646,25 +712,11 @@ function runCheck() {
       record("changelog-closed-still-derives", ok2, ok2 ? "1.1.0 derivable with the section already closed" : `got ${derivedAgain.ok ? derivedAgain.result.version : derivedAgain.code}`);
     }
 
-    // Forward write: manifests move to the derived version, lock included.
-    {
-      const dir = makeFixture("1.0.0", [{ subject: "feat: thing" }]);
-      fixtures.push(dir);
-      const { result, versions } = applyFixtureVersion(dir);
-      const ok = versions.cargo === "1.1.0" && versions.lock === "1.1.0" && versions.pkg === "1.1.0" && versions.man === "1.1.0"
-        && readFileSync(join(dir, "npm/package.json"), "utf8").includes("gladius-mcp@1.1.0");
-      record("apply-writes-every-manifest", ok, ok ? "cargo/lock/pkg/manifest + npx hint = 1.1.0" : `wanted 1.1.0 everywhere, got ${JSON.stringify(versions)}`);
-      record("apply-derives-forward-only", result.version === "1.1.0", result.version);
-    }
-
     // Refuse a committed version ahead of the derivation (a hand edit).
     {
-      const dir = makeFixture("1.0.0", [{ subject: "fix: small" }]);
+      const dir = makeFixture({ base: "1.0.0", commits: [{ subject: "fix: small" }] });
       fixtures.push(dir);
-      writeFileSync(join(dir, "Cargo.toml"), `[package]\nname = "gladius"\nversion = "1.9.0"\n`);
-      writeFileSync(join(dir, "npm/package.json"), JSON.stringify({ name: "gladius-mcp", version: "1.9.0" }, null, 2) + "\n");
-      writeFileSync(join(dir, "npm/engine-manifest.json"), JSON.stringify({ serverVersion: "1.9.0", runtime: {} }, null, 2) + "\n");
-      writeFileSync(join(dir, "Cargo.lock"), `[[package]]\nname = "gladius"\nversion = "1.9.0"\n`);
+      writeFixtureManifests(dir, "1.9.0");
       const got = tryDerive(dir);
       const ok = !got.ok && got.code === "version-mismatch";
       record("refuse-tree-ahead-of-history", ok, ok ? "refused version-mismatch" : `got ${got.ok ? got.result.version : got.code}`);
@@ -672,36 +724,71 @@ function runCheck() {
 
     // Refuse manifests that disagree with each other.
     {
-      const dir = makeFixture("1.0.0", [{ subject: "fix: small" }]);
+      const dir = makeFixture({ base: "1.0.0", manifestAt: "1.0.1", commits: [{ subject: "fix: small" }] });
       fixtures.push(dir);
-      writeFileSync(join(dir, "npm/package.json"), JSON.stringify({ name: "gladius-mcp", version: "1.0.9" }, null, 2) + "\n");
+      writeFileSync(join(dir, "npm/package.json"), fixturePkg("1.0.9"));
       const got = tryDerive(dir);
       const ok = !got.ok && got.code === "manifests-disagree";
       record("refuse-manifests-disagree", ok, ok ? "refused manifests-disagree" : `got ${got.ok ? got.result.version : got.code}`);
     }
 
+    // Refuse a Cargo.lock left behind (a --locked build ships a stale version).
+    {
+      const dir = makeFixture({ base: "1.0.0", manifestAt: "1.0.1", commits: [{ subject: "fix: small" }] });
+      fixtures.push(dir);
+      writeFileSync(join(dir, "Cargo.lock"), fixtureLock("1.0.0"));
+      const got = tryDerive(dir);
+      const ok = !got.ok && got.code === "lock-drift";
+      record("refuse-lock-drift", ok, ok ? "refused lock-drift" : `got ${got.ok ? got.result.version : got.code}`);
+    }
+
+    // Refuse a manifest whose runtime paths still name the old tag: the
+    // launcher would 404 on first run of the new release.
+    {
+      const dir = makeFixture({ base: "1.0.0", manifestAt: "1.0.1", pathVersion: "1.0.0", commits: [{ subject: "fix: small" }] });
+      fixtures.push(dir);
+      const got = tryDerive(dir);
+      const ok = !got.ok && got.code === "manifest-paths";
+      record("refuse-manifest-path-drift", ok, ok ? "refused manifest-paths" : `got ${got.ok ? got.result.version : got.code}`);
+    }
+
+    // Refuse an npx hint left at the old version: it is the string a user
+    // copies out of the install refusal.
+    {
+      const dir = makeFixture({ base: "1.0.0", manifestAt: "1.0.1", hintAt: "1.0.0", commits: [{ subject: "fix: small" }] });
+      fixtures.push(dir);
+      const got = tryDerive(dir);
+      const ok = !got.ok && got.code === "pkg-hint-drift";
+      record("refuse-pkg-hint-drift", ok, ok ? "refused pkg-hint-drift" : `got ${got.ok ? got.result.version : got.code}`);
+    }
+
     // A tag sitting on HEAD reruns as its own version instead of deriving anew.
     {
-      const dir = makeFixture("1.0.0", []);
+      const dir = makeFixture({ base: "1.0.0", commits: [] });
       fixtures.push(dir);
       const got = tryDerive(dir);
       const ok = got.ok && got.result.alreadyReleased && got.result.version === "1.0.0" && got.result.level === "none";
       record("rerun-at-released-tag", ok, ok ? "HEAD tag 1.0.0 resolved" : `got ${got.ok ? `${got.result.version}/${got.result.level}` : got.code}`);
     }
 
-    // A hand-cut tag is checked against the derivation: accepted when it names
-    // the derived version, refused when it claims another one.
+    // A hand-cut tag at HEAD is a claim, and it is checked against the
+    // derivation: one naming another version is refused, and so is one that
+    // names the derivation while the tree behind it was never bumped.
     {
-      const dir = makeFixture("1.0.0", [{ subject: "feat: thing" }]);
+      const dir = makeFixture({ base: "1.0.0", manifestAt: "1.1.0", commits: [{ subject: "feat: thing" }] });
       fixtures.push(dir);
-      execFileSync("git", ["-C", dir, "tag", "v1.1.0"], { encoding: "utf8" });
+      execFileSync("git", ["-C", dir, "tag", "v1.4.0"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
       const got = tryDerive(dir);
-      const ok = got.ok && got.result.version === "1.1.0" && !got.result.alreadyReleased;
-      record("hand-cut-tag-agrees", ok, ok ? "tag v1.1.0 names the derived 1.1.0" : `got ${got.ok ? got.result.version : got.code}`);
-      execFileSync("git", ["-C", dir, "tag", "-f", "v1.4.0"], { encoding: "utf8" });
-      const bad = tryDerive(dir);
-      const ok2 = !bad.ok && bad.code === "tag-mismatch";
-      record("refuse-hand-cut-tag-mismatch", ok2, ok2 ? "refused tag-mismatch" : `got ${bad.ok ? bad.result.version : bad.code}`);
+      const ok = !got.ok && got.code === "tag-mismatch";
+      record("refuse-hand-cut-tag-mismatch", ok, ok ? "refused tag-mismatch" : `got ${got.ok ? got.result.version : got.code}`);
+    }
+    {
+      const dir = makeFixture({ base: "1.0.0", commits: [{ subject: "feat: thing" }] });
+      fixtures.push(dir);
+      execFileSync("git", ["-C", dir, "tag", "v1.1.0"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      const got = tryDerive(dir);
+      const ok = !got.ok && got.code === "version-mismatch";
+      record("refuse-tag-ahead-of-manifests", ok, ok ? "refused version-mismatch" : `got ${got.ok ? got.result.version : got.code}`);
     }
   } finally {
     for (const dir of fixtures) {
@@ -723,7 +810,7 @@ function main(argv) {
   const has = (f) => argv.includes(f);
   if (has("--check")) return runCheck();
   if (has("--help") || has("-h")) {
-    console.log(readFileSync(fileURLToPath(import.meta.url), "utf8").split("\n").slice(1, 40).join("\n"));
+    console.log(readFileSync(fileURLToPath(import.meta.url), "utf8").split("\n").slice(1, 45).join("\n"));
     return 0;
   }
 
@@ -797,13 +884,13 @@ function main(argv) {
       writeFileSync(resolve(notesOut), `${section}\n`);
       console.log(`  notes        ${notesOut}`);
     }
-    if (has("--changelog")) return 0;
+    return 0;
   }
 
-  const written = applyVersion(root, result.files, result.version);
-  console.log(written.length
-    ? `  written      ${written.join(", ")} = ${result.version}`
-    : `  written      nothing (already at ${result.version})`);
+  // Default mode writes nothing at all: deriveAll already refused unless every
+  // committed manifest carries the derived version, so there is nothing left to
+  // repair here. Saying so keeps the log honest about the lane's contract.
+  console.log(`  manifests    asserted at ${result.version}, nothing written`);
   return 0;
 }
 

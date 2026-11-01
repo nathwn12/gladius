@@ -28,9 +28,11 @@ granular token), and locally npm >= 11.5.1 with Node >= 22.14.0
 
 2. Dispatch the `release` workflow for the commit (`dry_run: true` rehearses).
    Nothing is typed: the run derives the version from the commits since the
-   last `vX.Y.Z` tag (`scripts/derive-release.mjs`), writes it into the
-   manifests before the build, and creates the tag itself after the gate.
-   The workflow builds the
+   last `vX.Y.Z` tag (`scripts/derive-release.mjs`) and REFUSES unless the
+   committed manifests already carry it — the lane asserts the version, it
+   never writes one — then builds, and creates the tag itself after the gate.
+   The version bump therefore lands in the same commit range as the change it
+   releases. The workflow builds the
    crate with the MSRV toolchain, runs the suite against the provisioned
    pinned browser, assembles the server-only runtime bundle (no browser
    bytes), fills `engine-manifest.json` with hashes computed from the REAL
@@ -87,13 +89,17 @@ granular token), and locally npm >= 11.5.1 with Node >= 22.14.0
 
 The run derives `X.Y.Z` from the commits since the last `vX.Y.Z` tag
 (`scripts/derive-release.mjs`: breaking -> major, `feat` -> minor, `fix`/`perf`
--> patch, and on 0.x a major hop moves the minor) and writes it into
+-> patch, and on 0.x a major hop moves the minor) and then asserts that
 `Cargo.toml`, `Cargo.lock`, `npm/package.json` and `npm/engine-manifest.json`
-before the build; `runtime.source`/`runtime.archive` names are filled from it
-too, together with the hashes computed from the real artifacts. `## [Unreleased]`
-in `CHANGELOG.md` must carry the entry, and the run closes it after the gate.
-The workflow fails closed on any mismatch, and a hand-cut `v*` tag is accepted
-only when it names the derived version.
+ALREADY carry it, together with `runtime.source`/`runtime.archive` naming
+`vX.Y.Z` and the npx hint in the `preinstall` guard naming the same version.
+There is no writer: a tree whose manifests were not bumped with its commits is
+refused before the build (`version-mismatch: history derives X but the committed
+manifests say Y … this lane asserts the version, it never writes it`), not
+repaired. Only the hashes are filled by the run, from the real artifacts.
+`## [Unreleased]` in `CHANGELOG.md` must carry the entry, and the run closes it
+after the gate. The workflow fails closed on any mismatch, and a hand-cut `v*`
+tag is accepted only when it names the derived version.
 The manifest's `browser` pin must equal `scripts/chromium-manifest.json`'s
 (the workflow asserts deep equality plus the `fetch-chromium.ps1` constants
 and the provisioned bytes); a browser bump also refreshes the version named
@@ -121,3 +127,21 @@ zero `RELEASE_WORKFLOW_FILLS_THIS` placeholders (pass
 `--allow-placeholders` on a dev tree where the workflow has not filled
 hashes yet), and no `.exe`, `.env`, `*secret*`, or `node_modules` in the
 tarball. It prints a PASS/FAIL table and exits non-zero on any failure.
+
+Two more local gates, both dependency-free and both run by the release lane
+itself:
+
+- `node scripts/derive-release.mjs --check` — the derivation and every refusal
+  as fixture repos, including the one that matters here: a tree whose commits
+  outran the manifests is refused with exit 1 and
+  `refuse: version-mismatch: … this lane asserts the version, it never writes
+  it`, and the refused run leaves the manifests byte-identical.
+- `node scripts/check-release-workflow.mjs` — the ordering invariants of
+  `.github/workflows/release.yml` (derive before any version assert, no step
+  that writes a version, changelog closed after the gates, tag created in the
+  publish job immediately before the release is attached).
+
+Before dispatching a release, bump the version in `Cargo.toml`,
+`Cargo.lock`, `npm/package.json` and `npm/engine-manifest.json` in the same
+commit range as the change: the run will not do it for you, and refuses
+instead.
