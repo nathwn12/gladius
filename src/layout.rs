@@ -31,9 +31,12 @@ pub enum Spec {
 }
 
 impl Spec {
-    fn selector(&self) -> String {
+    /// The selector used by the DOM lookup. Only a ref the snapshot issued
+    /// through the explicit `mode:"legacy"` path (which stamps the page) has
+    /// no backend id and reaches this lookup; an AX ref resolves by node
+    /// identity instead - the same resolver the action tools use.
+    fn legacy_selector(&self) -> String {
         match self {
-            // The ref attribute the snapshot stamps on every node it names.
             Spec::Ref(id) => format!("[data-gladius-ref=\"{id}\"]"),
             Spec::Selector(s) => s.clone(),
         }
@@ -47,13 +50,19 @@ impl Spec {
     }
 }
 
-/// A resolved DOM node: which target label it answers to, the selector that
-/// found it, its position in that selector's match list, and its node id.
+/// A resolved DOM node: which target label it answers to, the spec it belongs
+/// to (`key`, also the grouping key), its frontend node id for
+/// `DOM.getBoxModel`, and - for a ref resolved by node identity - the live JS
+/// object the in-page facts are read from. A node resolved through a selector
+/// (or a legacy ref) carries `object_id: None` and is measured by
+/// `querySelectorAll(selector)[index]`.
 struct Node {
     label: String,
+    key: String,
     selector: String,
     index: usize,
     node_id: i64,
+    object_id: Option<String>,
 }
 
 /// A box in CSS px. `doc` uses the engine's page coordinates,
@@ -141,13 +150,44 @@ async fn root_node(browser: &Browser) -> Result<i64, ToolErr> {
         })
 }
 
-/// Resolve every spec to its matching nodes (document order). An invalid
-/// selector is a typed `invalid_args`/`bad_value`, never a silent miss.
+/// Resolve every spec to its matching nodes. A ref resolves through the
+/// node identity `snapshot` recorded (backend id -> `DOM.resolveNode` ->
+/// `Runtime.callFunctionOn`), exactly like `click`/`type`/`hover`/`select`/
+/// `upload`: the default AX path never stamps `data-gladius-ref` into the
+/// page, so an attribute lookup here would find nothing. A node the DOM no
+/// longer knows is a typed `stale_ref`/`node_gone`, never a silent
+/// `exists:false`. An invalid selector is a typed `invalid_args`/`bad_value`.
 async fn resolve(browser: &Browser, tool: &str, specs: &[Spec]) -> Result<Vec<Node>, ToolErr> {
     let root = root_node(browser).await?;
     let mut out: Vec<Node> = Vec::new();
     for spec in specs {
-        let selector = spec.selector();
+        if let Spec::Ref(id) = spec {
+            if let Some(object_id) = crate::tools::resolve_ref_object(browser, tool, id).await? {
+                // A removed node keeps a detached JS wrapper, so resolving the
+                // object does not prove the ref still names a node in the
+                // document. Liveness is the same `isConnected` test the action
+                // preflights run, so a stale ref is typed here too.
+                let live = crate::tools::call_on_object(browser, &object_id, LIVE_FN, vec![])
+                    .await?
+                    .as_bool()
+                    .unwrap_or(false);
+                if !live {
+                    return Err(crate::tools::stale_gone(tool, "", id));
+                }
+                let backend = browser.ref_backend(id).await.unwrap_or(0);
+                let node_id = frontend_node(browser, tool, id, backend).await?;
+                out.push(Node {
+                    label: spec.label(),
+                    key: spec.label(),
+                    selector: String::new(),
+                    index: 0,
+                    node_id,
+                    object_id: Some(object_id),
+                });
+                continue;
+            }
+        }
+        let selector = spec.legacy_selector();
         let r = browser
             .command(
                 "DOM.querySelectorAll",
@@ -175,13 +215,51 @@ async fn resolve(browser: &Browser, tool: &str, specs: &[Spec]) -> Result<Vec<No
                 } else {
                     spec.label()
                 },
+                key: spec.label(),
                 selector: selector.clone(),
                 index: i,
                 node_id: id,
+                object_id: None,
             });
         }
     }
     Ok(out)
+}
+
+/// `isConnected`: the action tools' own liveness test for a resolved ref. A
+/// removed node keeps a detached JS wrapper, so `DOM.resolveNode` alone would
+/// still answer for it.
+const LIVE_FN: &str = "function() { return !!(this && this.isConnected); }";
+
+/// Frontend node id for a backend id the snapshot recorded, so the geometry
+/// primitives (`DOM.getBoxModel` / `DOM.getContentQuads`) measure the exact
+/// node the ref names - including one inside an open shadow root, which a
+/// document-level `querySelectorAll` cannot reach. A backend id the page has
+/// dropped (removed node) is a typed `stale_ref`/`node_gone`.
+async fn frontend_node(
+    browser: &Browser,
+    tool: &str,
+    id: &str,
+    backend: i64,
+) -> Result<i64, ToolErr> {
+    let pushed = browser
+        .command(
+            "DOM.pushNodesByBackendIdsToFrontend",
+            json!({"backendNodeIds": [backend]}),
+            true,
+        )
+        .await
+        .map_err(|e| ToolErr::fallback(format!("{tool}: ref @{id}: {e}")))?;
+    let node_id = pushed
+        .get("nodeIds")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if node_id == 0 {
+        return Err(crate::tools::stale_gone(tool, "", id));
+    }
+    Ok(node_id)
 }
 
 /// Border box from `DOM.getBoxModel` (page coordinates) plus the content quad
@@ -232,14 +310,12 @@ async fn element_info(
     node: &Node,
     computed_keys: &[String],
 ) -> Result<Option<Value>, ToolErr> {
-    let sel =
-        serde_json::to_string(&node.selector).map_err(|e| ToolErr::fallback(e.to_string()))?;
     let keys =
         serde_json::to_string(computed_keys).map_err(|e| ToolErr::fallback(e.to_string()))?;
-    let idx = node.index;
-    let expr = format!(
-        r#"(() => {{
-  const el = document.querySelectorAll({sel})[{idx}];
+    let v = run_on_node(browser, node, |el| {
+        format!(
+            r#"function() {{
+  const el = {el};
   if (!el) return null;
   const cs = getComputedStyle(el);
   const r = el.getBoundingClientRect();
@@ -249,7 +325,10 @@ async fn element_info(
     extra[k] = cs.getPropertyValue(kebab) || '';
   }}
   let hit = null;
-  try {{ hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2); }} catch (e) {{ hit = null; }}
+  try {{
+    const root = el.getRootNode ? el.getRootNode() : document;
+    hit = (root.elementFromPoint || document.elementFromPoint).call(root, r.x + r.width / 2, r.y + r.height / 2);
+  }} catch (e) {{ hit = null; }}
   return {{
     rect: {{x: r.x, y: r.y, w: r.width, h: r.height}},
     scroll: {{width: el.scrollWidth, height: el.scrollHeight,
@@ -264,26 +343,48 @@ async fn element_info(
     viewport: {{width: window.innerWidth, height: window.innerHeight,
                 scrollX: window.scrollX, scrollY: window.scrollY}}
   }};
-}})()"#
-    );
-    let v = browser.eval(&expr).await.map_err(ToolErr::from)?;
+}}"#
+        )
+    })
+    .await?;
     if v.is_null() {
         return Ok(None);
     }
     Ok(Some(v))
 }
 
+/// Run one measurement body against the node. A ref resolved by node identity
+/// runs as `Runtime.callFunctionOn` with the element as `this` (so a node
+/// inside an open shadow root is measured directly); a selector or legacy-ref
+/// match is looked up in the page by `querySelectorAll(selector)[index]`.
+async fn run_on_node<F>(browser: &Browser, node: &Node, body: F) -> Result<Value, ToolErr>
+where
+    F: Fn(&str) -> String,
+{
+    match &node.object_id {
+        Some(oid) => crate::tools::call_on_object(browser, oid, &body("this"), vec![]).await,
+        None => {
+            let sel = serde_json::to_string(&node.selector)
+                .map_err(|e| ToolErr::fallback(e.to_string()))?;
+            let binding = format!("document.querySelectorAll({sel})[{}]", node.index);
+            let f = body(&binding);
+            browser
+                .eval(&format!("({f})()"))
+                .await
+                .map_err(ToolErr::from)
+        }
+    }
+}
+
 /// Sample the element's viewport rect once per animation frame, `frames`
 /// times. Each wait is raced against a timer so a background/shadowed page
 /// that starves rAF still returns a sample set instead of hanging.
 async fn stable_sample(browser: &Browser, node: &Node, frames: i64) -> Result<Vec<Rect>, ToolErr> {
-    let sel =
-        serde_json::to_string(&node.selector).map_err(|e| ToolErr::fallback(e.to_string()))?;
-    let idx = node.index;
     let n = frames.clamp(1, 60);
-    let expr = format!(
-        r#"(() => {{
-  const el = document.querySelectorAll({sel})[{idx}];
+    let v = run_on_node(browser, node, |el| {
+        format!(
+            r#"function() {{
+  const el = {el};
   if (!el) return null;
   const out = [];
   const tick = () => Promise.race([
@@ -298,9 +399,10 @@ async fn stable_sample(browser: &Browser, node: &Node, frames: i64) -> Result<Ve
     }}
     return out;
   }})();
-}})()"#
-    );
-    let v = browser.eval(&expr).await.map_err(ToolErr::from)?;
+}}"#
+        )
+    })
+    .await?;
     let arr = v.as_array().cloned().unwrap_or_default();
     let mut out = Vec::with_capacity(arr.len());
     for q in arr {
@@ -465,11 +567,11 @@ pub async fn assert_layout(
     }
     let mut order: Vec<Slot> = Vec::new();
     for spec in specs {
-        let sel = spec.selector();
+        let key = spec.label();
         let found: Vec<usize> = nodes
             .iter()
             .enumerate()
-            .filter(|(_, n)| n.selector == sel)
+            .filter(|(_, n)| n.key == key)
             .map(|(i, _)| i)
             .collect();
         if found.is_empty() {
