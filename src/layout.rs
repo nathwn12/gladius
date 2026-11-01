@@ -802,17 +802,18 @@ pub async fn layout(
     let nodes = resolve(browser, "layout", specs).await?;
     let mut elements: Vec<Value> = Vec::new();
     let mut rects: Vec<(String, Rect, bool)> = Vec::new();
-    // The viewport is reported even when nothing matched: the schema promises
-    // an object, and "no elements" still has a viewport. Read once, up front,
-    // and use it for the scroll offsets.
+    // The viewport size is reported even when nothing matched: the schema
+    // promises an object, and "no elements" still has a viewport. Scroll is
+    // read PER ELEMENT below - a page that scrolls between measurements must
+    // not mix a stale offset into one box and a fresh one into the next.
     let viewport = match browser
-        .eval("[window.innerWidth, window.innerHeight, window.scrollX, window.scrollY]")
+        .eval("[window.innerWidth, window.innerHeight]")
         .await
     {
         Ok(v) => {
             let a = v.as_array().cloned().unwrap_or_default();
             let g = |i: usize| a.get(i).and_then(|x| x.as_f64()).unwrap_or(0.0);
-            json!({"width": g(0), "height": g(1), "scrollX": g(2), "scrollY": g(3)})
+            json!({"width": g(0), "height": g(1)})
         }
         Err(e) => return Err(ToolErr::from(e)),
     };
@@ -820,8 +821,16 @@ pub async fn layout(
         let info = element_info(browser, node, &[]).await?;
         let geom = box_geom(browser, node.node_id).await?;
         let Some(info) = info else { continue };
-        let scroll_x = num(&viewport, "scrollX").unwrap_or(0.0);
-        let scroll_y = num(&viewport, "scrollY").unwrap_or(0.0);
+        let (scroll_x, scroll_y) = match browser.eval("[window.scrollX, window.scrollY]").await {
+            Ok(v) => {
+                let a = v.as_array().cloned().unwrap_or_default();
+                (
+                    a.first().and_then(|x| x.as_f64()).unwrap_or(0.0),
+                    a.get(1).and_then(|x| x.as_f64()).unwrap_or(0.0),
+                )
+            }
+            Err(e) => return Err(ToolErr::from(e)),
+        };
         let js_rect = info.get("rect").and_then(rect_of).unwrap_or(Rect {
             x: 0.0,
             y: 0.0,

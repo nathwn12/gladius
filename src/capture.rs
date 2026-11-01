@@ -117,6 +117,10 @@ pub struct Capture {
     pub checksum: String,
     pub width: i64,
     pub height: i64,
+    /// Real PNG pixel dimensions from the IHDR chunk (device pixels); these
+    /// differ from `width`/`height` on a full-page capture by construction.
+    pub png_width: i64,
+    pub png_height: i64,
     pub dsf: f64,
     pub url: String,
     pub deterministic: bool,
@@ -133,6 +137,10 @@ impl Capture {
         let mut m = serde_json::Map::new();
         m.insert("mimeType".to_string(), json!("image/png"));
         m.insert("bytes".to_string(), json!(self.bytes.len() as i64));
+        m.insert(
+            "size".to_string(),
+            json!({"width": self.png_width, "height": self.png_height}),
+        );
         if self.deterministic {
             m.insert("deterministic".to_string(), json!(true));
             m.insert(
@@ -327,17 +335,32 @@ fn decode(r: &Value, deterministic: bool) -> Result<Capture, String> {
         .decode(data.as_bytes())
         .map_err(|e| format!("screenshot: capture payload is not valid base64: {e}"))?;
     let sum = checksum(&bytes);
+    let (png_width, png_height) = png_size(&bytes).unwrap_or((0, 0));
     Ok(Capture {
         base64: data.to_string(),
         bytes,
         checksum: sum,
         width: 0,
         height: 0,
+        png_width,
+        png_height,
         dsf: 1.0,
         url: String::new(),
         deterministic,
         reduced_motion_emulated: false,
     })
+}
+
+/// Real PNG pixel size from the IHDR chunk: signature (8) + length (4) +
+/// type (4) puts width/height at bytes 16..24, big-endian. No dependency.
+fn png_size(bytes: &[u8]) -> Option<(i64, i64)> {
+    const SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if bytes.len() < 24 || bytes[..8] != SIG || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?) as i64;
+    let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?) as i64;
+    Some((w, h))
 }
 
 /// Replay the prior device-metrics override (or clear it when there was
@@ -533,4 +556,24 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
         .unwrap_or("")
         .to_string();
     Ok(cap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::png_size;
+
+    /// IHDR width/height are big-endian at bytes 16..24; the viewport fields
+    /// alone cannot tell a full-page capture's real pixel size.
+    #[test]
+    fn png_size_reads_ihdr_big_endian() {
+        let mut png = vec![
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, // signature
+            0, 0, 0, 13, // IHDR length
+            b'I', b'H', b'D', b'R', // chunk type
+        ];
+        png.extend_from_slice(&640u32.to_be_bytes());
+        png.extend_from_slice(&480u32.to_be_bytes());
+        assert_eq!(png_size(&png), Some((640, 480)));
+        assert_eq!(png_size(b"not a png"), None);
+    }
 }

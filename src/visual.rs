@@ -478,6 +478,9 @@ pub struct DiffOpts {
     pub antialias: bool,
     pub min_diff_cluster: i64,
     pub require_environment_match: bool,
+    /// When false, a compare passes only if NO anti-aliased component was
+    /// subtracted (`ignored_pixels == 0`).
+    pub allow_ignored_aa: bool,
 }
 
 impl Default for DiffOpts {
@@ -492,6 +495,7 @@ impl Default for DiffOpts {
             antialias: true,
             min_diff_cluster: 2,
             require_environment_match: false,
+            allow_ignored_aa: true,
         }
     }
 }
@@ -939,6 +943,24 @@ pub async fn png_diff(
 
 /// Diff the current deterministic capture against the stored baseline, and
 /// check the recorded environment.
+/// True when the AA subtraction may still count as a pass. With
+/// `allow_ignored_aa:false` the caller demands a zero-ignored diff, which is
+/// the only way to catch a 1-2 px edge change the AA rule subtracts.
+fn aa_tolerated(ignored_pixels: i64, allow_ignored_aa: bool) -> bool {
+    allow_ignored_aa || ignored_pixels == 0
+}
+
+/// Warning text whenever the AA rule subtracted pixels: a pass is never
+/// silently explained away.
+fn aa_warning(ignored_pixels: i64, ignored_clusters: i64) -> Option<String> {
+    if ignored_pixels <= 0 {
+        return None;
+    }
+    Some(format!(
+        "ignored_antialiasing: {ignored_pixels} pixel(s) in {ignored_clusters} cluster(s) were subtracted as anti-aliasing; a 1-2 px edge change can hide there (set allowIgnoredAA:false to require a zero-ignored diff)"
+    ))
+}
+
 pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<Value, ToolErr> {
     let safe = sanitise_name(name).map_err(ToolErr::fallback)?;
     let base = baseline_path(&safe);
@@ -1051,7 +1073,16 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
             )),
         ),
     };
-    let pixel_pass = !diff.size_mismatch
+    let mut warning = warning;
+    if let Some(aa) = aa_warning(diff.ignored_pixels, diff.ignored_clusters) {
+        warning = match warning {
+            Value::Null => json!(aa),
+            Value::String(s) => json!(format!("{s}; {aa}")),
+            other => other,
+        };
+    }
+    let pixel_pass = aa_tolerated(diff.ignored_pixels, opts.allow_ignored_aa)
+        && !diff.size_mismatch
         && diff.diff_pixels <= opts.max_diff_pixels
         && ratio <= opts.max_diff_ratio;
     let pass = pixel_pass && (env_match || !opts.require_environment_match);
@@ -1103,6 +1134,19 @@ mod tests {
         // Leap day.
         assert_eq!(civil_from_days(59), (1970, 3, 1));
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+    }
+
+    /// A 1-2 px anti-aliased component can hide a real edge change, so
+    /// `allowIgnoredAA:false` requires a zero-ignored diff; the default keeps
+    /// the historic behaviour and a warning always names what was ignored.
+    #[test]
+    fn ignored_aa_can_be_made_a_pass_condition() {
+        assert!(aa_tolerated(0, false), "zero ignored is a clean pass");
+        assert!(!aa_tolerated(2, false), "allowIgnoredAA:false rejects 2 px");
+        assert!(aa_tolerated(2, true), "default still tolerates AA");
+        assert!(aa_warning(0, 0).is_none(), "no ignored pixels, no warning");
+        let w = aa_warning(2, 1).expect("warning names the subtraction");
+        assert!(w.contains("2 pixel(s)") && w.contains("allowIgnoredAA:false"));
     }
 
     /// The scratch target is ALWAYS requested in the background: there is no

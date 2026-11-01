@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-01
+
+### Added
+
+- `snapshot` now pages: `offset` (line index), `snapshotId`, `totalLines` and `nextOffset` (null on the last page). Pages slice one cached render at the unchanged 8000-char cap, so refs never move namespace and a ref from a later page acts like a first-page ref.
+- `type` reports `valueLength` (the real post-insert length, never the value) and adds a `note` when a `maxlength`, `pattern` or input handler transformed the text; the call still succeeds.
+- `screenshot` reports `size` - the PNG's real pixel width/height from its IHDR chunk - alongside the CSS `viewport`, so a `fullPage` capture's true pixel size is visible without decoding the image.
+- `visual compare` accepts `allowIgnoredAA` (default `true`); when `false`, `pass` additionally requires `ignoredPixels == 0`.
+- `visual compare` sets a `warning` whenever anti-aliased pixels were subtracted.
+
+### Changed
+
+- AX snapshot refs are stored as CDP backend node ids and resolved at action time with `DOM.resolveNode` + `Runtime.callFunctionOn`; the per-node `data-gladius-ref` stamp loop is gone and the page is no longer mutated by a snapshot. Refs inside open shadow roots are now actionable by `click`, `type`, `hover`, `select` and `upload`.
+- `snapshot`'s backend-id resolves are pipelined instead of one sequential CDP round trip per node.
+- A non-deterministic `screenshot` and an `assert_layout` without `screenshotOnFail` no longer take the global execution lock; only mutating captures do.
+- `layout` reads `scrollX`/`scrollY` per element so boxes measured around a scroll stay self-consistent.
+- `history.action` is now an enum (`back`/`forward`/`reload`) and `navigate.url` declares `format: "uri"`.
+
+### Fixed
+
+- `docs/GUIDE.md` no longer claims `wait_for` returns `ok:true` on timeout; it returns the typed `timeout` error.
+
 ## [0.5.1] - 2026-10-28
 
 ### Fixed

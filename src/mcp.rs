@@ -123,9 +123,19 @@ fn needs_exec_lock(name: &str, args: &Value) -> bool {
     match name {
         "navigate" | "click" | "type" | "select" | "upload" | "key" | "hover" | "viewport"
         | "tabs" | "history" | "cdp" | "evaluate" | "close" => true,
-        // Deterministic capture + on-failure capture mutate the page while
-        // they run (see the doc comment above).
-        "screenshot" | "assert_layout" => true,
+        // Only the deterministic capture mutates page-visible state (metrics
+        // override, emulated media, freeze stylesheet) and restores it; a
+        // plain screenshot is a read of the current surface and stays
+        // lock-free. `assert_layout` locks only when its screenshotOnFail
+        // capture runs.
+        "screenshot" => args
+            .get("deterministic")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        "assert_layout" => args
+            .get("screenshotOnFail")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         // `visual` writes baseline files and opens a scratch target for the
         // in-engine diff: serialise it with the mutating tools so a compare
         // cannot race another page action mid-capture.
@@ -178,8 +188,19 @@ const CANCEL_GRACE: Duration = Duration::from_secs(60);
 /// Tools whose call mutates page-visible state and restores it before
 /// returning: their future must not be dropped mid-section. Every one of them
 /// is also exec-locked (`needs_exec_lock`), asserted by `exec_lock_tests`.
-fn needs_critical_section(name: &str) -> bool {
-    matches!(name, "screenshot" | "assert_layout" | "visual")
+fn needs_critical_section(name: &str, args: &Value) -> bool {
+    match name {
+        "screenshot" => args
+            .get("deterministic")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        "assert_layout" => args
+            .get("screenshotOnFail")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        "visual" => true,
+        _ => false,
+    }
 }
 
 /// Abort `handle` only once its critical section has finished.
@@ -790,7 +811,7 @@ async fn dispatch_call(
     let tx_task = tx.clone();
     let registry_task = registry.clone();
     let lock_needed = needs_exec_lock(&name, &args);
-    let section_needed = needs_critical_section(&name);
+    let section_needed = needs_critical_section(&name, &args);
     let critical_task = critical.clone();
     let key_task = key.clone();
     let handle: JoinHandle<()> = tokio::spawn(async move {
@@ -1231,26 +1252,34 @@ mod exec_lock_tests {
     #[test]
     fn capture_tools_hold_the_execution_lock() {
         // The section gate only makes sense inside the execution lock.
-        for tool in ["screenshot", "assert_layout", "visual"] {
+        for (tool, args) in [
+            ("screenshot", json!({"deterministic": true})),
+            ("assert_layout", json!({"screenshotOnFail": true})),
+            ("visual", json!({})),
+        ] {
             assert!(
-                super::needs_critical_section(tool),
+                super::needs_critical_section(tool, &args),
                 "{tool} mutates and restores page state: it needs the section gate"
             );
-        }
-        for tool in ["navigate", "click", "snapshot", "layout"] {
             assert!(
-                !super::needs_critical_section(tool),
-                "{tool} restores nothing, so it must stay abortable"
-            );
-        }
-        for tool in ["screenshot", "assert_layout", "visual"] {
-            assert!(
-                needs_exec_lock(tool, &json!({})),
+                needs_exec_lock(tool, &args),
                 "{tool} mutates page-visible state during a capture and must hold the exec lock"
             );
-            // Same answer for the argument shapes that carry the capture.
-            assert!(needs_exec_lock(tool, &json!({"deterministic": true})));
-            assert!(needs_exec_lock(tool, &json!({"screenshotOnFail": true})));
+        }
+        // Plain reads of the current surface do not lock: a non-deterministic
+        // screenshot and an assert_layout without its capture are pure reads.
+        assert!(!needs_exec_lock("screenshot", &json!({})));
+        assert!(!needs_exec_lock(
+            "screenshot",
+            &json!({"deterministic": false})
+        ));
+        assert!(!needs_exec_lock("assert_layout", &json!({})));
+        assert!(!super::needs_critical_section("screenshot", &json!({})));
+        for tool in ["navigate", "click", "snapshot", "layout"] {
+            assert!(
+                !super::needs_critical_section(tool, &json!({})),
+                "{tool} restores nothing, so it must stay abortable"
+            );
         }
         // Pure reads stay lock-free so they keep overlapping.
         for tool in ["snapshot", "wait_for", "fetch_text", "console", "network"] {

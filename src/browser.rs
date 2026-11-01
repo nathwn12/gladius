@@ -395,12 +395,39 @@ async fn attach(raw: &str) -> Result<Inner, String> {
     })
 }
 
+/// One issued AX ref: the human label plus the CDP backend node id it was
+/// rendered from. The backend id is the identity used at action time
+/// (`DOM.resolveNode` + `Runtime.callFunctionOn`), so refs no longer depend
+/// on a `data-gladius-ref` attribute and shadow nodes resolve like light DOM.
+#[derive(Clone)]
+pub struct RefEntry {
+    pub label: String,
+    pub backend: Option<i64>,
+}
+
+/// The last rendered snapshot, kept so `snapshot {offset}` can page through
+/// the SAME render (identical refs) instead of re-rendering into fresh refs.
+#[derive(Clone)]
+pub struct SnapshotCache {
+    pub id: String,
+    pub mode: String,
+    pub frame: String,
+    pub lines: Vec<String>,
+    pub text: String,
+    pub url: String,
+    pub title: String,
+    pub nodes: Vec<Value>,
+    pub start: usize,
+}
+
 pub struct Browser {
     state: AsyncMutex<Option<Inner>>,
     pid: Mutex<Option<u32>>,
-    refs: AsyncMutex<HashMap<String, String>>,
+    refs: AsyncMutex<HashMap<String, RefEntry>>,
     snap_url: AsyncMutex<String>,
     ref_seq: std::sync::atomic::AtomicUsize,
+    snap_seq: std::sync::atomic::AtomicUsize,
+    snap_cache: AsyncMutex<Option<SnapshotCache>>,
     snapshot_lock: AsyncMutex<()>,
 }
 
@@ -412,19 +439,41 @@ impl Browser {
             refs: AsyncMutex::new(HashMap::new()),
             snap_url: AsyncMutex::new(String::new()),
             ref_seq: AtomicUsize::new(0),
+            snap_seq: std::sync::atomic::AtomicUsize::new(1),
+            snap_cache: AsyncMutex::new(None),
             snapshot_lock: AsyncMutex::new(()),
         }
     }
 
-    /// Store the ref table from the latest AX snapshot (ref `eN` -> label).
-    pub async fn store_refs(&self, url: String, refs: HashMap<String, String>) {
+    /// Store the ref table from the latest AX snapshot (`eN` -> entry).
+    pub async fn store_refs(&self, url: String, refs: HashMap<String, RefEntry>) {
         *self.refs.lock().await = refs;
         *self.snap_url.lock().await = url;
     }
 
     /// Label for a known ref id (`eN`), or None when the ref was never issued.
     pub async fn ref_label(&self, id: &str) -> Option<String> {
-        self.refs.lock().await.get(id).cloned()
+        self.refs.lock().await.get(id).map(|e| e.label.clone())
+    }
+
+    /// Backend node id for a known ref, when the snapshot recorded one.
+    pub async fn ref_backend(&self, id: &str) -> Option<i64> {
+        self.refs.lock().await.get(id).and_then(|e| e.backend)
+    }
+
+    /// Cache the render that `snapshot` just produced, for `offset` paging.
+    pub async fn store_snapshot(&self, cache: SnapshotCache) {
+        *self.snap_cache.lock().await = Some(cache);
+    }
+
+    /// The last rendered snapshot (None before the first render).
+    pub async fn cached_snapshot(&self) -> Option<SnapshotCache> {
+        self.snap_cache.lock().await.clone()
+    }
+
+    /// Fresh, monotonically increasing snapshot id (`s1`, `s2`, ...).
+    pub fn next_snapshot_id(&self) -> String {
+        format!("s{}", self.snap_seq.fetch_add(1, Ordering::SeqCst))
     }
 
     /// URL captured at the last AX snapshot (empty when none taken yet).
@@ -4002,6 +4051,8 @@ mod tests {
             refs: AsyncMutex::new(HashMap::new()),
             snap_url: AsyncMutex::new(String::new()),
             ref_seq: AtomicUsize::new(0),
+            snap_seq: AtomicUsize::new(1),
+            snap_cache: AsyncMutex::new(None),
             snapshot_lock: AsyncMutex::new(()),
         };
         TestRig {
@@ -4132,6 +4183,8 @@ mod tests {
             refs: AsyncMutex::new(HashMap::new()),
             snap_url: AsyncMutex::new(String::new()),
             ref_seq: AtomicUsize::new(0),
+            snap_seq: AtomicUsize::new(1),
+            snap_cache: AsyncMutex::new(None),
             snapshot_lock: AsyncMutex::new(()),
         };
         RecordingRig {
@@ -5172,6 +5225,8 @@ mod tests {
             refs: AsyncMutex::new(HashMap::new()),
             snap_url: AsyncMutex::new(String::new()),
             ref_seq: AtomicUsize::new(0),
+            snap_seq: AtomicUsize::new(1),
+            snap_cache: AsyncMutex::new(None),
             snapshot_lock: AsyncMutex::new(()),
         }
     }
