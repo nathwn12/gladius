@@ -35,22 +35,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `hyper-util`) become one `0.23.1`. The only observable message change is that
   `DecodeError::InvalidLastSymbol` now carries the decoded value, which is
   formatted into the screenshot-decode error text.
-- `reqwest` 0.12 -> 0.13. Upstream removed the `rustls-tls` feature and its
-  bundled webpki-roots; the surviving rustls features are `rustls` and
-  `rustls-no-provider`, both of which pin `rustls-platform-verifier`. So the
-  crypto provider moves from ring to aws-lc-rs, and TLS trust moves from the
-  bundled webpki-roots to the host certificate store: the bundled roots are gone
-  from both transports. `https://` attach endpoints verify through
-  `rustls-platform-verifier`, `wss://` through `rustls-native-certs`; both read
-  the host store, but they share the store and not the verifier, so acceptance
-  can differ at the edges - `rustls-platform-verifier` applies OS distrust
-  decisions that `rustls-native-certs` does not, and `rustls-native-certs`
-  honours `SSL_CERT_FILE` / `SSL_CERT_DIR` on the WS side.
-  `tokio-tungstenite` moved from `rustls-tls-webpki-roots` to
-  `rustls-tls-native-roots` in the same commit, because a webpki-roots feature
-  no longer exists on the `reqwest` side and the binary must not verify HTTP and
-  WS against two different stores. `webpki-roots` leaves the dependency graph;
-  `rustls-native-certs` joins it.
+- `reqwest` 0.12 -> 0.13. 0.13 no longer offers a bundled-roots rustls feature,
+  so the feature selection changed: `reqwest` selects `rustls`, and
+  `tokio-tungstenite` selects `rustls-tls-native-roots`. `webpki-roots` leaves
+  the dependency graph; `rustls-native-certs` joins it. The rustls crypto
+  provider moves from `ring` to `aws-lc-rs`.
 
 ## [0.6.2] - 2026-11-01
 
