@@ -7,14 +7,14 @@ pub fn list() -> Value {
     let mut listed = json!({"tools": [
         {"name": "navigate", "title": "Navigate",
          "description": "Navigate the active page to a URL",
-         "inputSchema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"], "additionalProperties": false},
+         "inputSchema": {"type": "object", "properties": {"url": {"type": "string", "format": "uri"}}, "required": ["url"], "additionalProperties": false},
          "outputSchema": {"type": "object",
             "properties": {"url": {"type": "string"}, "title": {"type": "string"}, "warning": {"type": "string"}},
             "required": ["url", "title"], "additionalProperties": false},
          "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}},
         {"name": "snapshot", "title": "Snapshot",
          "description": "Snapshot: one line per node with a stable ref (@eN, unique per snapshot), role/name/value, plus page text. Default is the real Accessibility tree (shadow + same-process frames; hidden/ignored subtrees excluded). mode:\"legacy\" keeps the old DOM heuristic; mode:\"text\" is text-only. frame=<CDP frameId> from targets scopes the snapshot to that iframe (same-process first; OOPIF is a follow-up). Shadow refs resolve in the snapshot but acting on a shadow ref through the main-document resolver is not yet supported (typed stale_ref, never a faked click).",
-         "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["ax", "legacy", "text"]}, "frame": {"type": "string"}}, "additionalProperties": false},
+         "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["ax", "legacy", "text"]}, "frame": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "snapshotId": {"type": "string"}}, "additionalProperties": false},
          "outputSchema": {"type": "object",
             "properties": {
                 "url": {"type": "string"}, "title": {"type": "string"},
@@ -25,9 +25,13 @@ pub fn list() -> Value {
                         "disabled": {"type": "boolean"}, "value": {"type": "string"}},
                     "required": ["ref", "role", "name", "tag", "disabled", "value"],
                     "additionalProperties": false}},
+                "snapshotId": {"type": "string"},
+                "offset": {"type": "integer", "minimum": 0},
+                "totalLines": {"type": "integer", "minimum": 0},
+                "nextOffset": {"type": ["integer", "null"]},
                 "mode": {"type": "string"}, "text": {"type": "string"}},
             "required": [], "additionalProperties": false,
-            "anyOf": [{"required": ["url", "title", "truncated", "nodes"]}, {"required": ["mode", "text"]}]},
+            "anyOf": [{"required": ["url", "title", "truncated", "nodes", "snapshotId", "totalLines", "nextOffset"]}, {"required": ["mode", "text"]}]},
          "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false}},
         {"name": "screenshot", "title": "Screenshot",
          "description": "PNG screenshot of the active page (unavailable with GLADIUS_BACKEND_CAPS=dom-only: no rendering pipeline). Optional path: an ABSOLUTE filesystem path the decoded PNG is also written to (missing parent directories are created; a failed write is a typed error, never a silent success). There is no allowlisted screenshot root: only absolute paths are accepted, and a relative path is rejected. When path is absent the reply shape is unchanged. deterministic:true pins the capture: device metrics fixed (current viewport, or width/height; deviceScaleFactor 1, mobile false) and restored afterwards, prefers-reduced-motion:reduce while the capture runs, cleared back to the engine/host default afterwards (a host that asks for reduced motion reports reduce again, so the guarantee is unchanged-from-baseline; reducedMotionEmulated reports whether the emulation was applied at all, and the freeze stylesheet is what stops CSS animation), a temporary style element freezing animation/transition/caret-color/scrollbars, then document.fonts.ready + every img complete + two animation-frame ticks before Page.captureScreenshot({format:png, fromSurface:true, captureBeyondViewport for full page}). The reply then carries viewport, deviceScaleFactor, url, byte length, reducedMotionEmulated and a cheap content checksum, so two captures of the same page can be proven byte-identical. Everything rides CDP: no OS cursor, no OS keyboard, no window, no foreground tab.",
@@ -57,7 +61,8 @@ pub fn list() -> Value {
              "element": {"type": "string"}, "text": {"type": "string"}, "submit": {"type": "boolean"}, "frame": {"type": "string"}},
              "required": ["element", "text"], "additionalProperties": false},
          "outputSchema": {"type": "object",
-            "properties": {"ok": {"type": "boolean"}}, "required": ["ok"], "additionalProperties": false},
+            "properties": {"ok": {"type": "boolean"}, "valueLength": {"type": "integer", "minimum": 0}, "note": {"type": "string"}},
+            "required": ["ok"], "additionalProperties": false},
          "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}},
         {"name": "evaluate", "title": "Evaluate",
          "description": "Evaluate a JS expression in the page, await promises. Optional realm routing: target=<CDP targetId> evaluates in that target's realm (page, dedicated/shared worker, service worker); frame=<CDP frameId> evaluates in that iframe's realm (isolated world, works cross-origin). Without either, the active page's main frame. target and frame are mutually exclusive.",
@@ -100,7 +105,7 @@ pub fn list() -> Value {
         {"name": "history", "title": "History",
          "description": "Navigation history on the active page: back|forward step one entry, reload replays the current one. Returns the live url+title after the load settle; a step past the boundary is a typed error, never a silent no-op.",
          "inputSchema": {"type": "object", "properties": {
-             "action": {"type": "string"}}, "required": ["action"], "additionalProperties": false},
+             "action": {"type": "string", "enum": ["back", "forward", "reload"]}}, "required": ["action"], "additionalProperties": false},
          "outputSchema": {"type": "object",
             "properties": {"ok": {"type": "boolean"}, "url": {"type": "string"}, "title": {"type": "string"}},
             "required": ["ok", "url", "title"], "additionalProperties": false},
@@ -287,6 +292,7 @@ pub fn list() -> Value {
               "maxDiffRatio": {"type": "number"},
               "antialias": {"type": "boolean"},
               "includeAA": {"type": "boolean"},
+              "allowIgnoredAA": {"type": "boolean"},
               "minDiffCluster": {"type": "integer", "minimum": 0},
               "requireEnvironmentMatch": {"type": "boolean"},
               "maskRects": {"type": "array", "items": {"type": "object", "properties": {
@@ -441,13 +447,30 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
             tool_navigate(browser, &url).await
         }
         "snapshot" => {
-            if let Err(e) = check_unknown("snapshot", args, &["mode", "frame"]) {
+            if let Err(e) =
+                check_unknown("snapshot", args, &["mode", "frame", "offset", "snapshotId"])
+            {
                 return e.envelope();
             }
+            let offset = match args.get("offset") {
+                None => 0usize,
+                Some(v) => match v.as_u64() {
+                    Some(n) => n as usize,
+                    None => {
+                        return ToolErr::typed(
+                            "snapshot: 'offset' must be an integer >= 0".to_string(),
+                            json!({"code": "invalid_args", "reason": "bad_value", "tool": "snapshot", "arg": "offset"}),
+                        )
+                        .envelope()
+                    }
+                },
+            };
             tool_snapshot(
                 browser,
                 args.get("mode").and_then(|v| v.as_str()),
                 args.get("frame").and_then(|v| v.as_str()),
+                offset,
+                args.get("snapshotId").and_then(|v| v.as_str()),
             )
             .await
         }
@@ -1012,6 +1035,98 @@ fn stale_gone(tool: &str, element: &str, id: &str) -> ToolErr {
     )
 }
 
+/// Resolve a ref's recorded backend node id to a live JS object.
+/// `Ok(None)` means the ref came from the explicit legacy path (no backend
+/// id recorded), so the caller keeps its selector resolver. A backend id the
+/// DOM no longer knows is a typed node-gone, never a wrong-element action.
+async fn resolve_ref_object(
+    browser: &Browser,
+    tool: &str,
+    id: &str,
+) -> Result<Option<String>, ToolErr> {
+    let Some(backend) = browser.ref_backend(id).await else {
+        return Ok(None);
+    };
+    match browser
+        .command("DOM.resolveNode", json!({"backendNodeId": backend}), true)
+        .await
+    {
+        Ok(v) => match v
+            .get("object")
+            .and_then(|o| o.get("objectId"))
+            .and_then(|x| x.as_str())
+        {
+            Some(oid) => Ok(Some(oid.to_string())),
+            None => Err(stale_gone(tool, "", id)),
+        },
+        Err(e) => {
+            let l = e.to_lowercase();
+            if l.contains("could not find node")
+                || l.contains("no node with given id")
+                || l.contains("does not belong to the document")
+            {
+                Err(stale_gone(tool, "", id))
+            } else {
+                Err(ToolErr::fallback(e))
+            }
+        }
+    }
+}
+
+/// Call `func` ON the resolved element (`this` is the element) and return the
+/// by-value result. The same function body runs for light DOM and shadow DOM.
+async fn call_on_object(
+    browser: &Browser,
+    object_id: &str,
+    func: &str,
+    args: Vec<Value>,
+) -> Result<Value, ToolErr> {
+    let r = browser
+        .command(
+            "Runtime.callFunctionOn",
+            json!({"objectId": object_id, "functionDeclaration": func,
+                   "returnByValue": true, "awaitPromise": true, "arguments": args}),
+            true,
+        )
+        .await
+        .map_err(ToolErr::fallback)?;
+    if let Some(ex) = r.get("exceptionDetails") {
+        return Err(ToolErr::fallback(format!("js exception: {ex}")));
+    }
+    match r.get("result").and_then(|x| x.get("value")) {
+        Some(v) => Ok(v.clone()),
+        None => Err(ToolErr::fallback(
+            "callFunctionOn: expression returned no value".to_string(),
+        )),
+    }
+}
+
+/// Action-time read of an editable field's length ONLY (never its value):
+/// the truthful `type` reply needs to know whether the field kept all of it.
+const VALUE_LEN_FN: &str = r#"function() {
+  const el = this;
+  let n = null;
+  try { if (typeof el.value === "string") n = el.value.length; else if (el.isContentEditable) n = (el.textContent || "").length; } catch (e) {}
+  return n;
+}"#;
+
+/// Build the `type` reply. `valueLength` is reported only when the field was
+/// readable; a differing length adds a note (never a failure - some fields
+/// legitimately transform their input).
+fn type_reply(typed: &str, value_length: Option<u64>) -> Value {
+    let typed_len = typed.encode_utf16().count() as u64;
+    let mut out = json!({"ok": true});
+    if let Some(n) = value_length {
+        out["valueLength"] = json!(n);
+        if n != typed_len {
+            out["note"] = json!(format!(
+                "typed {typed_len} UTF-16 characters but the field now holds {n} (maxlength, pattern, or an input handler transformed it)"
+            ));
+        }
+    }
+    ok_text(out.to_string())
+}
+
 /// G4b frame policy: AX refs (`@eN`) are stamped against the MAIN document
 /// resolver, so a ref scoped to a frame realm cannot resolve safely. Reject it
 /// with a typed `invalid_args` (never a silent main-frame click); frame
@@ -1198,30 +1313,204 @@ async fn frame_owner_hit_ok(
 /// the 8000-char cap, so `nodes` matches the text block's refs one-for-one
 /// (including on a truncated page). Zero new page evaluation - `items` is
 /// what the snapshot already computed.
-fn snapshot_nodes(
-    url: &str,
-    title: &str,
-    items: &[Value],
-    shown_lines: usize,
-    truncated: bool,
-) -> Value {
-    // lines[0] is the header; lines[1..] are one node each.
-    let n = shown_lines.saturating_sub(1).min(items.len());
-    let nodes: Vec<Value> = items
-        .iter()
-        .take(n)
-        .map(|it| {
+/// One structured snapshot node from a rendered item.
+fn node_json(it: &Value) -> Value {
+    json!({
+        "ref": it.get("ref").and_then(|x| x.as_str()).unwrap_or(""),
+        "role": it.get("role").and_then(|x| x.as_str()).unwrap_or(""),
+        "name": it.get("name").and_then(|x| x.as_str()).unwrap_or(""),
+        "tag": it.get("tag").and_then(|x| x.as_str()).unwrap_or(""),
+        "disabled": it.get("disabled").and_then(|x| x.as_bool()).unwrap_or(false),
+        "value": it.get("value").and_then(|x| x.as_str()).unwrap_or(""),
+    })
+}
+
+/// Render one page of a snapshot at the unchanged 8000-char cap.
+///
+/// `offset` is a line index into the cached render (`0` is the header line);
+/// `nextOffset` is the next page's first line, `null` on the last page.
+/// Paging NEVER re-renders: it slices the cache stored by the `offset:0`
+/// call, so every page keeps the original render's ref namespace.
+async fn emit_paged_snapshot(
+    browser: &Browser,
+    mode: &str,
+    frame: Option<&str>,
+    offset: usize,
+    snapshot_id: Option<&str>,
+    start: usize,
+    url: String,
+    title: String,
+    items: Vec<Value>,
+    text: String,
+) -> Result<Value, ToolErr> {
+    let cache = if offset == 0 {
+        let mut lines: Vec<String> = Vec::with_capacity(items.len() + 3);
+        lines.push(format!("AX snapshot: {title} <{url}>"));
+        for it in items.iter() {
+            let r = it.get("ref").and_then(|x| x.as_str()).unwrap_or("?");
+            let role = it.get("role").and_then(|x| x.as_str()).unwrap_or("");
+            let name = it.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            let tag = it.get("tag").and_then(|x| x.as_str()).unwrap_or("");
+            let val = it.get("value").and_then(|x| x.as_str()).unwrap_or("");
+            let dis = it
+                .get("disabled")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+            let mut ln = format!("- {role} \"{name}\" [@{r}] ({tag})");
+            if !val.is_empty() {
+                ln.push_str(&format!(" value=\"{val}\""));
+            }
+            if dis {
+                ln.push_str(" [disabled]");
+            }
+            lines.push(ln);
+        }
+        let c = crate::browser::SnapshotCache {
+            id: browser.next_snapshot_id(),
+            mode: mode.to_string(),
+            frame: frame.unwrap_or("").to_string(),
+            lines,
+            text,
+            url,
+            title,
+            nodes: items.iter().map(node_json).collect(),
+            start,
+        };
+        browser.store_snapshot(c.clone()).await;
+        c
+    } else {
+        let c = browser.cached_snapshot().await.ok_or_else(|| {
+            ToolErr::typed(
+                "snapshot: no cached render to page; call snapshot without offset first"
+                    .to_string(),
+                json!({"code": "invalid_args", "reason": "snapshot_expired", "tool": "snapshot", "offset": offset}),
+            )
+        })?;
+        if let Some(want) = snapshot_id {
+            if want != c.id {
+                return Err(ToolErr::typed(
+                    format!(
+                        "snapshot: snapshotId '{want}' does not match the cached render '{}'; re-snapshot from offset 0",
+                        c.id
+                    ),
+                    json!({"code": "invalid_args", "reason": "snapshot_expired", "tool": "snapshot", "snapshotId": want}),
+                ));
+            }
+        }
+        if c.mode != mode || c.frame != frame.unwrap_or("") {
+            return Err(ToolErr::typed(
+                "snapshot: offset paging must use the same mode/frame as the cached render; re-snapshot from offset 0".to_string(),
+                json!({"code": "invalid_args", "reason": "snapshot_expired", "tool": "snapshot", "offset": offset}),
+            ));
+        }
+        c
+    };
+    let cap = 8000usize;
+    let total_lines = cache.lines.len();
+    let total_nodes = cache.nodes.len();
+    if offset >= total_lines {
+        return Err(ToolErr::typed(
+            format!("snapshot: offset {offset} is past the end (totalLines {total_lines})"),
+            json!({"code": "invalid_args", "reason": "bad_value", "tool": "snapshot", "arg": "offset", "offset": offset, "totalLines": total_lines}),
+        ));
+    }
+    let mut end = offset;
+    let mut last_fit: Option<(String, usize, bool)> = None;
+    while end < total_lines {
+        end += 1;
+        let last = end >= total_lines;
+        let mut footer = if total_nodes == 0 {
+            format!("\n[snapshot: {total_nodes} nodes, refs none]")
+        } else {
+            format!(
+                "\n[snapshot: {total_nodes} nodes, refs @e{}..@e{}]",
+                cache.start + 1,
+                cache.start + total_nodes
+            )
+        };
+        if last {
+            footer.push_str(&format!(
+                "\n[page: lines {offset}..{end} of {total_lines}; complete]"
+            ));
+        } else {
+            footer.push_str(&format!(
+                "\n[page: lines {offset}..{end} of {total_lines}; next offset {end}]"
+            ));
+            let rest_chars: usize = cache
+                .lines
+                .iter()
+                .skip(end)
+                .map(|l| l.chars().count() + 1)
+                .sum::<usize>()
+                + cache.text.chars().count();
+            footer.push_str(&format!(
+                "\n[truncated: showing {end} of {total_lines} lines, {rest_chars} chars omitted]"
+            ));
+        }
+        let body = cache.lines[offset..end].join("\n");
+        let mut tail = if last && !cache.text.is_empty() {
+            format!("\n{}", cache.text)
+        } else {
+            String::new()
+        };
+        let mut tail_cut = false;
+        let mut full = format!("{body}{tail}{footer}");
+        if full.chars().count() > cap && !tail.is_empty() {
+            tail_cut = true;
+            let room = cap
+                .saturating_sub(body.chars().count())
+                .saturating_sub(footer.chars().count());
+            tail = tail.chars().take(room).collect();
+            full = format!("{body}{tail}{footer}");
+        }
+        if full.chars().count() <= cap {
+            let done = last;
+            last_fit = Some((full, end, tail_cut));
+            if done {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    let Some((full, end, tail_cut)) = last_fit else {
+        // Degenerate: a single line plus footer exceeds the cap.
+        let cut: String = cache.lines[offset].chars().take(cap).collect();
+        let node_lo = offset.saturating_sub(1).min(total_nodes);
+        let node_hi = end.saturating_sub(1).min(total_nodes);
+        let nodes: Vec<Value> = if node_hi > node_lo {
+            cache.nodes[node_lo..node_hi].to_vec()
+        } else {
+            Vec::new()
+        };
+        return Ok(ok_snapshot(
+            cut,
             json!({
-                "ref": it.get("ref").and_then(|x| x.as_str()).unwrap_or(""),
-                "role": it.get("role").and_then(|x| x.as_str()).unwrap_or(""),
-                "name": it.get("name").and_then(|x| x.as_str()).unwrap_or(""),
-                "tag": it.get("tag").and_then(|x| x.as_str()).unwrap_or(""),
-                "disabled": it.get("disabled").and_then(|x| x.as_bool()).unwrap_or(false),
-                "value": it.get("value").and_then(|x| x.as_str()).unwrap_or(""),
-            })
-        })
-        .collect();
-    json!({"url": url, "title": title, "truncated": truncated, "nodes": nodes})
+                "url": cache.url, "title": cache.title, "truncated": true,
+                "nodes": nodes, "snapshotId": cache.id,
+                "offset": offset, "totalLines": total_lines,
+                "nextOffset": Value::Null,
+            }),
+        ));
+    };
+    let next = if end < total_lines { Some(end) } else { None };
+    let truncated = next.is_some() || tail_cut;
+    let node_lo = offset.saturating_sub(1).min(total_nodes);
+    let node_hi = end.saturating_sub(1).min(total_nodes);
+    let nodes: Vec<Value> = if node_hi > node_lo {
+        cache.nodes[node_lo..node_hi].to_vec()
+    } else {
+        Vec::new()
+    };
+    Ok(ok_snapshot(
+        full,
+        json!({
+            "url": cache.url, "title": cache.title, "truncated": truncated,
+            "nodes": nodes, "snapshotId": cache.id,
+            "offset": offset, "totalLines": total_lines,
+            "nextOffset": match next { Some(n) => json!(n), None => Value::Null },
+        }),
+    ))
 }
 
 /// AX snapshot result: the human text block stays FIRST and byte-identical
@@ -1238,11 +1527,51 @@ async fn tool_snapshot(
     browser: &Browser,
     mode: Option<&str>,
     frame: Option<&str>,
+    offset: usize,
+    snapshot_id: Option<&str>,
 ) -> Result<Value, ToolErr> {
     match mode {
-        Some("text") => return tool_snapshot_text_frame(browser, frame).await,
-        Some("legacy") => return tool_snapshot_legacy(browser, frame).await,
-        Some("ax") | None => return tool_snapshot_ax(browser, frame).await,
+        Some("text") => {
+            if offset > 0 {
+                return Err(ToolErr::typed(
+                    "snapshot: mode 'text' is not line-paged (use the default AX mode for refs and offset paging)".to_string(),
+                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "snapshot", "arg": "offset"}),
+                ));
+            }
+            tool_snapshot_text_frame(browser, frame).await
+        }
+        Some("legacy") if offset > 0 => {
+            emit_paged_snapshot(
+                browser,
+                "legacy",
+                frame,
+                offset,
+                snapshot_id,
+                0,
+                String::new(),
+                String::new(),
+                Vec::new(),
+                String::new(),
+            )
+            .await
+        }
+        Some("ax") | None if offset > 0 => {
+            emit_paged_snapshot(
+                browser,
+                "ax",
+                frame,
+                offset,
+                snapshot_id,
+                0,
+                String::new(),
+                String::new(),
+                Vec::new(),
+                String::new(),
+            )
+            .await
+        }
+        Some("legacy") => return tool_snapshot_legacy(browser, frame, offset, snapshot_id).await,
+        Some("ax") | None => return tool_snapshot_ax(browser, frame, offset, snapshot_id).await,
         Some(other) => Err(ToolErr::typed(
             format!("snapshot: unknown mode '{other}' (want 'ax'|'legacy'|'text')"),
             json!({"code": "invalid_args", "reason": "bad_value", "tool": "snapshot", "arg": "mode", "want": other}),
@@ -1250,7 +1579,12 @@ async fn tool_snapshot(
     }
 }
 
-async fn tool_snapshot_legacy(browser: &Browser, frame: Option<&str>) -> Result<Value, ToolErr> {
+async fn tool_snapshot_legacy(
+    browser: &Browser,
+    frame: Option<&str>,
+    offset: usize,
+    snapshot_id: Option<&str>,
+) -> Result<Value, ToolErr> {
     // Legacy DOM-heuristic mode (explicit `mode:"legacy"` only): enumerate actionable nodes in
     // document order, stamp each with an exact data-gladius-ref id, and
     // report role/name/value. Refs are unique across snapshots: the lock
@@ -1331,7 +1665,9 @@ async fn tool_snapshot_legacy(browser: &Browser, frame: Option<&str>) -> Result<
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string();
-    // Store the ref table for exact ref resolution + stale detection.
+    // Store the ref table for exact ref resolution + stale detection. Legacy
+    // keeps its single in-page stamp (one eval, not a per-node CDP round
+    // trip); AX stores backend ids instead and never touches the page.
     let mut table = std::collections::HashMap::new();
     for it in items.iter() {
         if let (Some(r), role, name) = (
@@ -1339,7 +1675,13 @@ async fn tool_snapshot_legacy(browser: &Browser, frame: Option<&str>) -> Result<
             it.get("role").and_then(|x| x.as_str()).unwrap_or(""),
             it.get("name").and_then(|x| x.as_str()).unwrap_or(""),
         ) {
-            table.insert(r.to_string(), format!("{role} {name}"));
+            table.insert(
+                r.to_string(),
+                crate::browser::RefEntry {
+                    label: format!("{role} {name}"),
+                    backend: None,
+                },
+            );
         }
     }
     browser.store_refs(url.clone(), table).await;
@@ -1347,13 +1689,11 @@ async fn tool_snapshot_legacy(browser: &Browser, frame: Option<&str>) -> Result<
     browser.ref_advance(total);
     // Page text keeps old callers (marker asserts) working on AX output.
     // With frame= the frame's own text is reported.
-    let frame_owned;
     let tv = match frame {
         Some(fid) => {
-            frame_owned = fid.to_string();
             browser
                 .eval_in_frame(
-                    &frame_owned,
+                    fid,
                     "((((document.body && document.body.innerText) || (document.documentElement && document.documentElement.innerText) || '')) + '').slice(0, 12000)",
                 )
                 .await
@@ -1368,91 +1708,24 @@ async fn tool_snapshot_legacy(browser: &Browser, frame: Option<&str>) -> Result<
         .ok()
         .and_then(|x| x.as_str().map(|s| s.to_string()))
         .unwrap_or_default();
-    let text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut lines: Vec<String> = Vec::with_capacity(total + 3);
-    lines.push(format!("AX snapshot: {title} <{url}>"));
-    for it in items.iter() {
-        let r = it.get("ref").and_then(|x| x.as_str()).unwrap_or("?");
-        let role = it.get("role").and_then(|x| x.as_str()).unwrap_or("");
-        let name = it.get("name").and_then(|x| x.as_str()).unwrap_or("");
-        let tag = it.get("tag").and_then(|x| x.as_str()).unwrap_or("");
-        let val = it.get("value").and_then(|x| x.as_str()).unwrap_or("");
-        let dis = it
-            .get("disabled")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false);
-        let mut ln = format!("- {role} \"{name}\" [@{r}] ({tag})");
-        if !val.is_empty() {
-            ln.push_str(&format!(" value=\"{val}\""));
-        }
-        if dis {
-            ln.push_str(" [disabled]");
-        }
-        lines.push(ln);
+    let mut text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !text.is_empty() {
+        text = format!("text: {text}");
     }
-    // Bounded output with EXPLICIT truncation (announced + by how much).
-    // The footer is never cut: lines and the expendable text tail shrink
-    // first, so a truncation notice is always present when content is lost.
-    let cap = 8000usize;
-    let total_lines = lines.len();
-    let mut shown = total_lines;
-    let mut out = lines.join("\n");
-    let mut tail = if text.is_empty() {
-        String::new()
-    } else {
-        format!("\ntext: {text}")
-    };
-    let mut tail_cut = false;
-    loop {
-        let mut footer = if total == 0 {
-            format!("\n[snapshot: {total} nodes, refs none]")
-        } else {
-            let first = start + 1;
-            let last = start + total;
-            format!("\n[snapshot: {total} nodes, refs @e{first}..@e{last}]")
-        };
-        if shown < total_lines {
-            let rest_chars: usize = lines
-                .iter()
-                .skip(shown)
-                .map(|l| l.chars().count() + 1)
-                .sum::<usize>()
-                + text.chars().count();
-            footer.push_str(&format!(
-                "\n[truncated: showing {shown} of {total_lines} lines, {rest_chars} chars omitted]"
-            ));
-        }
-        let full = format!("{out}{tail}{footer}");
-        if full.chars().count() <= cap {
-            let truncated = shown < total_lines || tail_cut;
-            return Ok(ok_snapshot(
-                full,
-                snapshot_nodes(&url, &title, items, shown, truncated),
-            ));
-        }
-        // Shrink order: text tail first, then whole lines off the end.
-        if !tail.is_empty() {
-            tail_cut = true;
-            let excess = full.chars().count() - cap;
-            let keep = tail.chars().count().saturating_sub(excess);
-            tail = if keep == 0 {
-                String::new()
-            } else {
-                tail.chars().take(keep).collect()
-            };
-        } else if shown > 1 {
-            shown -= 1;
-            out = lines[..shown].join("\n");
-        } else {
-            // Degenerate: header alone plus footer still exceed the cap;
-            // hard-cut (footer stays truthful about the node count).
-            let cut: String = full.chars().take(cap).collect();
-            return Ok(ok_snapshot(
-                cut,
-                snapshot_nodes(&url, &title, items, shown, true),
-            ));
-        }
-    }
+    let items_owned: Vec<Value> = items.to_vec();
+    emit_paged_snapshot(
+        browser,
+        "legacy",
+        frame,
+        offset,
+        snapshot_id,
+        start,
+        url,
+        title,
+        items_owned,
+        text,
+    )
+    .await
 }
 
 /// Real Accessibility-tree snapshot (the DEFAULT when `mode` is absent or
@@ -1480,7 +1753,12 @@ async fn tool_snapshot_legacy(browser: &Browser, frame: Option<&str>) -> Result<
 /// resolver cannot reach into open shadow roots, so a shadow ref action
 /// today returns the typed `stale_ref`/`node-gone` - documented, never
 /// faked.
-async fn tool_snapshot_ax(browser: &Browser, frame: Option<&str>) -> Result<Value, ToolErr> {
+async fn tool_snapshot_ax(
+    browser: &Browser,
+    frame: Option<&str>,
+    offset: usize,
+    snapshot_id: Option<&str>,
+) -> Result<Value, ToolErr> {
     let _snap_guard = browser.lock_snapshot().await;
     let start = browser.ref_start();
     let tree = browser.ax_tree(frame).await.map_err(|e| {
@@ -1572,104 +1850,88 @@ async fn tool_snapshot_ax(browser: &Browser, frame: Option<&str>) -> Result<Valu
             ax_disabled: disabled,
         });
     }
-    // Resolve + stamp. `DOM.enable` first (the upload path does the same),
-    // then a document handle: pushNodesByBackendIdsToFrontend needs the
-    // document requested first (pierce so shadow/iframe nodes resolve).
+    // Resolve the AX backend ids straight to JS objects: no attribute
+    // stamping, no page mutation. Resolves are pipelined (join_all), so the
+    // old one-sequential-round-trip-per-node stamp loop is gone, and
+    // DOM.resolveNode pierces open shadow roots - which is why a shadow ref
+    // is now actionable with the same resolver as a light-DOM ref.
     browser.command("DOM.enable", json!({}), true).await?;
-    let _ = browser
-        .command("DOM.getDocument", json!({"depth": 0, "pierce": true}), true)
-        .await?;
-    let backend_ids: Vec<Value> = cands.iter().map(|c| json!(c.backend)).collect();
-    let pushed = browser
-        .command(
-            "DOM.pushNodesByBackendIdsToFrontend",
-            json!({"backendNodeIds": backend_ids}),
-            true,
-        )
-        .await?;
-    let node_ids = pushed
-        .get("nodeIds")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    // Placeholder items in AX order; enrichment fills tag/disabled/value.
-    let mut items: Vec<Value> = Vec::new();
-    let mut live_nids: Vec<i64> = Vec::new();
-    let mut n_ok: usize = 0;
-    for (cand, nid_v) in cands.iter().zip(node_ids.iter()) {
-        let nid = nid_v.as_i64().unwrap_or(0);
-        if nid == 0 {
-            continue;
-        }
-        let r = format!("e{}", start + n_ok + 1);
-        let set = browser
-            .command(
-                "DOM.setAttributeValue",
-                json!({"nodeId": nid, "name": "data-gladius-ref", "value": r}),
-                true,
-            )
-            .await;
-        if set.is_err() {
-            continue;
-        }
-        n_ok += 1;
-        items.push(json!({
-            "ref": r, "role": cand.role, "name": cand.name,
-            "value": cand.ax_value, "tag": "", "disabled": cand.ax_disabled,
-        }));
-        live_nids.push(nid);
-    }
-    // Live enrichment: one eval maps ref -> {tag, disabled, value (60-char
-    // display cut), fullVal (uncapped raw value for name fallback), sens,
-    // ph, eid, enm, selText, ty}.
-    // Shadow nodes (querySelector cannot reach into open shadow roots from
-    // the document) come back null and fall to DOM.describeNode below.
-    let refs: Vec<String> = items
+    let resolves = cands
         .iter()
-        .filter_map(|it| {
-            it.get("ref")
+        .map(|c| browser.command("DOM.resolveNode", json!({"backendNodeId": c.backend}), true));
+    let resolved = futures_util::future::join_all(resolves).await;
+    let mut items: Vec<Value> = Vec::new();
+    let mut object_ids: Vec<String> = Vec::new();
+    let mut n_ok: usize = 0;
+    for (cand, got) in cands.iter().zip(resolved.into_iter()) {
+        let oid = got.ok().and_then(|v| {
+            v.get("object")
+                .and_then(|o| o.get("objectId"))
                 .and_then(|x| x.as_str())
                 .map(|s| s.to_string())
-        })
-        .collect();
-    let refs_lit = serde_json::to_string(&refs).unwrap_or_else(|_| "[]".to_string());
-    let enrich_js = format!(
-        r#"((refs) => {{
+        });
+        let Some(oid) = oid else { continue };
+        n_ok += 1;
+        items.push(json!({
+            "ref": format!("e{}", start + n_ok), "role": cand.role,
+            "name": cand.name, "value": cand.ax_value, "tag": "",
+            "disabled": cand.ax_disabled, "backend": cand.backend,
+        }));
+        object_ids.push(oid);
+    }
+    // Live enrichment in one callFunctionOn per 100 objects: the same fields
+    // the old selector eval produced, now read from the resolved objects
+    // themselves (shadow included). The first object of each chunk is the
+    // receiver so every call stays in that node's execution context.
+    const ENRICH_FN: &str = r#"function(...rest) {
   const SENS = new Set(["current-password", "new-password", "cc-number", "cc-exp", "cc-csc", "one-time-code"]);
-  const out = {{}};
-  for (const ref of refs) {{
-    const el = document.querySelector('[data-gladius-ref="' + ref + '"]');
-    if (!el) {{ out[ref] = null; continue; }}
+  const els = [this, ...rest];
+  return els.map((el) => {
+    if (!el || !el.tagName) return null;
     const tag = ((el.tagName || "").toLowerCase());
     let rawVal = "";
-    try {{ if ("value" in el) rawVal = String(el.value); }} catch (e) {{}}
+    try { if ("value" in el) rawVal = String(el.value); } catch (e) {}
     const ty = String((el.getAttribute && el.getAttribute("type")) || el.type || "").toLowerCase();
     const ac = String((el.getAttribute && el.getAttribute("autocomplete")) || el.autocomplete || "");
     const sens = (tag === "input") && (ty === "password" || ac.toLowerCase().split(/\s+/).filter(Boolean).some((t) => SENS.has(t)));
-    let ph = ""; try {{ ph = el.placeholder || ""; }} catch (e) {{}}
-    let eid = ""; try {{ eid = el.id || ""; }} catch (e) {{}}
-    let enm = ""; try {{ enm = el.name || ""; }} catch (e) {{}}
+    let ph = ""; try { ph = el.placeholder || ""; } catch (e) {}
+    let eid = ""; try { eid = el.id || ""; } catch (e) {}
+    let enm = ""; try { enm = el.name || ""; } catch (e) {}
     let selText = "";
-    try {{ if (tag === "select" && el.options && el.selectedIndex >= 0) {{ const o = el.options[el.selectedIndex]; selText = (o && (o.text || o.textContent)) || ""; }} }} catch (e) {{}}
-    // Fallback candidates ship FULL and RAW: nothing is truncated or
-    // normalized here. Truncating (or normalizing) before the legacy-order
-    // pick would corrupt it - e.g. 79 spaces + "ID_END" sliced to 80 chars
-    // normalizes to "I" instead of "ID_END". The 60-char cut applies only
-    // to the display `value`, never to names.
-    out[ref] = {{tag: tag, disabled: !!el.disabled, value: rawVal.slice(0, 60), fullVal: rawVal, sens: sens, ph: String(ph || ""), eid: String(eid || ""), enm: String(enm || ""), selText: String(selText || ""), ty: String(ty || "").slice(0, 20)}};
-  }}
-  return out;
-}})({refs_lit})"#
-    );
-    let enrich: Value = match frame {
-        Some(fid) => browser
-            .eval_in_frame(fid, &enrich_js)
+    try { if (tag === "select" && el.options && el.selectedIndex >= 0) { const o = el.options[el.selectedIndex]; selText = (o && (o.text || o.textContent)) || ""; } } catch (e) {}
+    return {tag: tag, disabled: !!el.disabled, value: rawVal.slice(0, 60), fullVal: rawVal, sens: sens, ph: String(ph || ""), eid: String(eid || ""), enm: String(enm || ""), selText: String(selText || ""), ty: String(ty || "").slice(0, 20)};
+  });
+}"#;
+    let mut enrich_vals: Vec<Value> = Vec::new();
+    for chunk in object_ids.chunks(100) {
+        let Some((receiver, rest)) = chunk.split_first() else {
+            continue;
+        };
+        let args: Vec<Value> = rest.iter().map(|id| json!({"objectId": id})).collect();
+        let got = browser
+            .command(
+                "Runtime.callFunctionOn",
+                json!({"objectId": receiver, "functionDeclaration": ENRICH_FN,
+                       "returnByValue": true, "arguments": args}),
+                true,
+            )
             .await
-            .unwrap_or(Value::Null),
-        None => browser.eval(&enrich_js).await.unwrap_or(Value::Null),
-    };
-    let enrich_map = enrich.as_object().cloned().unwrap_or_default();
-    for (idx, it) in items.iter_mut().enumerate() {
+            .ok()
+            .and_then(|v| v.get("result").and_then(|x| x.get("value")).cloned());
+        match got {
+            Some(Value::Array(a)) if a.len() == chunk.len() => enrich_vals.extend(a),
+            _ => enrich_vals.extend(chunk.iter().map(|_| Value::Null)),
+        }
+    }
+    let enrich_map: serde_json::Map<String, Value> = items
+        .iter()
+        .zip(enrich_vals.into_iter())
+        .filter_map(|(it, v)| {
+            let r = it.get("ref").and_then(|x| x.as_str())?.to_string();
+            Some((r, v))
+        })
+        .collect();
+    for it in items.iter_mut() {
         let r = it
             .get("ref")
             .and_then(|x| x.as_str())
@@ -1686,61 +1948,10 @@ async fn tool_snapshot_ax(browser: &Browser, frame: Option<&str>) -> Result<Valu
             .unwrap_or(false);
         match enrich_map.get(&r) {
             Some(Value::Null) | None => {
-                // Shadow (or otherwise unreachable) node: describe for tag
-                // + credential attributes; value/disabled stay AX-side with
-                // the G0 mask applied.
-                let nid = live_nids.get(idx).cloned().unwrap_or(0);
-                let mut tag = String::new();
-                let mut sens = false;
-                if nid != 0 {
-                    if let Ok(desc) = browser
-                        .command("DOM.describeNode", json!({"nodeId": nid}), true)
-                        .await
-                    {
-                        if let Some(node) = desc.get("node") {
-                            tag = node
-                                .get("nodeName")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_lowercase();
-                            if let Some(attrs) = node.get("attributes").and_then(|v| v.as_array()) {
-                                let mut ty = String::new();
-                                let mut ac = String::new();
-                                let mut i = 0;
-                                while i + 1 < attrs.len() {
-                                    let k = attrs[i].as_str().unwrap_or("");
-                                    let v = attrs[i + 1].as_str().unwrap_or("");
-                                    if k.eq_ignore_ascii_case("type") {
-                                        ty = v.to_lowercase();
-                                    } else if k.eq_ignore_ascii_case("autocomplete") {
-                                        ac = v.to_string();
-                                    }
-                                    i += 2;
-                                }
-                                const SENS_TOKS: [&str; 6] = [
-                                    "current-password",
-                                    "new-password",
-                                    "cc-number",
-                                    "cc-exp",
-                                    "cc-csc",
-                                    "one-time-code",
-                                ];
-                                sens = tag == "input"
-                                    && (ty == "password"
-                                        || ac
-                                            .to_lowercase()
-                                            .split_whitespace()
-                                            .any(|t| SENS_TOKS.contains(&t)));
-                            }
-                        }
-                    }
-                }
-                it["tag"] = json!(tag);
-                it["value"] = json!(if sens {
-                    "••••".to_string()
-                } else {
-                    ax_value
-                });
+                // Enrichment could not read this node (detached mid-snapshot):
+                // keep the AX-side tag/value/disabled and the G0 mask.
+                it["tag"] = json!("");
+                it["value"] = json!(ax_value);
                 it["disabled"] = json!(ax_disabled);
             }
             Some(info) => {
@@ -1886,7 +2097,8 @@ async fn tool_snapshot_ax(browser: &Browser, frame: Option<&str>) -> Result<Valu
             (u, t, tx)
         }
     };
-    // Store the ref table for exact ref resolution + stale detection.
+    // Store the ref table (label + backend node id) for exact resolution,
+    // shadow actionability, and stale detection.
     let mut table = std::collections::HashMap::new();
     for it in items.iter() {
         if let (Some(r), role, name) = (
@@ -1894,96 +2106,35 @@ async fn tool_snapshot_ax(browser: &Browser, frame: Option<&str>) -> Result<Valu
             it.get("role").and_then(|x| x.as_str()).unwrap_or(""),
             it.get("name").and_then(|x| x.as_str()).unwrap_or(""),
         ) {
-            table.insert(r.to_string(), format!("{role} {name}"));
+            table.insert(
+                r.to_string(),
+                crate::browser::RefEntry {
+                    label: format!("{role} {name}"),
+                    backend: it.get("backend").and_then(|b| b.as_i64()),
+                },
+            );
         }
     }
     browser.store_refs(url.clone(), table).await;
     let total = items.len();
     browser.ref_advance(total);
-    let mut lines: Vec<String> = Vec::with_capacity(total + 3);
-    lines.push(format!("AX snapshot: {title} <{url}>"));
-    for it in items.iter() {
-        let r = it.get("ref").and_then(|x| x.as_str()).unwrap_or("?");
-        let role = it.get("role").and_then(|x| x.as_str()).unwrap_or("");
-        let name = it.get("name").and_then(|x| x.as_str()).unwrap_or("");
-        let tag = it.get("tag").and_then(|x| x.as_str()).unwrap_or("");
-        let val = it.get("value").and_then(|x| x.as_str()).unwrap_or("");
-        let dis = it
-            .get("disabled")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false);
-        let mut ln = format!("- {role} \"{name}\" [@{r}] ({tag})");
-        if !val.is_empty() {
-            ln.push_str(&format!(" value=\"{val}\""));
-        }
-        if dis {
-            ln.push_str(" [disabled]");
-        }
-        lines.push(ln);
+    let mut text = text;
+    if !text.is_empty() {
+        text = format!("text: {text}");
     }
-    // Bounded output with EXPLICIT truncation (announced + by how much).
-    // The footer is never cut: lines and the expendable text tail shrink
-    // first, so a truncation notice is always present when content is lost.
-    let cap = 8000usize;
-    let total_lines = lines.len();
-    let mut shown = total_lines;
-    let mut out = lines.join("\n");
-    let mut tail = if text.is_empty() {
-        String::new()
-    } else {
-        format!("\ntext: {text}")
-    };
-    let mut tail_cut = false;
-    loop {
-        let mut footer = if total == 0 {
-            format!("\n[snapshot: {total} nodes, refs none]")
-        } else {
-            let first = start + 1;
-            let last = start + total;
-            format!("\n[snapshot: {total} nodes, refs @e{first}..@e{last}]")
-        };
-        if shown < total_lines {
-            let rest_chars: usize = lines
-                .iter()
-                .skip(shown)
-                .map(|l| l.chars().count() + 1)
-                .sum::<usize>()
-                + text.chars().count();
-            footer.push_str(&format!(
-                "\n[truncated: showing {shown} of {total_lines} lines, {rest_chars} chars omitted]"
-            ));
-        }
-        let full = format!("{out}{tail}{footer}");
-        if full.chars().count() <= cap {
-            let truncated = shown < total_lines || tail_cut;
-            return Ok(ok_snapshot(
-                full,
-                snapshot_nodes(&url, &title, &items, shown, truncated),
-            ));
-        }
-        // Shrink order: text tail first, then whole lines off the end.
-        if !tail.is_empty() {
-            tail_cut = true;
-            let excess = full.chars().count() - cap;
-            let keep = tail.chars().count().saturating_sub(excess);
-            tail = if keep == 0 {
-                String::new()
-            } else {
-                tail.chars().take(keep).collect()
-            };
-        } else if shown > 1 {
-            shown -= 1;
-            out = lines[..shown].join("\n");
-        } else {
-            // Degenerate: header alone plus footer still exceed the cap;
-            // hard-cut (footer stays truthful about the node count).
-            let cut: String = full.chars().take(cap).collect();
-            return Ok(ok_snapshot(
-                cut,
-                snapshot_nodes(&url, &title, &items, shown, true),
-            ));
-        }
-    }
+    emit_paged_snapshot(
+        browser,
+        "ax",
+        frame,
+        offset,
+        snapshot_id,
+        start,
+        url,
+        title,
+        items,
+        text,
+    )
+    .await
 }
 
 async fn tool_snapshot_text_frame(
@@ -2363,6 +2514,10 @@ async fn tool_visual(browser: &Browser, args: &Value) -> Result<Value, ToolErr> 
                     .get("requireEnvironmentMatch")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                allow_ignored_aa: args
+                    .get("allowIgnoredAA")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
             };
             // A per-channel threshold is a 0..1 fraction; a value outside
             // that range would silently compare nothing (or everything), so
@@ -2411,6 +2566,28 @@ fn click_preflight_sel(sel: &str) -> String {
     )
 }
 
+/// Ref-path preflights run as `Runtime.callFunctionOn` bodies with the
+/// resolved element as `this`, so shadow-DOM refs act exactly like light-DOM
+/// refs (no `document.querySelector` involved). The hit-test uses the
+/// element's OWN root: `document.elementFromPoint` returns the shadow HOST
+/// for a shadow child, which would read as occluded.
+fn click_preflight_fn() -> &'static str {
+    r#"function() { const el = this; if (!el || !el.isConnected) return 'GLADIUS_NOTFOUND'; const cs = getComputedStyle(el); if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') return 'GLADIUS_HIDDEN'; if (el.disabled) return 'GLADIUS_DISABLED'; const tag = (el.tagName || '').toUpperCase(); if (tag === 'OPTION') { const h0 = location.href; try { el.scrollIntoView({block: 'center'}); } catch (e) {} try { el.click(); } catch (e) { return 'GLADIUS_HIDDEN'; } try { return 'GLADIUS_FALLBACK:' + JSON.stringify({h0: h0, h1: location.href, rs: document.readyState}); } catch (e) { return 'GLADIUS_FALLBACK'; } } try { el.scrollIntoView({block: 'center'}); } catch (e) {} const r = el.getBoundingClientRect(); if (!r || r.width === 0 || r.height === 0) return 'GLADIUS_HIDDEN'; const cx = r.left + r.width / 2, cy = r.top + r.height / 2; let hit = null; try { const root = el.getRootNode ? el.getRootNode() : document; hit = (root.elementFromPoint || document.elementFromPoint).call(root, cx, cy); } catch (e) { return 'GLADIUS_OCCLUDED'; } if (!hit || (hit !== el && !el.contains(hit))) return 'GLADIUS_OCCLUDED'; return 'GLADIUS_POINT:' + JSON.stringify({x: cx, y: cy, h0: location.href}); }"#
+}
+
+fn type_preflight_fn() -> &'static str {
+    r#"function() { const el = this; if (!el || !el.isConnected) return 'GLADIUS_NOTFOUND'; if (el.disabled) return 'GLADIUS_DISABLED'; if (el.readOnly) return 'GLADIUS_READONLY'; const cs = getComputedStyle(el); if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') return 'GLADIUS_HIDDEN'; const r = el.getBoundingClientRect(); if (!r || (r.width === 0 && r.height === 0)) return 'GLADIUS_HIDDEN'; const tag = (el.tagName || '').toUpperCase(); let kind = ''; if (tag === 'INPUT') { const ty = String(el.type || 'text').toLowerCase(); if (['text','search','url','tel','password','email','number'].includes(ty)) kind = 'TEXT'; else kind = 'NOTEDIT:' + ty; } else if (tag === 'TEXTAREA') kind = 'TEXT'; else if (el.isContentEditable) kind = 'CE'; else kind = 'NOTEDIT:tag:' + tag; if (kind.startsWith('NOTEDIT:')) return 'GLADIUS_NOTEDIT:' + kind.slice(8); try { el.focus(); } catch (e) { return 'GLADIUS_HIDDEN'; } try { if (kind === 'TEXT') { if (typeof el.select === 'function') el.select(); else if (typeof el.setSelectionRange === 'function') el.setSelectionRange(0, el.value.length); } else { const range = document.createRange(); range.selectNodeContents(el); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range); } } catch (e) { return 'GLADIUS_HIDDEN'; } return 'GLADIUS_READY'; }"#
+}
+
+fn hover_preflight_fn() -> &'static str {
+    r#"function() { const el = this; if (!el || !el.isConnected) return 'GLADIUS_NOTFOUND'; const cs = getComputedStyle(el); if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') return 'GLADIUS_HIDDEN'; try { el.scrollIntoView({block: 'center', inline: 'center'}); } catch (e) {} const r = el.getBoundingClientRect(); if (!r || r.width === 0 || r.height === 0) return 'GLADIUS_HIDDEN'; const cx = r.left + r.width / 2, cy = r.top + r.height / 2; let hit = null; try { const root = el.getRootNode ? el.getRootNode() : document; hit = (root.elementFromPoint || document.elementFromPoint).call(root, cx, cy); } catch (e) { return 'GLADIUS_OCCLUDED'; } if (!hit || (hit !== el && !el.contains(hit))) return 'GLADIUS_OCCLUDED'; return JSON.stringify({x: cx, y: cy}); }"#
+}
+
+fn select_preflight_fn(val_lit: &str, txt_lit: &str) -> String {
+    let js = r#"function() { const el = this; if (!el || !el.isConnected) return 'GLADIUS_NOTFOUND'; if (!el || el.tagName !== 'SELECT') return 'GLADIUS_NOTSELECT'; const wantValue = __VAL__; const wantText = __TXT__; const opts = Array.from(el.options); let opt = null; if (wantValue !== null) { opt = opts.find(o => o.value === wantValue); } else { opt = opts.find(o => o.text === wantText || o.textContent === wantText); } if (!opt) return 'GLADIUS_NOOPT'; el.value = opt.value; el.selectedIndex = opts.indexOf(opt); el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); return 'GLADIUS_OK'; }"#;
+    js.replace("__VAL__", val_lit).replace("__TXT__", txt_lit)
+}
+
 /// Dispatch a trusted main-frame pointer click at `(x, y)` (viewport CSS px)
 /// via `Browser::mouse_click`, then build the `{h0, h1, rs}` settle state the
 /// same shape the old in-page click reported (h0 from preflight, h1/rs read
@@ -2452,8 +2629,13 @@ async fn tool_click(
     }
     if let Some(id) = parse_ref(element) {
         let at_id = guard_ref(browser, "click", element, &id).await?;
-        let (expr, _) = click_preflight_ref(&id);
-        let v = browser.eval(&expr).await?;
+        let v = match resolve_ref_object(browser, "click", &id).await? {
+            Some(oid) => call_on_object(browser, &oid, click_preflight_fn(), vec![]).await?,
+            None => {
+                let (expr, _) = click_preflight_ref(&id);
+                browser.eval(&expr).await?
+            }
+        };
         return match v.as_str() {
             Some(s) if s.starts_with("GLADIUS_FALLBACK:") => {
                 // Documented <option> fallback only (no layout box for a
@@ -2843,15 +3025,29 @@ async fn tool_type(
                 &json!({"element": element, "frame": f}),
             )
         })?;
+        let len_expr = format!(
+            "(() => {{ const el = document.querySelector({sel}); return el && typeof el.value === 'string' ? el.value.length : null; }})()"
+        );
+        let value_length = browser
+            .eval_in_frame(f, &len_expr)
+            .await
+            .ok()
+            .and_then(|v| v.as_u64());
         if submit {
             submit_enter(browser).await?;
         }
-        return Ok(ok_text(json!({"ok": true}).to_string()));
+        return Ok(type_reply(text, value_length));
     }
     if let Some(id) = parse_ref(element) {
         let at_id = guard_ref(browser, "type", element, &id).await?;
-        let expr = type_preflight_ref(&id);
-        let v = browser.eval(&expr).await?;
+        let oid = resolve_ref_object(browser, "type", &id).await?;
+        let v = match &oid {
+            Some(o) => call_on_object(browser, o, type_preflight_fn(), vec![]).await?,
+            None => {
+                let expr = type_preflight_ref(&id);
+                browser.eval(&expr).await?
+            }
+        };
         match v.as_str() {
             Some("GLADIUS_READY") => {}
             Some("GLADIUS_NOTFOUND") => return Err(stale_gone("type", element, &id)),
@@ -2886,10 +3082,27 @@ async fn tool_type(
                 &json!({"ref": at_id}),
             )
         })?;
+        // Truthful reply: read the field's LENGTH ONLY (never its value; the
+        // G0 sensitivity mask stays intact). Some fields legitimately
+        // transform input, so a mismatch is a note, never a failure.
+        let value_length = match &oid {
+            Some(o) => call_on_object(browser, o, VALUE_LEN_FN, vec![])
+                .await
+                .ok()
+                .and_then(|v| v.as_u64()),
+            None => {
+                let lit = serde_json::to_string(&format!("[data-gladius-ref=\"{id}\"]"))
+                    .map_err(|e| e.to_string())?;
+                let expr = format!(
+                    "(() => {{ const el = document.querySelector({lit}); return el && typeof el.value === 'string' ? el.value.length : null; }})()"
+                );
+                browser.eval(&expr).await.ok().and_then(|v| v.as_u64())
+            }
+        };
         if submit {
             submit_enter(browser).await?;
         }
-        return Ok(ok_text(json!({"ok": true}).to_string()));
+        return Ok(type_reply(text, value_length));
     }
     let sel = serde_json::to_string(element).map_err(|e| e.to_string())?;
     let expr = type_preflight_sel(&sel);
@@ -2936,10 +3149,14 @@ async fn tool_type(
             &json!({"element": element}),
         )
     })?;
+    let len_expr = format!(
+        "(() => {{ const el = document.querySelector({sel}); return el && typeof el.value === 'string' ? el.value.length : null; }})()"
+    );
+    let value_length = browser.eval(&len_expr).await.ok().and_then(|v| v.as_u64());
     if submit {
         submit_enter(browser).await?;
     }
-    Ok(ok_text(json!({"ok": true}).to_string()))
+    Ok(type_reply(text, value_length))
 }
 
 async fn submit_enter(browser: &Browser) -> Result<(), String> {
@@ -3152,6 +3369,51 @@ async fn tool_upload(
         return Ok(ok_text(
             json!({"ok": true, "files": paths.len()}).to_string(),
         ));
+    }
+    // AX ref path: resolve the recorded backend id and set files on it
+    // directly (`DOM.setFileInputFiles` accepts backendNodeId), so a file
+    // input inside a shadow root works without a querySelector.
+    if let Some(id) = parse_ref(element) {
+        guard_ref(browser, "upload", element, &id).await?;
+        if let Some(backend) = browser.ref_backend(&id).await {
+            let oid = resolve_ref_object(browser, "upload", &id)
+                .await?
+                .unwrap_or_default();
+            let probe_fn = r#"function() { const el = this; if (!el || !el.isConnected) return 'GLADIUS_NOTFOUND'; if (el.disabled) return 'GLADIUS_DISABLED'; if (el.tagName !== 'INPUT' || (el.type || '').toLowerCase() !== 'file') return 'GLADIUS_NOTFILE'; return 'GLADIUS_OK'; }"#;
+            match call_on_object(browser, &oid, probe_fn, vec![])
+                .await?
+                .as_str()
+            {
+                Some("GLADIUS_OK") => {}
+                Some("GLADIUS_NOTFOUND") => {
+                    return Err(stale_gone("upload", element, &id));
+                }
+                Some("GLADIUS_DISABLED") => {
+                    return Err(ToolErr::typed(
+                        format!("upload: element is disabled: {element}"),
+                        json!({"code": "not_actionable", "reason": "disabled", "tool": "upload", "ref": format!("@{id}")}),
+                    ));
+                }
+                _ => {
+                    return Err(ToolErr::typed(
+                        format!("upload: element is not a file input: {element}"),
+                        json!({"code": "invalid_target", "reason": "not_file", "tool": "upload", "ref": format!("@{id}")}),
+                    ));
+                }
+            }
+            browser.command("DOM.enable", json!({}), true).await?;
+            browser
+                .command(
+                    "DOM.setFileInputFiles",
+                    json!({"backendNodeId": backend, "files": paths}),
+                    true,
+                )
+                .await
+                .map_err(|e| format!("upload: {e}"))?;
+            return Ok(ok_text(
+                json!({"ok": true, "files": paths.len()}).to_string(),
+            ));
+        }
     }
     let sel_owned;
     let (sel, rid): (&str, Option<String>) = match parse_ref(element) {
@@ -3486,11 +3748,16 @@ async fn tool_hover(
     }
     if let Some(id) = parse_ref(element) {
         let at_id = guard_ref(browser, "hover", element, &id).await?;
-        let rid = serde_json::to_string(&id).map_err(|e| e.to_string())?;
-        let expr = format!(
-            "((ref) => {{ const el = document.querySelector('[data-gladius-ref=\"' + ref + '\"]'); if (!el) return 'GLADIUS_NOTFOUND'; const cs = getComputedStyle(el); if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') return 'GLADIUS_HIDDEN'; try {{ el.scrollIntoView({{block: 'center', inline: 'center'}}); }} catch (e) {{}} const r = el.getBoundingClientRect(); if (!r || r.width === 0 || r.height === 0) return 'GLADIUS_HIDDEN'; const cx = r.left + r.width / 2, cy = r.top + r.height / 2; let hit = null; try {{ hit = document.elementFromPoint(cx, cy); }} catch (e) {{ return 'GLADIUS_OCCLUDED'; }} if (!hit || (hit !== el && !el.contains(hit))) return 'GLADIUS_OCCLUDED'; return JSON.stringify({{x: cx, y: cy}}); }})({rid})"
-        );
-        let v = browser.eval(&expr).await?;
+        let v = match resolve_ref_object(browser, "hover", &id).await? {
+            Some(oid) => call_on_object(browser, &oid, hover_preflight_fn(), vec![]).await?,
+            None => {
+                let rid = serde_json::to_string(&id).map_err(|e| e.to_string())?;
+                let expr = format!(
+                    "((ref) => {{ const el = document.querySelector('[data-gladius-ref=\"' + ref + '\"]'); if (!el) return 'GLADIUS_NOTFOUND'; const cs = getComputedStyle(el); if (cs.display === 'none' || cs.visibility === 'hidden' || cs.visibility === 'collapse') return 'GLADIUS_HIDDEN'; try {{ el.scrollIntoView({{block: 'center', inline: 'center'}}); }} catch (e) {{}} const r = el.getBoundingClientRect(); if (!r || r.width === 0 || r.height === 0) return 'GLADIUS_HIDDEN'; const cx = r.left + r.width / 2, cy = r.top + r.height / 2; let hit = null; try {{ hit = document.elementFromPoint(cx, cy); }} catch (e) {{ return 'GLADIUS_OCCLUDED'; }} if (!hit || (hit !== el && !el.contains(hit))) return 'GLADIUS_OCCLUDED'; return JSON.stringify({{x: cx, y: cy}}); }})({rid})"
+                );
+                browser.eval(&expr).await?
+            }
+        };
         if v.as_str() == Some("GLADIUS_NOTFOUND") {
             return Err(stale_gone("hover", element, &id));
         }
@@ -3600,7 +3867,6 @@ async fn tool_select(
     }
     if let Some(id) = parse_ref(element) {
         guard_ref(browser, "select", element, &id).await?;
-        let rid = serde_json::to_string(&id).map_err(|e| e.to_string())?;
         let val_lit = match value {
             Some(s) => serde_json::to_string(s).map_err(|e| e.to_string())?,
             None => "null".to_string(),
@@ -3609,10 +3875,24 @@ async fn tool_select(
             Some(s) => serde_json::to_string(s).map_err(|e| e.to_string())?,
             None => "null".to_string(),
         };
-        let expr = format!(
-            "((ref) => {{ const el = document.querySelector('[data-gladius-ref=\"' + ref + '\"]'); if (!el) return 'GLADIUS_NOTFOUND'; if (!el || el.tagName !== 'SELECT') return 'GLADIUS_NOTSELECT'; const wantValue = {val_lit}; const wantText = {txt_lit}; const opts = Array.from(el.options); let opt = null; if (wantValue !== null) {{ opt = opts.find(o => o.value === wantValue); }} else {{ opt = opts.find(o => o.text === wantText || o.textContent === wantText); }} if (!opt) return 'GLADIUS_NOOPT'; el.value = opt.value; el.selectedIndex = opts.indexOf(opt); el.dispatchEvent(new Event('input', {{bubbles: true}})); el.dispatchEvent(new Event('change', {{bubbles: true}})); return 'GLADIUS_OK'; }})({rid})"
-        );
-        let v = browser.eval(&expr).await?;
+        let v = match resolve_ref_object(browser, "select", &id).await? {
+            Some(oid) => {
+                call_on_object(
+                    browser,
+                    &oid,
+                    &select_preflight_fn(&val_lit, &txt_lit),
+                    vec![],
+                )
+                .await?
+            }
+            None => {
+                let rid = serde_json::to_string(&id).map_err(|e| e.to_string())?;
+                let expr = format!(
+                    "((ref) => {{ const el = document.querySelector('[data-gladius-ref=\"' + ref + '\"]'); if (!el) return 'GLADIUS_NOTFOUND'; if (!el || el.tagName !== 'SELECT') return 'GLADIUS_NOTSELECT'; const wantValue = {val_lit}; const wantText = {txt_lit}; const opts = Array.from(el.options); let opt = null; if (wantValue !== null) {{ opt = opts.find(o => o.value === wantValue); }} else {{ opt = opts.find(o => o.text === wantText || o.textContent === wantText); }} if (!opt) return 'GLADIUS_NOOPT'; el.value = opt.value; el.selectedIndex = opts.indexOf(opt); el.dispatchEvent(new Event('input', {{bubbles: true}})); el.dispatchEvent(new Event('change', {{bubbles: true}})); return 'GLADIUS_OK'; }})({rid})"
+                );
+                browser.eval(&expr).await?
+            }
+        };
         return match v.as_str() {
             Some("GLADIUS_OK") => Ok(ok_text(json!({"ok": true}).to_string())),
             Some("GLADIUS_NOTFOUND") => Err(stale_gone("select", element, &id)),

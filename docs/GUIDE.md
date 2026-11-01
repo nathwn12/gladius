@@ -245,7 +245,7 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 
 #### `wait_for`
 - **Args:** at least one of `selector?: string`, `text?: string`, `ms?: number`, `networkIdle?: bool`, `idleMs?: number`, `expression?: string`
-- **Returns:** `{ "ok": true }` when the condition holds, or when the timeout elapses (maximum 15 s). `expression` polls a JS predicate with backoff.
+- **Returns:** `{ "ok": true }` when the condition holds. On expiry the call is a typed `timeout` error (`structuredContent.code = "timeout"`), never a silent `ok:true` (maximum 15 s). `expression` polls a JS predicate with backoff.
 - **Example:** `{"selector": "#results", "ms": 5000}`
 
 #### `assert_layout`

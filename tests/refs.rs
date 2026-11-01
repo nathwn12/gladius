@@ -225,22 +225,31 @@ fn ref_actions_are_exact() {
         "hover-by-ref fired mouseover: {h}"
     );
 
-    // type by ref into #name: re-snapshot to get its ref via id lookup.
-    let rname = content_text(&c.call(
-        "evaluate",
-        json!({"expression": "document.querySelector('#name').dataset.gladiusRef || 'NOREF'"}),
-    ));
-    assert!(!rname.contains("NOREF"), "name input stamped: {rname}");
-    // content_text wraps as {"value":"eN"}; extract eN.
-    let id: String = rname
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect::<String>()
-        .trim_start_matches("value")
-        .to_string();
+    // type by ref into #name: take its ref from the structured node table
+    // (the page is not stamped any more; refs are backend ids).
+    let snapv = c.call("snapshot", json!({}));
+    let st: Value = snapv
+        .get("content")
+        .and_then(|c| c.get(1))
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Null);
+    let name_ref = st
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .and_then(|ns| {
+            ns.iter().find_map(|n| {
+                (n.get("tag").and_then(|t| t.as_str()) == Some("input")
+                    && n.get("name").and_then(|t| t.as_str()) == Some("name"))
+                .then(|| n.get("ref").and_then(|r| r.as_str()).map(|r| r.to_string()))
+                .flatten()
+            })
+        })
+        .unwrap_or_else(|| panic!("name input ref in structured nodes: {st}"));
     let t = c.call(
         "type",
-        json!({"element": format!("@{id}"), "text": "ref-typed-1"}),
+        json!({"element": format!("@{name_ref}"), "text": "ref-typed-1"}),
     );
     assert!(!is_error(&t), "type by ref ok: {t}");
     let vv = content_text(&c.call(
@@ -380,5 +389,147 @@ fn refs_are_unique_across_snapshots() {
     // New ref still acts.
     let new = c.call("click", json!({"element": r2}));
     assert!(!is_error(&new), "new ref ok: {new}");
+    finish(c);
+}
+
+/// The structured snapshot block (content[1]) as JSON.
+fn structured(v: &Value) -> Value {
+    v.get("content")
+        .and_then(|c| c.get(1))
+        .and_then(|c| c.get("text"))
+        .and_then(|t| t.as_str())
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(Value::Null)
+}
+
+fn body_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|l| {
+            !l.starts_with("[snapshot:")
+                && !l.starts_with("[page:")
+                && !l.starts_with("text: ")
+                && !l.starts_with("[truncated:")
+        })
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// P1: a snapshot larger than the 8000-char cap pages with offset/nextOffset,
+/// every line is reconstructible exactly once, refs never change namespace,
+/// and a ref taken from page 2 still acts.
+#[test]
+fn snapshot_pages_without_renaming_refs() {
+    let mut c = launch_on_fixture();
+    c.call(
+        "evaluate",
+        json!({"expression": "let h=''; for (let i=0;i<400;i++) h+=`<button onclick=\"window.__paged=this.textContent\">PAGED_BUTTON_${i}_WITH_A_LONG_LABEL_TO_FILL_LINES</button>`; document.body.insertAdjacentHTML('beforeend', h); 'bulked'"}),
+    );
+    let first = c.call("snapshot", json!({}));
+    assert!(!is_error(&first), "first page ok: {first}");
+    let t0 = content_text(&first);
+    assert!(t0.chars().count() <= 8000, "page 1 bounded");
+    let s0 = structured(&first);
+    let sid = s0
+        .get("snapshotId")
+        .and_then(|v| v.as_str())
+        .expect("snapshotId present")
+        .to_string();
+    let total = s0
+        .get("totalLines")
+        .and_then(|v| v.as_u64())
+        .expect("totalLines present");
+    assert!(total > 20, "fixture renders a multi-page snapshot: {total}");
+    let mut offset = s0
+        .get("nextOffset")
+        .and_then(|v| v.as_u64())
+        .expect("page 1 is followed by page 2");
+    assert!(offset > 1, "page 1 ended mid-line-list: {offset}");
+    let mut all = body_lines(&t0);
+    let mut second_page_ref: Option<String> = None;
+    let mut pages = 1;
+    while offset < total {
+        let p = c.call(
+            "snapshot",
+            json!({"offset": offset, "snapshotId": sid.clone()}),
+        );
+        assert!(!is_error(&p), "page at offset {offset} ok: {p}");
+        let t = content_text(&p);
+        assert!(t.chars().count() <= 8000, "page at {offset} bounded");
+        let s = structured(&p);
+        assert_eq!(
+            s.get("snapshotId").and_then(|v| v.as_str()),
+            Some(sid.as_str()),
+            "paging keeps the same snapshot identity"
+        );
+        assert_eq!(
+            s.get("offset").and_then(|v| v.as_u64()),
+            Some(offset),
+            "reply echoes the offset"
+        );
+        if second_page_ref.is_none() {
+            second_page_ref = s
+                .get("nodes")
+                .and_then(|n| n.as_array())
+                .and_then(|ns| ns.first())
+                .and_then(|n| n.get("ref"))
+                .and_then(|r| r.as_str())
+                .map(|r| r.to_string());
+        }
+        all.extend(body_lines(&t));
+        pages += 1;
+        match s.get("nextOffset").and_then(|v| v.as_u64()) {
+            Some(n) => {
+                assert!(n > offset, "nextOffset moves forward");
+                offset = n;
+            }
+            None => break,
+        }
+    }
+    assert!(pages > 1, "the fixture actually paged");
+    assert_eq!(
+        all.len() as u64,
+        total,
+        "every line reconstructed exactly once (pages {pages})"
+    );
+    assert!(
+        all.iter().any(|l| l.contains("PAGED_BUTTON_399")),
+        "the tail node line survived paging"
+    );
+
+    // Acting on a ref from the second page resolves in the SAME table.
+    let r = second_page_ref.expect("page 2 carries a ref");
+    let clk = c.call("click", json!({"element": format!("@{r}")}));
+    assert!(!is_error(&clk), "click by page-2 ref @{r}: {clk}");
+    let hit = content_text(&c.call("evaluate", json!({"expression": "window.__paged || ''"})));
+    assert!(
+        hit.contains("PAGED_BUTTON_"),
+        "page-2 ref acted on the same node: {hit}"
+    );
+    finish(c);
+}
+
+/// P2: `type` reports the field's post-insert length and notes a transform,
+/// instead of an unconditional ok that hides maxlength truncation.
+#[test]
+fn type_reports_truncated_length() {
+    let mut c = launch_on_fixture();
+    c.call(
+        "evaluate",
+        json!({"expression": "document.body.insertAdjacentHTML('beforeend', '<input id=\"limited\" maxlength=\"3\" type=\"text\">'); 'ok'"}),
+    );
+    let out = c.call("type", json!({"element": "#limited", "text": "abcdefgh"}));
+    assert!(!is_error(&out), "type ok even when it transforms: {out}");
+    let v: Value = serde_json::from_str(&content_text(&out)).expect("type reply is JSON");
+    assert_eq!(v.get("ok"), Some(&json!(true)));
+    assert_eq!(
+        v.get("valueLength").and_then(|n| n.as_u64()),
+        Some(3),
+        "valueLength is the real stored length: {v}"
+    );
+    let note = v.get("note").and_then(|n| n.as_str()).unwrap_or("");
+    assert!(
+        note.contains("transformed"),
+        "a differing length is explained, never silent: {v}"
+    );
     finish(c);
 }

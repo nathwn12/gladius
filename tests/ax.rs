@@ -189,27 +189,6 @@ fn probe_line(snap: &str, needle: &str) -> String {
         .to_string()
 }
 
-/// Stamped ref (`eN`) of the element matched by this JS expression, via
-/// the `data-gladius-ref` stamp. Read back right after the snapshot under
-/// test: each snapshot restamps the whole page, so refs are table-local.
-fn ref_of(c: &mut Client, expr: &str) -> String {
-    let t = content_text(&c.call(
-        "evaluate",
-        json!({"expression": format!("({expr}).dataset.gladiusRef || 'NOREF'")}),
-    ));
-    let rid: String = t
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect::<String>()
-        .trim_start_matches("value")
-        .to_string();
-    assert!(
-        !rid.is_empty() && rid != "NOREF",
-        "stamped ref present for {expr}"
-    );
-    rid
-}
-
 /// Node line bearing this ref.
 fn line_for_ref(snap: &str, rid: &str) -> String {
     snap.lines()
@@ -319,30 +298,50 @@ fn ax_legacy_name_parity_whitespace_prefix() {
         )}),
     );
     let def = content_text(&c.call("snapshot", json!({})));
-    // Refs are table-local: read back before the next snapshot restamps.
-    let by_id = |c: &mut Client, id: &str| {
-        let lit = serde_json::to_string(id).unwrap();
-        ref_of(c, &format!("document.getElementById({lit})"))
+    // Refs are table-local: read them from this snapshot's own node lines.
+    let ref_before = |snap: &str, needle: &str| -> String {
+        let lines: Vec<&str> = snap.lines().filter(|l| l.starts_with("- ")).collect();
+        let idx = lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no line with {needle:?}"));
+        let prev = lines[idx - 1];
+        let a = prev
+            .find("[@")
+            .unwrap_or_else(|| panic!("no ref before {needle:?}"));
+        let rest = &prev[a + 2..];
+        let b = rest.find(']').unwrap_or_else(|| panic!("unterminated ref"));
+        format!("@{}", &rest[..b])
     };
-    let d_id = by_id(&mut c, &format!("{pad}ID_END"));
-    let d_ph = by_id(&mut c, "par-wsph");
-    let d_sel = by_id(&mut c, "par-wssel");
-    let d_we = by_id(&mut c, "par-wsempty");
-    let d_pw = by_id(&mut c, "par-wspass");
-    let d_nm = ref_of(
-        &mut c,
-        &format!("document.querySelector('[name=\"{pad}NAME_END\"]')"),
-    );
+    let d_id = find_ref(&def, "ID_END").trim_start_matches('@').to_string();
+    let d_ph = find_ref(&def, "PH_END").trim_start_matches('@').to_string();
+    let d_sel = find_ref(&def, "OPT_END")
+        .trim_start_matches('@')
+        .to_string();
+    let d_we = ref_before(&def, "par-wspass")
+        .trim_start_matches('@')
+        .to_string();
+    let d_pw = find_ref(&def, "par-wspass")
+        .trim_start_matches('@')
+        .to_string();
+    let d_nm = find_ref(&def, "NAME_END")
+        .trim_start_matches('@')
+        .to_string();
     let leg = content_text(&c.call("snapshot", json!({"mode": "legacy"})));
-    let l_id = by_id(&mut c, &format!("{pad}ID_END"));
-    let l_ph = by_id(&mut c, "par-wsph");
-    let l_sel = by_id(&mut c, "par-wssel");
-    let l_we = by_id(&mut c, "par-wsempty");
-    let l_pw = by_id(&mut c, "par-wspass");
-    let l_nm = ref_of(
-        &mut c,
-        &format!("document.querySelector('[name=\"{pad}NAME_END\"]')"),
-    );
+    let l_id = find_ref(&leg, "ID_END").trim_start_matches('@').to_string();
+    let l_ph = find_ref(&leg, "PH_END").trim_start_matches('@').to_string();
+    let l_sel = find_ref(&leg, "OPT_END")
+        .trim_start_matches('@')
+        .to_string();
+    let l_we = ref_before(&leg, "par-wspass")
+        .trim_start_matches('@')
+        .to_string();
+    let l_pw = find_ref(&leg, "par-wspass")
+        .trim_start_matches('@')
+        .to_string();
+    let l_nm = find_ref(&leg, "NAME_END")
+        .trim_start_matches('@')
+        .to_string();
 
     // Trailing token survives normalization on both paths.
     for (d, l, want) in [
@@ -609,5 +608,38 @@ fn default_ax_full_semantics() {
     assert!(def.contains("••••"), "password mask:\n{def}");
     assert!(!def.contains("supersecret123"), "raw password absent");
     assert!(def.chars().count() <= 8000, "bounded to 8000 chars");
+    finish(c);
+}
+
+/// P1 structural: a ref inside an open shadow root is actionable. The old
+/// `document.querySelector('[data-gladius-ref]')` resolver could not see into
+/// the shadow root, so this click and type both returned a typed stale_ref.
+#[test]
+fn shadow_refs_are_actionable() {
+    let mut c = launch_on_ax();
+    c.call(
+        "evaluate",
+        json!({"expression": "(() => { const s = document.getElementById('shadow-host').shadowRoot; s.innerHTML += '<input id=\"shadow-input\" type=\"text\" aria-label=\"SHADOW_INPUT_LABEL\">'; s.getElementById('shadow-btn').addEventListener('click', () => { window.__shadowClicked = (window.__shadowClicked || 0) + 1; }); return 'ok'; })()"}),
+    );
+    let snap = c.call("snapshot", json!({}));
+    assert!(!is_error(&snap), "shadow snapshot ok: {snap}");
+    let t = content_text(&snap);
+    let rb = find_ref(&t, "SHADOW_BTN_LABEL_inner-abc");
+    let clk = c.call("click", json!({"element": rb}));
+    assert!(!is_error(&clk), "click through a shadow ref: {clk}");
+    let clicked = content_text(&c.call(
+        "evaluate",
+        json!({"expression": "window.__shadowClicked || 0"}),
+    ));
+    assert!(clicked.contains('1'), "shadow click fired: {clicked}");
+
+    let ri = find_ref(&t, "SHADOW_INPUT_LABEL");
+    let ty = c.call("type", json!({"element": ri, "text": "shadow-typed"}));
+    assert!(!is_error(&ty), "type through a shadow ref: {ty}");
+    let v = content_text(&c.call(
+        "evaluate",
+        json!({"expression": "document.getElementById('shadow-host').shadowRoot.getElementById('shadow-input').value"}),
+    ));
+    assert!(v.contains("shadow-typed"), "shadow type landed: {v}");
     finish(c);
 }
