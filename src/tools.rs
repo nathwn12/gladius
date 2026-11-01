@@ -13,8 +13,8 @@ pub fn list() -> Value {
             "required": ["url", "title"], "additionalProperties": false},
          "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}},
         {"name": "snapshot", "title": "Snapshot",
-         "description": "Snapshot: one line per node with a stable ref (@eN, unique per snapshot), role/name/value, plus page text. Default is the real Accessibility tree (shadow + same-process frames; hidden/ignored subtrees excluded). mode:\"legacy\" keeps the old DOM heuristic; mode:\"text\" is text-only. frame=<CDP frameId> from targets scopes the snapshot to that iframe (same-process first; OOPIF is a follow-up). Shadow refs resolve in the snapshot but acting on a shadow ref through the main-document resolver is not yet supported (typed stale_ref, never a faked click).",
-         "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["ax", "legacy", "text"]}, "frame": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "snapshotId": {"type": "string"}}, "additionalProperties": false},
+         "description": "Snapshot: one line per node with a stable ref (@eN, unique per snapshot), role/name/value, plus page text. Default is the real Accessibility tree (shadow + same-process frames; hidden/ignored subtrees excluded). mode:\"legacy\" keeps the old DOM heuristic (the only path that stamps an attribute into the page); mode:\"text\" is text-only. frame=<CDP frameId> from targets scopes the snapshot to that iframe (same-process first; OOPIF is a follow-up). AX refs resolve by backend node id, so a shadow ref is actionable exactly like a light-DOM ref. Paging: pass the snapshotId from the offset:0 render with offset>0 (required; paging slices that render and never re-renders).",
+         "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["ax", "legacy", "text"]}, "frame": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "snapshotId": {"type": "string", "description": "required when offset > 0: the id returned by the offset:0 render"}}, "additionalProperties": false},
          "outputSchema": {"type": "object",
             "properties": {
                 "url": {"type": "string"}, "title": {"type": "string"},
@@ -402,6 +402,7 @@ impl From<String> for ToolErr {
 ///   invalid_target   reason not_select|not_found|not_file   (+ tool, ref|element)
 ///   option_not_found reason no_match                         (+ tool, want)
 ///   capability_gated reason dom_only                         (+ tool)
+///   target_changed   reason raced                             (+ tool, before, after)
 ///   timeout          reason budget_exceeded                   (+ tool)
 ///   invalid_args     reason missing_arg|bad_value|bad_index|unknown_action|unknown_tool|need_option|unknown_arg (+ tool, arg?)
 ///   error            fallback, code only (cdp/js-engine failures and anything untyped)
@@ -998,7 +999,9 @@ fn parse_ref(s: &str) -> Option<String> {
 /// Guard a ref-targeted action: unknown refs and post-navigation refs fail
 /// with a TYPED stale-ref error naming the reason - never a silent
 /// wrong-element click. Returns the ref id (`eN`) when it may proceed.
-async fn guard_ref(
+/// Shared by the action tools and the geometry tools so a ref means the same
+/// thing everywhere.
+pub(crate) async fn guard_ref(
     browser: &Browser,
     tool: &str,
     _element: &str,
@@ -1347,6 +1350,15 @@ async fn emit_paged_snapshot(
     items: Vec<Value>,
     text: String,
 ) -> Result<Value, ToolErr> {
+    if offset > 0 && snapshot_id.is_none() {
+        return Err(ToolErr::typed(
+            format!(
+                "snapshot: offset {offset} requires snapshotId (the id the offset:0 render returned; paging slices that render and never re-renders)"
+            ),
+            json!({"code": "invalid_args", "reason": "missing_arg", "tool": "snapshot",
+                   "arg": "snapshotId", "offset": offset}),
+        ));
+    }
     let cache = if offset == 0 {
         let mut lines: Vec<String> = Vec::with_capacity(items.len() + 3);
         lines.push(format!("AX snapshot: {title} <{url}>"));
@@ -1383,6 +1395,10 @@ async fn emit_paged_snapshot(
         browser.store_snapshot(c.clone()).await;
         c
     } else {
+        // Paging reads the render a concurrent offset:0 snapshot may be
+        // rewriting: take the same lock every render holds and clone the
+        // cache under it, so the id check and the slice see ONE render.
+        let _paging_guard = browser.lock_snapshot().await;
         let c = browser.cached_snapshot().await.ok_or_else(|| {
             ToolErr::typed(
                 "snapshot: no cached render to page; call snapshot without offset first"
@@ -1478,23 +1494,19 @@ async fn emit_paged_snapshot(
         }
     }
     let Some((full, end, tail_cut)) = last_fit else {
-        // Degenerate: a single line plus footer exceeds the cap.
-        let cut: String = cache.lines[offset].chars().take(cap).collect();
-        let node_lo = offset.saturating_sub(1).min(total_nodes);
-        let node_hi = end.saturating_sub(1).min(total_nodes);
-        let nodes: Vec<Value> = if node_hi > node_lo {
-            cache.nodes[node_lo..node_hi].to_vec()
-        } else {
-            Vec::new()
-        };
-        return Ok(ok_snapshot(
-            cut,
-            json!({
-                "url": cache.url, "title": cache.title, "truncated": true,
-                "nodes": nodes, "snapshotId": cache.id,
-                "offset": offset, "totalLines": total_lines,
-                "nextOffset": Value::Null,
-            }),
+        // Degenerate: one line plus its footer exceeds the cap, so no page
+        // boundary exists that would make progress. The old shape returned
+        // the cut line with `truncated:true` AND `nextOffset:null`, which
+        // says "there is more, and there is no next page" - a dead end for
+        // the caller. Refuse with the line length and the way out instead.
+        let line_chars = cache.lines[offset].chars().count();
+        return Err(ToolErr::typed(
+            format!(
+                "snapshot: line {offset} is {line_chars} chars and alone exceeds the {cap}-char page cap; cannot page this render (re-snapshot with mode:\"text\" for the page text)"
+            ),
+            json!({"code": "invalid_args", "reason": "bad_value", "tool": "snapshot",
+                   "arg": "offset", "offset": offset, "lineChars": line_chars,
+                   "totalLines": total_lines, "cap": cap}),
         ));
     };
     let next = if end < total_lines { Some(end) } else { None };
@@ -1732,31 +1744,137 @@ async fn tool_snapshot_legacy(
     .await
 }
 
+/// One `Runtime.callFunctionOn` body enriching up to 100 resolved objects in
+/// the receiver's world. Kept at module scope: `enrich_objects` splits a
+/// rejected chunk and re-runs this exact function on each sub-chunk.
+const ENRICH_FN: &str = r#"function(...rest) {
+  const SENS = new Set(["current-password", "new-password", "cc-number", "cc-exp", "cc-csc", "one-time-code"]);
+  const els = [this, ...rest];
+  return els.map((el) => {
+    if (!el || !el.tagName) return null;
+    const tag = ((el.tagName || "").toLowerCase());
+    let rawVal = "";
+    try { if ("value" in el) rawVal = String(el.value); } catch (e) {}
+    const ty = String((el.getAttribute && el.getAttribute("type")) || el.type || "").toLowerCase();
+    const ac = String((el.getAttribute && el.getAttribute("autocomplete")) || el.autocomplete || "");
+    const sens = (tag === "input") && (ty === "password" || ac.toLowerCase().split(/\s+/).filter(Boolean).some((t) => SENS.has(t)));
+    let ph = ""; try { ph = el.placeholder || ""; } catch (e) {}
+    let eid = ""; try { eid = el.id || ""; } catch (e) {}
+    let enm = ""; try { enm = el.name || ""; } catch (e) {}
+    let selText = "";
+    try { if (tag === "select" && el.options && el.selectedIndex >= 0) { const o = el.options[el.selectedIndex]; selText = (o && (o.text || o.textContent)) || ""; } } catch (e) {}
+    return {tag: tag, disabled: !!el.disabled, value: rawVal.slice(0, 60), fullVal: rawVal, sens: sens, ph: String(ph || ""), eid: String(eid || ""), enm: String(enm || ""), selText: String(selText || ""), ty: String(ty || "").slice(0, 20)};
+  });
+}"#;
+
+/// Enrich resolved objects in chunks of 100, splitting a chunk the engine
+/// rejects. `Runtime.callFunctionOn` requires every argument to share the
+/// receiver's JavaScript world, so a chunk that mixes worlds (nodes of two
+/// frames/realms in one tree) fails as a whole; the split keeps that failure
+/// to the object that genuinely cannot be read instead of nulling its
+/// neighbours. Values keep the input order; a singleton that still fails is
+/// `Null` and takes the masked fallback.
+async fn enrich_objects(browser: &Browser, ids: &[String]) -> Vec<Value> {
+    let mut vals: Vec<Value> = vec![Value::Null; ids.len()];
+    let mut pending: Vec<(usize, usize)> = (0..ids.len())
+        .step_by(100)
+        .map(|s| (s, (ids.len() - s).min(100)))
+        .collect();
+    pending.reverse(); // pop() runs the chunks left to right
+    while let Some((start, len)) = pending.pop() {
+        let chunk = &ids[start..start + len];
+        let Some((receiver, rest)) = chunk.split_first() else {
+            continue;
+        };
+        let args: Vec<Value> = rest.iter().map(|id| json!({"objectId": id})).collect();
+        let got = browser
+            .command(
+                "Runtime.callFunctionOn",
+                json!({"objectId": receiver, "functionDeclaration": ENRICH_FN,
+                       "returnByValue": true, "arguments": args}),
+                true,
+            )
+            .await
+            .ok()
+            .and_then(|v| v.get("result").and_then(|x| x.get("value")).cloned());
+        match got {
+            Some(Value::Array(a)) if a.len() == len => {
+                for (i, v) in a.into_iter().enumerate() {
+                    vals[start + i] = v;
+                }
+            }
+            _ if len == 1 => {}
+            _ => {
+                let mid = len / 2;
+                pending.push((start + mid, len - mid));
+                pending.push((start, mid));
+            }
+        }
+    }
+    vals
+}
+
+/// Value reported when a node's live element could not be read at all. The
+/// AX tree may already carry a value, but a text-entry control never falls
+/// back to it raw: the element is gone, sensitivity cannot be re-checked
+/// (`sens` lives on the element), and the credential mask wins over
+/// legibility on this rare path.
+fn unreadable_value(role: &str, ax_value: &str) -> String {
+    if ax_value.is_empty() {
+        return String::new();
+    }
+    match role {
+        "textbox" | "searchbox" => "••••".to_string(),
+        _ => ax_value.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unreadable_value;
+
+    /// The unreadable fallback is the ONE branch where the value comes from
+    /// the AX tree instead of the live element, so it cannot consult the
+    /// element's `sens` flag; a text-entry node must mask, everything else
+    /// keeps the AX value it already had.
+    #[test]
+    fn unreadable_fallback_never_emits_a_credential() {
+        assert_eq!(unreadable_value("textbox", "PW_SECRET_123"), "••••");
+        assert_eq!(unreadable_value("searchbox", "PW_SECRET_123"), "••••");
+        assert_eq!(unreadable_value("textbox", ""), "", "empty stays empty");
+        assert_eq!(unreadable_value("button", "OK"), "OK");
+        assert_eq!(
+            unreadable_value("combobox", "chosen option"),
+            "chosen option"
+        );
+    }
+}
+
 /// Real Accessibility-tree snapshot (the DEFAULT when `mode` is absent or
 /// null; explicit `mode:"ax"` is identical; optional `frame=`).
 /// Nodes come from `Accessibility.getFullAXTree`: non-ignored AX nodes with
-/// a `backendDOMNodeId`. Backend ids map to frontend node ids
-/// (`DOM.pushNodesByBackendIdsToFrontend`); each is stamped with
-/// `data-gladius-ref` via `DOM.setAttributeValue` so the existing ref
-/// guards keep resolving. Role/name come from the AX node; tag and the
-/// live disabled/value refine from the element in one eval
-/// (`DOM.describeNode` fallback for shadow nodes `querySelector` cannot
-/// reach). Unlabeled form controls (empty AX name on input/textarea/select)
-/// fall back the same way the legacy heuristic names them
-/// (placeholder, live value unless sensitive, selected option, id, name) so
-/// an unlabeled control keeps a stable human name on both paths. Sensitive
-/// inputs keep the G0 mask. AX-ignored subtrees (display:none, aria-hidden,
-/// and other ignored nodes) are NOT stamped and never appear in the lines:
-/// an old ref to such a node resolves through the guard to the typed
+/// a `backendDOMNodeId`. Nothing is stamped into the page: the backend id IS
+/// the ref's identity (`DOM.resolveNode` -> `Runtime.callFunctionOn`), the
+/// same resolver `click`/`type`/`hover`/`select`/`upload` and the geometry
+/// tools use, and `DOM.resolveNode` pierces open shadow roots - so a shadow
+/// ref is actionable exactly like a light-DOM ref. Role/name come from the
+/// AX node; tag, disabled and the live value refine from the resolved element
+/// (a node whose element cannot be read keeps the AX field and the mask).
+/// Unlabeled form controls (empty AX name on input/textarea/select) fall back
+/// the same way the legacy heuristic names them (placeholder, live value
+/// unless sensitive, selected option, id, name) so an unlabeled control keeps
+/// a stable human name on both paths. Sensitive inputs keep the G0 mask, on
+/// the enriched path and on the unreadable fallback. AX-ignored subtrees
+/// (display:none, aria-hidden, and other ignored nodes) never appear in the
+/// lines: an old ref to such a node resolves through the guard to the typed
 /// `stale_ref` (unknown/node-gone), never a silent main-frame click.
+/// `mode:"legacy"` is the exception: it is the DOM-heuristic path, which
+/// still stamps `data-gladius-ref` in one page eval and resolves refs by that
+/// attribute (no backend ids, no ML shadow support).
 /// Text format, block2 shape, cap, and footer match the legacy path.
-/// Same-process iframes are covered; OOPIF subtrees needing a separate
-/// target session are a documented follow-up (the engine error surfaces
-/// instead of faked content). Acting on a shadow ref through the
-/// main-document `querySelector` resolver is NOT yet supported (G4): the
-/// resolver cannot reach into open shadow roots, so a shadow ref action
-/// today returns the typed `stale_ref`/`node-gone` - documented, never
-/// faked.
+/// Same-process iframes are covered when their frame is read directly
+/// (snapshot frame=, or an OOPIF session); an engine that refuses a frame
+/// surfaces the error instead of faked content.
 async fn tool_snapshot_ax(
     browser: &Browser,
     frame: Option<&str>,
@@ -1886,47 +2004,9 @@ async fn tool_snapshot_ax(
     // Live enrichment in one callFunctionOn per 100 objects: the same fields
     // the old selector eval produced, now read from the resolved objects
     // themselves (shadow included). The first object of each chunk is the
-    // receiver so every call stays in that node's execution context.
-    const ENRICH_FN: &str = r#"function(...rest) {
-  const SENS = new Set(["current-password", "new-password", "cc-number", "cc-exp", "cc-csc", "one-time-code"]);
-  const els = [this, ...rest];
-  return els.map((el) => {
-    if (!el || !el.tagName) return null;
-    const tag = ((el.tagName || "").toLowerCase());
-    let rawVal = "";
-    try { if ("value" in el) rawVal = String(el.value); } catch (e) {}
-    const ty = String((el.getAttribute && el.getAttribute("type")) || el.type || "").toLowerCase();
-    const ac = String((el.getAttribute && el.getAttribute("autocomplete")) || el.autocomplete || "");
-    const sens = (tag === "input") && (ty === "password" || ac.toLowerCase().split(/\s+/).filter(Boolean).some((t) => SENS.has(t)));
-    let ph = ""; try { ph = el.placeholder || ""; } catch (e) {}
-    let eid = ""; try { eid = el.id || ""; } catch (e) {}
-    let enm = ""; try { enm = el.name || ""; } catch (e) {}
-    let selText = "";
-    try { if (tag === "select" && el.options && el.selectedIndex >= 0) { const o = el.options[el.selectedIndex]; selText = (o && (o.text || o.textContent)) || ""; } } catch (e) {}
-    return {tag: tag, disabled: !!el.disabled, value: rawVal.slice(0, 60), fullVal: rawVal, sens: sens, ph: String(ph || ""), eid: String(eid || ""), enm: String(enm || ""), selText: String(selText || ""), ty: String(ty || "").slice(0, 20)};
-  });
-}"#;
-    let mut enrich_vals: Vec<Value> = Vec::new();
-    for chunk in object_ids.chunks(100) {
-        let Some((receiver, rest)) = chunk.split_first() else {
-            continue;
-        };
-        let args: Vec<Value> = rest.iter().map(|id| json!({"objectId": id})).collect();
-        let got = browser
-            .command(
-                "Runtime.callFunctionOn",
-                json!({"objectId": receiver, "functionDeclaration": ENRICH_FN,
-                       "returnByValue": true, "arguments": args}),
-                true,
-            )
-            .await
-            .ok()
-            .and_then(|v| v.get("result").and_then(|x| x.get("value")).cloned());
-        match got {
-            Some(Value::Array(a)) if a.len() == chunk.len() => enrich_vals.extend(a),
-            _ => enrich_vals.extend(chunk.iter().map(|_| Value::Null)),
-        }
-    }
+    // receiver so every call stays in that node's execution context; a chunk
+    // that mixes worlds is split rather than nulled (see `enrich_objects`).
+    let enrich_vals: Vec<Value> = enrich_objects(browser, &object_ids).await;
     let enrich_map: serde_json::Map<String, Value> = items
         .iter()
         .zip(enrich_vals.into_iter())
@@ -1952,10 +2032,15 @@ async fn tool_snapshot_ax(
             .unwrap_or(false);
         match enrich_map.get(&r) {
             Some(Value::Null) | None => {
-                // Enrichment could not read this node (detached mid-snapshot):
-                // keep the AX-side tag/value/disabled and the G0 mask.
+                // Enrichment could not read this node (detached mid-snapshot,
+                // or an object the engine would not hand back): keep the
+                // AX-side tag/disabled and the G0 mask. The AX value is
+                // whatever the engine exposed; a text-entry control is
+                // masked here because sensitivity cannot be re-checked
+                // without the element.
                 it["tag"] = json!("");
-                it["value"] = json!(ax_value);
+                let role = it.get("role").and_then(|x| x.as_str()).unwrap_or("");
+                it["value"] = json!(unreadable_value(role, &ax_value));
                 it["disabled"] = json!(ax_disabled);
             }
             Some(info) => {
@@ -2233,6 +2318,17 @@ async fn tool_screenshot(
         Ok(crate::browser::BackendCaps::Render) => {}
         Err(e) => return Err(ToolErr::fallback(format!("screenshot: {e}"))),
     }
+    // A plain capture is lock-free (mcp.rs `needs_exec_lock`), so a mutating
+    // tool may switch the active target while it runs: `tabs select`/
+    // `targets select` move the very page the caption names, and `visual`
+    // opens a scratch target. Read the target before and after and refuse a
+    // capture whose page changed - a PNG of another page under "the active
+    // page" is a lie, and re-widening the lock would serialise every read.
+    let target_before = if deterministic {
+        None
+    } else {
+        Some(browser.active_target_id().await)
+    };
     let cap = crate::capture::capture(
         browser,
         &crate::capture::Options {
@@ -2243,6 +2339,20 @@ async fn tool_screenshot(
         },
     )
     .await?;
+    if let Some(before) = target_before {
+        let after = browser.active_target_id().await;
+        if after != before {
+            return Err(ToolErr::typed(
+                format!(
+                    "screenshot: the active target changed during the capture ({} -> {}); retry against one page",
+                    before.as_deref().unwrap_or("none"),
+                    after.as_deref().unwrap_or("none")
+                ),
+                json!({"code": "target_changed", "reason": "raced", "tool": "screenshot",
+                       "before": before, "after": after}),
+            ));
+        }
+    }
     if let Some(p) = path {
         write_screenshot_file(p, &cap.bytes)?;
     }
@@ -2392,6 +2502,7 @@ async fn tool_visual(browser: &Browser, args: &Value) -> Result<Value, ToolErr> 
             "update",
             "antialias",
             "includeAA",
+            "allowIgnoredAA",
             "minDiffCluster",
             "requireEnvironmentMatch",
         ],

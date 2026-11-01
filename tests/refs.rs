@@ -446,6 +446,7 @@ fn snapshot_pages_without_renaming_refs() {
     assert!(offset > 1, "page 1 ended mid-line-list: {offset}");
     let mut all = body_lines(&t0);
     let mut second_page_ref: Option<String> = None;
+    let mut second_page_name: Option<String> = None;
     let mut pages = 1;
     while offset < total {
         let p = c.call(
@@ -467,11 +468,21 @@ fn snapshot_pages_without_renaming_refs() {
             "reply echoes the offset"
         );
         if second_page_ref.is_none() {
-            second_page_ref = s
-                .get("nodes")
-                .and_then(|n| n.as_array())
-                .and_then(|ns| ns.first())
+            // First page-2 node that actually carries a name: that is the
+            // label the click must reproduce.
+            let named = s.get("nodes").and_then(|n| n.as_array()).and_then(|ns| {
+                ns.iter().find(|n| {
+                    n.get("name")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|x| !x.is_empty())
+                })
+            });
+            second_page_ref = named
                 .and_then(|n| n.get("ref"))
+                .and_then(|r| r.as_str())
+                .map(|r| r.to_string());
+            second_page_name = named
+                .and_then(|n| n.get("name"))
                 .and_then(|r| r.as_str())
                 .map(|r| r.to_string());
         }
@@ -496,14 +507,17 @@ fn snapshot_pages_without_renaming_refs() {
         "the tail node line survived paging"
     );
 
-    // Acting on a ref from the second page resolves in the SAME table.
+    // Acting on a ref from the second page resolves in the SAME table, and it
+    // acts on THAT node: the clicked label must equal the page-2 node's name,
+    // not merely match any of the 400 buttons.
     let r = second_page_ref.expect("page 2 carries a ref");
+    let want = second_page_name.expect("page 2 node carries a name");
     let clk = c.call("click", json!({"element": format!("@{r}")}));
     assert!(!is_error(&clk), "click by page-2 ref @{r}: {clk}");
     let hit = content_text(&c.call("evaluate", json!({"expression": "window.__paged || ''"})));
     assert!(
-        hit.contains("PAGED_BUTTON_"),
-        "page-2 ref acted on the same node: {hit}"
+        hit.contains(&want),
+        "page-2 ref @{r} acted on its own node ({want:?}), got: {hit}"
     );
     finish(c);
 }

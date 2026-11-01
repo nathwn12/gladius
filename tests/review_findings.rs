@@ -256,6 +256,197 @@ fn snapshot_caps_huge_page_at_source() {
     shutdown(c);
 }
 
+/// P1: a password input's value must never surface raw. The enrichment pass
+/// masks it from the live element's `sens` flag, and the unreadable fallback
+/// (see `tools::unreadable_value`) masks text-entry nodes too - the AX value
+/// is never emitted for a credential.
+#[test]
+fn password_value_masked_in_snapshot() {
+    let mut c = Client::spawn();
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+
+    let dir = std::env::temp_dir().join(format!(
+        "gladius-pwmask-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    ));
+    std::fs::create_dir_all(&dir).expect("pwmask dir");
+    let page = dir.join("pw.html");
+    std::fs::write(
+        &page,
+        "<!doctype html><html><body>\
+         <input id=pw name=pw type=password value=PW_SECRET_123>\
+         <input id=tx name=tx value=plain_text_ok>\
+         <input id=pw2 name=pw2 type=text autocomplete=current-password value=PW_AUTOCOMPLETE_456>\
+         </body></html>",
+    )
+    .expect("write pw page");
+    #[cfg(windows)]
+    let ps = page.to_string_lossy().replace('\\', "/");
+    #[cfg(not(windows))]
+    let ps = page.to_string_lossy().to_string();
+    let url = format!("file:///{ps}");
+
+    let nav = c.call("navigate", json!({"url": url}));
+    assert!(nav.get("isError").is_none(), "navigate: {nav}");
+    let snap = c.call("snapshot", json!({}));
+    assert!(snap.get("isError").is_none(), "snapshot ok: {snap}");
+
+    let raw = format!(
+        "{}{}",
+        content_text(&snap),
+        snap.get("structuredContent")
+            .cloned()
+            .unwrap_or(Value::Null)
+    );
+    assert!(
+        !raw.contains("PW_SECRET_123") && !raw.contains("PW_AUTOCOMPLETE_456"),
+        "credential leaked into the snapshot: {raw}"
+    );
+    let nodes = snap
+        .get("structuredContent")
+        .and_then(|s| s.get("nodes"))
+        .and_then(|n| n.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let value_of = |name: &str| {
+        nodes
+            .iter()
+            .find(|n| n.get("name").and_then(|v| v.as_str()) == Some(name))
+            .and_then(|n| {
+                n.get("value")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| panic!("node named '{name}' present: {nodes:?}"))
+    };
+    assert_eq!(value_of("pw"), "••••", "password input masked");
+    assert_eq!(
+        value_of("pw2"),
+        "••••",
+        "autocomplete=current-password masked"
+    );
+    // An unlabeled text input is named from its value, so the live value is
+    // what proves the mask is not blanket.
+    assert!(
+        nodes.iter().any(|n| n
+            .get("value")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == "plain_text_ok")),
+        "a non-sensitive input keeps its live value: {nodes:?}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    let closed = c.call("close", json!({}));
+    assert!(closed.get("isError").is_none(), "close ok: {closed}");
+    shutdown(c);
+}
+
+/// P2: `allowIgnoredAA:false` must be a real gate, not a helper-only rule.
+/// A 1x2 px colour change sitting on a high-contrast edge is exactly what the
+/// AA subtraction hides: the default passes with a warning, the strict call
+/// fails and names the 2 ignored pixels.
+#[test]
+fn strict_allow_ignored_aa_fails_a_two_pixel_edge_diff() {
+    let dir = std::env::temp_dir().join(format!(
+        "gladius-aa-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    ));
+    let vdir = dir.join("visual");
+    std::fs::create_dir_all(&vdir).expect("visual dir");
+    let vdir_s = vdir.to_string_lossy().to_string();
+    let mut c = Client::spawn_with_env(&[("GLADIUS_VISUAL_DIR", &vdir_s)]);
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+
+    // Absolute 10x10 black block on white, no margin: pixel (9,4) is the
+    // last black column, an edge in both images.
+    let page = dir.join("aa.html");
+    std::fs::write(
+        &page,
+        "<!doctype html><html><head><style>html,body{margin:0;padding:0;background:#fff}\
+         #blk{position:absolute;left:0;top:0;width:10px;height:10px;background:#000}\
+         </style></head><body><div id=blk></div></body></html>",
+    )
+    .expect("write aa page");
+    #[cfg(windows)]
+    let ps = page.to_string_lossy().replace('\\', "/");
+    #[cfg(not(windows))]
+    let ps = page.to_string_lossy().to_string();
+    let nav = c.call("navigate", json!({"url": format!("file:///{ps}")}));
+    assert!(nav.get("isError").is_none(), "navigate: {nav}");
+    let vp = c.call("viewport", json!({"width": 200, "height": 100}));
+    assert!(vp.get("isError").is_none(), "viewport: {vp}");
+
+    let saved = c.call("visual", json!({"action": "save", "name": "aa"}));
+    assert!(saved.get("isError").is_none(), "visual save: {saved}");
+
+    // Two pixels change, each still on an edge in both images: #808080 over
+    // the black block's edge column.
+    let painted = c.call(
+        "evaluate",
+        json!({"expression": "const d=document.createElement('div'); d.id='aa'; d.style='position:absolute;left:9px;top:4px;width:1px;height:2px;background:#808080'; document.body.appendChild(d); 'painted'"}),
+    );
+    assert!(painted.get("isError").is_none(), "evaluate: {painted}");
+
+    let loose = c.call("visual", json!({"action": "compare", "name": "aa"}));
+    assert!(loose.get("isError").is_none(), "loose compare: {loose}");
+    let loose_json: Value = serde_json::from_str(&content_text(&loose)).expect("loose json");
+    assert_eq!(
+        loose_json.get("ignoredPixels").and_then(|v| v.as_i64()),
+        Some(2),
+        "the AA rule subtracts the 2-px cluster: {loose_json}"
+    );
+    assert_eq!(
+        loose_json.get("ignoredClusters").and_then(|v| v.as_i64()),
+        Some(1),
+        "one cluster: {loose_json}"
+    );
+    assert_eq!(
+        loose_json.get("diffPixels").and_then(|v| v.as_i64()),
+        Some(0),
+        "nothing else differs: {loose_json}"
+    );
+    assert_eq!(
+        loose_json.get("pass").and_then(|v| v.as_bool()),
+        Some(true),
+        "default tolerates the AA cluster: {loose_json}"
+    );
+
+    let strict = c.call(
+        "visual",
+        json!({"action": "compare", "name": "aa", "allowIgnoredAA": false}),
+    );
+    assert!(strict.get("isError").is_none(), "strict compare: {strict}");
+    let strict_json: Value = serde_json::from_str(&content_text(&strict)).expect("strict json");
+    assert_eq!(
+        strict_json.get("pass").and_then(|v| v.as_bool()),
+        Some(false),
+        "allowIgnoredAA:false refuses a 2-px ignored diff: {strict_json}"
+    );
+    let warning = strict_json
+        .get("warning")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        warning.contains("ignored_antialiasing")
+            && warning.contains("2 pixel(s)")
+            && warning.contains("allowIgnoredAA:false"),
+        "warning names the ignored pixels: {strict_json}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    let closed = c.call("close", json!({}));
+    assert!(closed.get("isError").is_none(), "close ok: {closed}");
+    shutdown(c);
+}
+
 #[test]
 fn wait_for_hard_deadline() {
     let mut c = Client::spawn();
