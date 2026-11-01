@@ -28,11 +28,19 @@
 #           and deletes the outgoing release.
 #
 # workflow_dispatch is the rehearsal lane: it derives the same version from the
-# named commit's history and runs the identical build + pre-publish cleanroom
+# DISPATCHED REF's history (the branch or tag the run was started on, i.e.
+# github.ref / github.sha) and runs the identical build + pre-publish cleanroom
 # gate, then skips tag creation, release creation, npm publish and
 # outgoing-release deletion for as long as dry_run (default true) holds. A dry
 # run therefore proves the build and the gate without touching the registry,
 # the Releases API or the tag namespace.
+#
+# The dispatch's optional `commit` input is an ASSERTION, never the checkout
+# source: it is resolved to a full SHA against the fetched history and must be
+# an ancestor of the dispatched ref, or the run refuses in seconds. To release
+# a different commit, dispatch on a ref that contains it. (A short SHA handed
+# to actions/checkout as `ref:` is neither a branch nor a tag, so the run used
+# to die inside the action before any step could say why.)
 #
 # Action majors were verified against the GitHub Releases API on 2026-10-17:
 # checkout v7 (v7.0.1), setup-node v7 (v7.1.0), upload-artifact v7 (v7.0.2),
@@ -46,12 +54,12 @@ on:
       - 'v*'
   # Rehearsal lane, and the normal lane for a release that does not exist yet.
   # There is deliberately no `version` input: the version is a FUNCTION OF THE
-  # HISTORY at `commit`, and typing one would re-open the drift this workflow
-  # exists to close.
+  # HISTORY at the dispatched ref, and typing one would re-open the drift this
+  # workflow exists to close.
   workflow_dispatch:
     inputs:
       commit:
-        description: 'Commit, branch or tag to release (empty = the dispatched ref)'
+        description: 'Assertion only (short SHA ok): refuse unless the dispatched ref contains this commit; empty = no assertion'
         required: false
         type: string
         default: ''
@@ -76,10 +84,35 @@ jobs:
     steps:
       # fetch-depth: 0 and the tags are the derivation's input: without them
       # `git log base..HEAD` sees one commit and no base tag at all.
+      # No `ref:`: the checkout source is the ref this run was dispatched on
+      # (github.ref / github.sha), or the tag a push released. The typed
+      # `commit` input never selects the tree — see the assertion below.
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit || github.ref }}
           fetch-depth: 0
+      # The optional `commit` input asserts which commit the dispatch is about;
+      # it never picks the checkout. Resolved to a full SHA first, then proven
+      # to be an ancestor of what the dispatched ref points at, so a typo, an
+      # ambiguous short SHA or a commit on another branch is refused here in
+      # seconds instead of releasing a different tree than the caller meant.
+      - name: assert the commit input is on the dispatched ref
+        if: github.event_name == 'workflow_dispatch' && inputs.commit != ''
+        shell: bash
+        env:
+          COMMIT_INPUT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          want="$(git rev-parse --verify --quiet "${COMMIT_INPUT}^{commit}" || true)"
+          if [ -z "$want" ]; then
+            echo "::error::commit input '$COMMIT_INPUT' does not resolve to a commit in this checkout of $GITHUB_REF (head $head_sha)"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$want" "$head_sha"; then
+            echo "::error::commit input '$COMMIT_INPUT' ($want) is not an ancestor of $GITHUB_REF (head $head_sha); dispatch on a ref that contains it"
+            exit 1
+          fi
+          echo "commit input $want is on $GITHUB_REF ($head_sha)"
       # First, before any build, any assert and any provisioning: a refusal
       # (no release-worthy commit, a non-conventional subject, an empty
       # changelog, a tree ahead of its history) must cost seconds.
@@ -312,7 +345,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit || github.ref }}
+          # Same commit as the build job, from the same ref: the dispatch's
+          # ref (or the pushed tag), never the typed input.
           fetch-depth: 0
       # Provenance check, not a second source of truth: the same commit must
       # derive the same version, or the artifacts were built for a different
