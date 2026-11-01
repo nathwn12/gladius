@@ -10,11 +10,15 @@
 # the tag always names the version the derivation proved.
 #
 # Two jobs share one derived version and one commit:
-#   build   (windows-latest) derives the version FIRST (a refusal fails in
-#           seconds, not after a 20-minute build), writes it into Cargo.toml /
-#           Cargo.lock / npm/package.json / npm/engine-manifest.json, then
-#           provisions the pinned BROWSER exactly the way docs/CHROMIUM.md
-#           implies (scripts/fetch-chromium.ps1, sha-verified), builds + tests
+#   build   (windows-latest) asserts its own step order, derives the version
+#           FIRST (a refusal fails in seconds, not after a 20-minute build) and
+#           refuses unless the committed Cargo.toml / Cargo.lock /
+#           npm/package.json / npm/engine-manifest.json ALREADY carry it: this
+#           lane asserts the version, it never writes it, so a tree that
+#           disagrees with its own commits is a defect to land, not a number for
+#           CI to guess. Then it provisions the pinned BROWSER exactly the way
+#           docs/CHROMIUM.md implies (scripts/fetch-chromium.ps1, sha-verified),
+#           builds + tests
 #           the crate with the MSRV toolchain, assembles the server-only
 #           runtime bundle (the browser is NEVER bundled: it is fetched from
 #           Google's Chrome-for-Testing endpoint at provision time), closes the
@@ -90,6 +94,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      # The ordering invariants of THIS file, asserted before anything runs: a
+      # reordering that puts an assert before the derive, a step that writes a
+      # version, or a tag that leaks into the build job fails here in
+      # milliseconds instead of in a 20-minute release run.
+      - name: assert the workflow's release invariants
+        run: node scripts/check-release-workflow.mjs
       # The optional `commit` input asserts which commit the dispatch is about;
       # it never picks the checkout. Resolved to a full SHA first, then proven
       # to be an ancestor of what the dispatched ref points at, so a typo, an
@@ -144,14 +154,11 @@ jobs:
             throw "tag $env:GITHUB_REF_NAME does not name the derived version v$ver"
           }
           Write-Host "version $ver (ref $env:GITHUB_REF_NAME)"
-      # The release run is the only writer of the version. It moves the three
-      # manifests and the crate stanza forward to the derived version, and
-      # never backwards (a committed version ahead of its history is refused by
-      # the script). The "assert versions" step below then COMPARES, and never
-      # repairs: a mismatch there is a defect in this writer, not a value to fix.
-      - name: apply the derived version
-        shell: bash
-        run: node scripts/derive-release.mjs
+      # NO "apply the derived version" STEP EXISTS, ON PURPOSE. The version is
+      # asserted by the derive above and by the "assert versions" step below;
+      # neither writes one. A release that needed CI to repair its manifests is
+      # refused instead, so the tag can only ever name a version the tree
+      # already carried when the dispatch was made.
       # Provision the pinned browser with the repo's own script (sha-verified).
       # The suite runs against it, and the attribution copy carried below is
       # taken from these verified bytes. A release must never point at a
@@ -223,9 +230,9 @@ jobs:
           if ($tag -ne "v$ver") { throw "RELEASE_TAG '$tag' is not v$ver" }
           function Get-Sha([string]$p) { return (Get-FileHash -Algorithm SHA256 -Path $p).Hash.ToLowerInvariant() }
           # 1. One version everywhere: derivation == crate == npm package ==
-          # manifest serverVersion. These are ASSERTS: nothing here writes a
-          # version, so a disagreement fails the release instead of papering
-          # over the writer above.
+          # manifest serverVersion. These are ASSERTS: nothing in this workflow
+          # writes a version, so a disagreement fails the release instead of
+          # being repaired by the lane that is supposed to be checking it.
           $cargo = Get-Content Cargo.toml -Raw
           if ($cargo -notmatch '(?m)^version\s*=\s*"([^"]+)"') { throw 'cannot read crate version from Cargo.toml' }
           if ($Matches[1] -ne $ver) { throw "crate version $($Matches[1]) != derived version $ver" }
