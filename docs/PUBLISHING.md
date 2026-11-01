@@ -26,7 +26,11 @@ granular token), and locally npm >= 11.5.1 with Node >= 22.14.0
    own the package. Package name is unscoped `gladius-mcp`; it publishes
    under whoever publishes first — confirm the handle at sign-in.
 
-2. Push the version tag (e.g. `v0.2.1`). The `release` workflow builds the
+2. Dispatch the `release` workflow for the commit (`dry_run: true` rehearses).
+   Nothing is typed: the run derives the version from the commits since the
+   last `vX.Y.Z` tag (`scripts/derive-release.mjs`), writes it into the
+   manifests before the build, and creates the tag itself after the gate.
+   The workflow builds the
    crate with the MSRV toolchain, runs the suite against the provisioned
    pinned browser, assembles the server-only runtime bundle (no browser
    bytes), fills `engine-manifest.json` with hashes computed from the REAL
@@ -81,11 +85,15 @@ granular token), and locally npm >= 11.5.1 with Node >= 22.14.0
 
 ## Version checklist (one version everywhere)
 
-A release tag `vX.Y.Z` requires, on that commit: `Cargo.toml` version
-`X.Y.Z`, `npm/package.json` version `X.Y.Z`, `npm/engine-manifest.json`
-`serverVersion` `X.Y.Z` with matching `runtime.source`/`runtime.archive`
-names (the workflow asserts all four equal the tag and fills the hashes),
-and a `CHANGELOG.md` entry. The workflow fails closed on any mismatch.
+The run derives `X.Y.Z` from the commits since the last `vX.Y.Z` tag
+(`scripts/derive-release.mjs`: breaking -> major, `feat` -> minor, `fix`/`perf`
+-> patch, and on 0.x a major hop moves the minor) and writes it into
+`Cargo.toml`, `Cargo.lock`, `npm/package.json` and `npm/engine-manifest.json`
+before the build; `runtime.source`/`runtime.archive` names are filled from it
+too, together with the hashes computed from the real artifacts. `## [Unreleased]`
+in `CHANGELOG.md` must carry the entry, and the run closes it after the gate.
+The workflow fails closed on any mismatch, and a hand-cut `v*` tag is accepted
+only when it names the derived version.
 The manifest's `browser` pin must equal `scripts/chromium-manifest.json`'s
 (the workflow asserts deep equality plus the `fetch-chromium.ps1` constants
 and the provisioned bytes); a browser bump also refreshes the version named

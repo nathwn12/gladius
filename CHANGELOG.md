@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- The release version is derived from history instead of typed: `scripts/derive-release.mjs` reads the commits since the last `vX.Y.Z` tag, classifies them (breaking -> major, `feat` -> minor, `fix`/`perf` -> patch, and on 0.x a major hop moves the minor), refuses when there is nothing releasable, when a subject is not a Conventional Commit, when `## [Unreleased]` is empty, or when a committed manifest is ahead of the derivation, and prints every commit it considered and every one it ignored.
+- The `release` workflow derives that version in seconds before any build, writes it into `Cargo.toml`, `Cargo.lock`, `npm/package.json` and `npm/engine-manifest.json`, closes the `## [Unreleased]` section after the build+test gate, and creates the tag in the publish job immediately before attaching the release — so the `version` dispatch input is gone and a tag can no longer claim a version the tree does not carry.
+- `derive-release.mjs --check` ships 21 fixture cases covering the major/minor/patch hops, the 0.x rule, every refusal, the forward-only write, the changelog close (twice), a rerun at a released tag and a hand-cut tag checked against the derivation.
+- The GitHub Release body is now the changelog section the run closed (`dist/release-notes.md`) instead of boilerplate.
+- A `v*` tag push no longer defines the version: it is checked against the derivation, so a hand-cut tag is accepted only when it names the version the history implies.
 ## [0.6.2] - 2026-11-01
 
 ### Fixed
