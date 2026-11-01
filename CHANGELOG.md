@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-11-01
+
+### Fixed
+
+- Credential mask (P1): the AX snapshot's unreadable-enrichment fallback wrote the AX value straight into `value`, although its own comment promised the G0 mask. A text-entry node whose element cannot be read is masked (`••••`) on that path now, and the enrichment chunks are split until each sub-chunk shares one JavaScript world, so an object the engine will not hand back can no longer null its neighbours' values (and their masks with it).
+- `snapshot` with `offset > 0` read the cached render without the snapshot lock an `offset:0` render holds; paging now takes the same lock and clones the cache under it. `snapshotId` is required for any `offset > 0` (typed `invalid_args`/`missing_arg` naming it) instead of being silently optional.
+- `snapshot` no longer returns `nextOffset:null` together with `truncated:true` when a single line alone exceeds the 8000-char cap: that was a paging dead end, and is now a typed error naming the line length and pointing at `mode:"text"`.
+- `layout`/`assert_layout` resolve a ref through `guard_ref`, so an unissued or pre-navigation ref is the same typed `stale_ref` `click` returns instead of `exists:false`.
+- A plain `screenshot` (lock-free by design) reads the active target id before and after the capture and refuses with a typed `target_changed` error when the page changed mid-capture, instead of returning another page's PNG under "the active page".
+- `visual compare` accepts the `allowIgnoredAA` its schema and the 0.6.0 changelog already advertised; the argument gate rejected it as unknown, so the strict mode could not be used at all.
+- The AX-snapshot doc block, the `snapshot` tool description and `docs/GUIDE.md` no longer claim `data-gladius-ref` stamping or that shadow actionability is unsupported: refs resolve by backend node id, shadow refs act like light-DOM refs, and `mode:"legacy"` is the one path that stamps an attribute.
+
+### Tests
+
+- `tests/review_findings.rs` proves the credential mask end to end (password and `autocomplete=current-password` inputs mask, a plain input keeps its value) and covers the unreadable fallback in `tools::tests`; the fallback test is red on the pre-fix branch (`left: "PW_SECRET_123"`).
+- `tests/review_findings.rs` adds an end-to-end `allowIgnoredAA:false` run with a real 2-pixel AA-cluster diff, asserting `pass:false` and the warning string; previously only the pure helpers were covered.
+- `tests/refs.rs` compares the clicked page-2 label to that node's `name`; the old assertion accepted any of the 400 buttons.
+
 ## [0.6.1] - 2026-11-01
 
 ### Fixed

@@ -162,6 +162,10 @@ async fn resolve(browser: &Browser, tool: &str, specs: &[Spec]) -> Result<Vec<No
     let mut out: Vec<Node> = Vec::new();
     for spec in specs {
         if let Spec::Ref(id) = spec {
+            // Same guard the action tools run: an unissued ref or one from
+            // before a navigation is a typed `stale_ref`, never a silent
+            // `exists:false` that reads as "the element is not there".
+            crate::tools::guard_ref(browser, tool, "", id).await?;
             if let Some(object_id) = crate::tools::resolve_ref_object(browser, tool, id).await? {
                 // A removed node keeps a detached JS wrapper, so resolving the
                 // object does not prove the ref still names a node in the

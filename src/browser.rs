@@ -481,6 +481,15 @@ impl Browser {
         self.snap_url.lock().await.clone()
     }
 
+    /// `targetId` of the page the untargeted commands currently run against
+    /// (`None` only when no page is tracked). Read-only.
+    pub async fn active_target_id(&self) -> Option<String> {
+        match self.shared().await {
+            Ok(shared) => shared.target.lock().await.clone(),
+            Err(_) => None,
+        }
+    }
+
     /// Serialize snapshots so ref ranges never overlap.
     pub async fn lock_snapshot(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.snapshot_lock.lock().await
