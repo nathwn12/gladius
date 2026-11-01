@@ -3197,9 +3197,9 @@ async fn launch() -> Result<Inner, String> {
 
 /// Pinned Chromium identity (keep in lockstep with
 /// `scripts/fetch-chromium.ps1` and `scripts/chromium-manifest.json`).
-const PINNED_CHROMIUM_VERSION: &str = "155.0.8059.84";
+const PINNED_CHROMIUM_VERSION: &str = "156.0.8078.80";
 /// First 8 hex chars of the pinned zip sha256 (the versioned cache dir tag).
-const PINNED_ZIP_SHORT8: &str = "5ca590a4";
+const PINNED_ZIP_SHORT8: &str = "10a77466";
 /// Env override for the explicit browser binary path.
 const CHROMIUM_ENV: &str = "GLADIUS_CHROMIUM";
 /// Env override for the versioned cache root.
