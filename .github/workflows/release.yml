@@ -1,24 +1,46 @@
-# gladius release: build the server runtime, publish npm.
+# gladius release: derive the version from history, build the server runtime,
+# then tag and publish.
 #
-# Trigger: owner pushes a `v*` tag, or dispatches the workflow to rehearse it.
-# Two jobs share one tag and one commit:
-#   build   (windows-latest) provisions the pinned BROWSER exactly the way
-#           docs/CHROMIUM.md implies (scripts/fetch-chromium.ps1, sha-verified),
-#           builds + tests the crate with the MSRV toolchain, assembles the
-#           server-only runtime bundle (the browser is NEVER bundled: it is
-#           fetched from Google's Chrome-for-Testing endpoint at provision
-#           time), computes every hash from the REAL artifacts, and fills
-#           npm/engine-manifest.json.
-#   publish (ubuntu-latest) creates the current release from those artifacts,
-#           publishes npm over OIDC trusted publishing (no token; provenance
-#           is automatic), deletes the outgoing release, and skips a tag older
-#           than the current release.
+# Trigger: a `v*` tag push (a rerun of an existing release), or a dispatch that
+# names the commit to release. NOBODY TYPES A VERSION ANY MORE: the run derives
+# it from the commits since the last release (scripts/derive-release.mjs), so a
+# tag that disagrees with the tree can no longer be cut by hand and discovered
+# by a human afterwards. The tag is produced by the publish job, immediately
+# before the release is attached, so an untagged commit is the normal case and
+# the tag always names the version the derivation proved.
 #
-# workflow_dispatch is the rehearsal lane: it derives the same tag from
-# inputs.version and runs the identical build + pre-publish cleanroom gate,
-# then skips release creation, npm publish and outgoing-release deletion for
-# as long as dry_run (default true) holds. A dry run therefore proves the
-# build and the gate without touching the registry or the Releases API.
+# Two jobs share one derived version and one commit:
+#   build   (windows-latest) derives the version FIRST (a refusal fails in
+#           seconds, not after a 20-minute build), writes it into Cargo.toml /
+#           Cargo.lock / npm/package.json / npm/engine-manifest.json, then
+#           provisions the pinned BROWSER exactly the way docs/CHROMIUM.md
+#           implies (scripts/fetch-chromium.ps1, sha-verified), builds + tests
+#           the crate with the MSRV toolchain, assembles the server-only
+#           runtime bundle (the browser is NEVER bundled: it is fetched from
+#           Google's Chrome-for-Testing endpoint at provision time), closes the
+#           `## [Unreleased]` changelog section AFTER the gate, asserts every
+#           version against the derivation, computes every hash from the REAL
+#           artifacts, and fills npm/engine-manifest.json.
+#   publish (ubuntu-latest) re-derives on the same commit as a provenance
+#           check, skips a tag older than the current release, creates the tag,
+#           creates the current release from those artifacts, publishes npm
+#           over OIDC trusted publishing (no token; provenance is automatic),
+#           and deletes the outgoing release.
+#
+# workflow_dispatch is the rehearsal lane: it derives the same version from the
+# DISPATCHED REF's history (the branch or tag the run was started on, i.e.
+# github.ref / github.sha) and runs the identical build + pre-publish cleanroom
+# gate, then skips tag creation, release creation, npm publish and
+# outgoing-release deletion for as long as dry_run (default true) holds. A dry
+# run therefore proves the build and the gate without touching the registry,
+# the Releases API or the tag namespace.
+#
+# The dispatch's optional `commit` input is an ASSERTION, never the checkout
+# source: it is resolved to a full SHA against the fetched history and must be
+# an ancestor of the dispatched ref, or the run refuses in seconds. To release
+# a different commit, dispatch on a ref that contains it. (A short SHA handed
+# to actions/checkout as `ref:` is neither a branch nor a tag, so the run used
+# to die inside the action before any step could say why.)
 #
 # Action majors were verified against the GitHub Releases API on 2026-10-17:
 # checkout v7 (v7.0.1), setup-node v7 (v7.1.0), upload-artifact v7 (v7.0.2),
@@ -30,17 +52,19 @@ on:
   push:
     tags:
       - 'v*'
-  # Rehearsal lane. No tag exists on a dispatch, so `version` stands in for it:
-  # the tag is derived as `v<version>`, which keeps every version assertion
-  # below identical in both modes.
+  # Rehearsal lane, and the normal lane for a release that does not exist yet.
+  # There is deliberately no `version` input: the version is a FUNCTION OF THE
+  # HISTORY at the dispatched ref, and typing one would re-open the drift this
+  # workflow exists to close.
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version to rehearse, without the leading v (e.g. 0.4.4)'
-        required: true
+      commit:
+        description: 'Assertion only (short SHA ok): refuse unless the dispatched ref contains this commit; empty = no assertion'
+        required: false
         type: string
+        default: ''
       dry_run:
-        description: 'Rehearse only: skip release creation, npm publish and outgoing-release deletion'
+        description: 'Rehearse only: skip tag creation, release creation, npm publish and outgoing-release deletion'
         required: false
         type: boolean
         default: true
@@ -49,18 +73,85 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
-    name: build runtime + manifest
+    name: derive + build runtime + manifest
     runs-on: windows-latest
     permissions:
       contents: read
-    # One tag, two triggers: a tag push names it directly, a dispatch derives
-    # it from inputs.version. Every step reads this, never GITHUB_REF_NAME,
-    # which on a dispatch would be the branch name.
-    env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
+    # The one version this run is about. publish reads it, and everything
+    # downstream of the derive step reads RELEASE_TAG from $GITHUB_ENV.
+    outputs:
+      version: ${{ steps.derive.outputs.version }}
     steps:
+      # fetch-depth: 0 and the tags are the derivation's input: without them
+      # `git log base..HEAD` sees one commit and no base tag at all.
+      # No `ref:`: the checkout source is the ref this run was dispatched on
+      # (github.ref / github.sha), or the tag a push released. The typed
+      # `commit` input never selects the tree — see the assertion below.
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          fetch-depth: 0
+      # The optional `commit` input asserts which commit the dispatch is about;
+      # it never picks the checkout. Resolved to a full SHA first, then proven
+      # to be an ancestor of what the dispatched ref points at, so a typo, an
+      # ambiguous short SHA or a commit on another branch is refused here in
+      # seconds instead of releasing a different tree than the caller meant.
+      - name: assert the commit input is on the dispatched ref
+        if: github.event_name == 'workflow_dispatch' && inputs.commit != ''
+        shell: bash
+        env:
+          COMMIT_INPUT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          want="$(git rev-parse --verify --quiet "${COMMIT_INPUT}^{commit}" || true)"
+          if [ -z "$want" ]; then
+            echo "::error::commit input '$COMMIT_INPUT' does not resolve to a commit in this checkout of $GITHUB_REF (head $head_sha)"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$want" "$head_sha"; then
+            echo "::error::commit input '$COMMIT_INPUT' ($want) is not an ancestor of $GITHUB_REF (head $head_sha); dispatch on a ref that contains it"
+            exit 1
+          fi
+          echo "commit input $want is on $GITHUB_REF ($head_sha)"
+      # First, before any build, any assert and any provisioning: a refusal
+      # (no release-worthy commit, a non-conventional subject, an empty
+      # changelog, a tree ahead of its history) must cost seconds.
+      - name: derive release version
+        id: derive
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/derive-release.mjs --json > "$RUNNER_TEMP/derive.json"
+          node -e "
+            const d = JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'));
+            const fs = require('fs');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,
+              ['version=' + d.version, 'level=' + d.level, 'base=' + d.base,
+               'already_released=' + d.alreadyReleased].join('\n') + '\n');
+            fs.appendFileSync(process.env.GITHUB_ENV, 'RELEASE_TAG=v' + d.version + '\n');
+            console.log('derived ' + d.version + ' (' + d.level + ') from ' + d.base);
+          " "$RUNNER_TEMP/derive.json"
+      # The tag, when the run was started by one, must name the derived
+      # version. Every version comparison below uses ${{ steps.derive.outputs.version }};
+      # none of them is derived from the tag.
+      - name: assert the ref names the derived version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = "${{ steps.derive.outputs.version }}"
+          if ($ver -notmatch '^\d+\.\d+\.\d+$') { throw "derived version '$ver' is not X.Y.Z" }
+          if ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF_NAME -ne "v$ver") {
+            throw "tag $env:GITHUB_REF_NAME does not name the derived version v$ver"
+          }
+          Write-Host "version $ver (ref $env:GITHUB_REF_NAME)"
+      # The release run is the only writer of the version. It moves the three
+      # manifests and the crate stanza forward to the derived version, and
+      # never backwards (a committed version ahead of its history is refused by
+      # the script). The "assert versions" step below then COMPARES, and never
+      # repairs: a mismatch there is a defect in this writer, not a value to fix.
+      - name: apply the derived version
+        shell: bash
+        run: node scripts/derive-release.mjs
       # Provision the pinned browser with the repo's own script (sha-verified).
       # The suite runs against it, and the attribution copy carried below is
       # taken from these verified bytes. A release must never point at a
@@ -83,6 +174,13 @@ jobs:
       # aborts the release before any artifact exists to publish.
       - name: selftest (real browser end-to-end)
         run: target\release\gladius.exe selftest
+      # The changelog heading is produced by the run, AFTER the gate and before
+      # any tag exists: a red build never closes a section. Idempotent, so a
+      # rerun over an already-closed section changes nothing. The closed
+      # section doubles as the release body (dist/release-notes.md).
+      - name: close the changelog section
+        shell: bash
+        run: node scripts/derive-release.mjs --changelog --notes-out dist/release-notes.md
       - name: assemble archives
         shell: pwsh
         run: |
@@ -121,16 +219,18 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = $env:RELEASE_TAG
-          if (-not $tag.StartsWith('v')) { throw "tag '$tag' does not start with v" }
-          $ver = $tag.Substring(1)
-          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch' -and $ver -notmatch '^\d+\.\d+\.\d+$') { throw "dispatch version '$ver' must be X.Y.Z" }
+          $ver = "${{ steps.derive.outputs.version }}"
+          if ($tag -ne "v$ver") { throw "RELEASE_TAG '$tag' is not v$ver" }
           function Get-Sha([string]$p) { return (Get-FileHash -Algorithm SHA256 -Path $p).Hash.ToLowerInvariant() }
-          # 1. One version everywhere: tag == crate == npm package == manifest serverVersion.
+          # 1. One version everywhere: derivation == crate == npm package ==
+          # manifest serverVersion. These are ASSERTS: nothing here writes a
+          # version, so a disagreement fails the release instead of papering
+          # over the writer above.
           $cargo = Get-Content Cargo.toml -Raw
           if ($cargo -notmatch '(?m)^version\s*=\s*"([^"]+)"') { throw 'cannot read crate version from Cargo.toml' }
-          if ($Matches[1] -ne $ver) { throw "crate version $($Matches[1]) != tag version $ver" }
+          if ($Matches[1] -ne $ver) { throw "crate version $($Matches[1]) != derived version $ver" }
           $pkg = Get-Content npm/package.json -Raw | ConvertFrom-Json
-          if ($pkg.version -ne $ver) { throw "npm package version $($pkg.version) != tag version $ver" }
+          if ($pkg.version -ne $ver) { throw "npm package version $($pkg.version) != derived version $ver" }
           # Sole scripts-field exception: the global-install-refusal preinstall
           # guard (no install-time download; it only refuses `npm i -g`).
           # A postinstall download would silently never run under npx, so
@@ -142,7 +242,7 @@ jobs:
             }
           }
           $man = Get-Content npm/engine-manifest.json -Raw | ConvertFrom-Json
-          if ($man.serverVersion -ne $ver) { throw "manifest serverVersion $($man.serverVersion) != tag version $ver" }
+          if ($man.serverVersion -ne $ver) { throw "manifest serverVersion $($man.serverVersion) != derived version $ver" }
           # 2. Browser identity drift gate: the npm manifest's browser pin must
           # equal the integrity root scripts/chromium-manifest.json, agree with
           # the pin constants in scripts/fetch-chromium.ps1, and match the
@@ -165,7 +265,9 @@ jobs:
           if ((Get-Item -LiteralPath $exePath).Length -ne $exeEntry.size) { throw 'provisioned browser exe size drift vs manifest' }
           if ((Get-Sha $exePath) -ne $exeEntry.sha256.ToLowerInvariant()) { throw 'provisioned browser exe hash drift vs manifest' }
           Write-Host 'browser identity agrees: npm manifest == chromium-manifest.json == fetch-chromium.ps1 == provisioned bytes'
-          # 3. Fill the release-computed hashes from the real artifacts.
+          # 3. Fill the release-computed hashes from the real artifacts. The
+          # version fields are NOT touched here: they were produced by the
+          # derivation and are asserted above.
           $repo = 'https://github.com/nathwn12/gladius'
           $bundle = "gladius-$tag-windows-x86_64.zip"
           $server = Get-Item -LiteralPath target\release\gladius.exe
@@ -175,6 +277,7 @@ jobs:
           $man.runtime.archive.size = (Get-Item -LiteralPath "dist\$bundle").Length
           $man.runtime.server.sha256 = Get-Sha $server.FullName
           $man.runtime.server.size = $server.Length
+          if ($man.serverVersion -ne $ver) { throw 'manifest serverVersion changed while filling hashes' }
           $man | ConvertTo-Json -Depth 8 | Out-File npm/engine-manifest.json -Encoding utf8
           Copy-Item npm/engine-manifest.json dist/engine-manifest.json
           Write-Host "manifest filled for $tag"
@@ -219,6 +322,7 @@ jobs:
             dist/*.zip
             dist/*.zip.sha256
             dist/engine-manifest.json
+            dist/release-notes.md
           if-no-files-found: error
           retention-days: 1
       - uses: actions/upload-artifact@v7
@@ -228,16 +332,36 @@ jobs:
           if-no-files-found: error
           retention-days: 1
   publish:
-    name: github release + npm publish
+    name: tag + github release + npm publish
     needs: [build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
-    # Same tag derivation as build; on a dispatch GITHUB_REF_NAME is the branch.
+    # The version came from the build job's derivation; the tag is built from
+    # it here, never read from the environment's ref.
     env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
+      RELEASE_TAG: v${{ needs.build.outputs.version }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          # Same commit as the build job, from the same ref: the dispatch's
+          # ref (or the pushed tag), never the typed input.
+          fetch-depth: 0
+      # Provenance check, not a second source of truth: the same commit must
+      # derive the same version, or the artifacts were built for a different
+      # tree than the one about to be tagged.
+      - name: re-derive on the release commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/derive-release.mjs --json > "$RUNNER_TEMP/publish-derive.json"
+          got="$(node -p "JSON.parse(require('fs').readFileSync(process.argv[1],'utf8')).version" "$RUNNER_TEMP/publish-derive.json")"
+          if [ "$got" != "${RELEASE_TAG#v}" ]; then
+            echo "::error::history at this commit implies $got, the build produced ${RELEASE_TAG#v}"
+            exit 1
+          fi
+          echo "derivation agrees on this commit: $got"
       - uses: actions/download-artifact@v8
         with:
           name: dist
@@ -246,6 +370,8 @@ jobs:
         with:
           name: npm-package
           path: npm-pkg
+      # Runs AFTER the derivation (RELEASE_TAG is now derived, not typed), so a
+      # stale rerun costs nothing and a fresh version is never skipped.
       - name: check stale tag
         id: release_mode
         shell: bash
@@ -263,15 +389,40 @@ jobs:
             fi
           fi
           echo "current=true" >> "$GITHUB_OUTPUT"
+      # The tag is produced HERE, after the build gate, after the cleanroom
+      # gate and after the stale check: the only way a `v*` tag can exist for
+      # this commit is that everything above was green. A push made with
+      # GITHUB_TOKEN does not start another workflow run, so this cannot loop;
+      # on a rerun of an existing tag the tag is already at HEAD and is left
+      # alone.
+      - name: create the release tag
+        if: steps.release_mode.outputs.current == 'true' && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          if git rev-parse --verify -q "refs/tags/$RELEASE_TAG" >/dev/null; then
+            have="$(git rev-list -n1 "$RELEASE_TAG")"
+            if [ "$have" != "$sha" ]; then
+              echo "::error::tag $RELEASE_TAG already points at $have, not at the release commit $sha"
+              exit 1
+            fi
+            echo "tag $RELEASE_TAG already at $sha (rerun): left unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$RELEASE_TAG" -m "$RELEASE_TAG" "$sha"
+          git push origin "refs/tags/$RELEASE_TAG"
+          echo "tagged $sha as $RELEASE_TAG"
       # Irreversible step 1/3: creating the public release. Skipped only on a
-      # rehearsal dispatch; a tag push always runs it when the tag is current.
+      # rehearsal dispatch; the tag above is the one this attaches to.
       - name: attach archives to the GitHub Release
         if: steps.release_mode.outputs.current == 'true' && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false)
         uses: softprops/action-gh-release@v3
         with:
           name: ${{ github.event.repository.name }} ${{ env.RELEASE_TAG }}
-          body: |
-            Release ${{ env.RELEASE_TAG }}. See the repository CHANGELOG and the npm package for details.
+          body_path: dist/release-notes.md
           overwrite_files: true
           files: |
             dist/*.zip
@@ -291,7 +442,7 @@ jobs:
           npm --version
           node -e "const v=process.versions.node.split('.').map(Number); if (!(v[0]>22||(v[0]===22&&v[1]>=14))) { console.error('need node >= 22.14.0'); process.exit(1) }"
           node -e "const v=require('child_process').execSync('npm --version').toString().trim().split('.').map(Number); if (!(v[0]>11||(v[0]===11&&(v[1]>5||(v[1]===5&&v[2]>=1))))) { console.error('need npm >= 11.5.1'); process.exit(1) }"
-          test "$(node -p "require('./npm-pkg/package.json').version")" = "${RELEASE_TAG#v}" || { echo "npm package version != tag version"; exit 1; }
+          test "$(node -p "require('./npm-pkg/package.json').version")" = "${RELEASE_TAG#v}" || { echo "npm package version != derived version"; exit 1; }
           node -e "for (const f of ['./npm-pkg/package.json','./npm-pkg/engine-manifest.json','./npm-pkg/bin/gladius-mcp.js']) require('fs').accessSync(f); const p=require('./npm-pkg/package.json'); if (p.scripts!==undefined && (Object.keys(p.scripts).join(',')!=='preinstall' || !/npm_config_global/.test(p.scripts.preinstall))) { console.error('scripts field holds more than the preinstall global-refusal guard'); process.exit(1) }; const m=require('./npm-pkg/engine-manifest.json'); if (m.serverVersion!==p.version) { console.error('serverVersion != package version'); process.exit(1) }; for (const s of [m.runtime.archive.sha256, m.runtime.server.sha256, m.browser.asset.sha256]) if (!/^[0-9a-f]{64}$/.test(s)) { console.error('manifest still has placeholder hashes'); process.exit(1) }; if (!Array.isArray(m.browser.files) || m.browser.files.length!==m.browser.fileCount) { console.error('browser file list != fileCount'); process.exit(1) }; console.log('npm package OK: no scripts field, serverVersion matches, all release hashes filled, browser pin complete')"
       - name: assert packaged manifest matches built assets
         shell: bash
@@ -333,7 +484,7 @@ jobs:
           fi
           man_ver=$(node -p "require('./npm-pkg/engine-manifest.json').serverVersion")
           if [ "$man_ver" != "$version" ]; then
-            echo "::error::manifest serverVersion $man_ver != tag version $version"
+            echo "::error::manifest serverVersion $man_ver != derived version $version"
             exit 1
           fi
           node -e "const m=require('./npm-pkg/engine-manifest.json'); const tag=process.env.RELEASE_TAG; const src=(m.runtime&&m.runtime.source)||''; const arc=(m.runtime&&m.runtime.archive&&m.runtime.archive.name)||''; if(!src.includes(tag)||!arc.includes(tag)){ console.error('::error::manifest runtime.source/archive do not name tag '+tag+': '+src+' / '+arc); process.exit(1); } console.log('manifest OK: serverVersion '+m.serverVersion+', runtime '+src+' / '+arc)"
