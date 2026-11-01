@@ -44,6 +44,7 @@ pub fn list() -> Value {
             "properties": {"mimeType": {"type": "string"}, "bytes": {"type": "integer", "minimum": 0},
                 "path": {"type": "string"}, "deterministic": {"type": "boolean"},
                 "viewport": {"type": "object"}, "deviceScaleFactor": {"type": "number"},
+                "size": {"type": "object", "properties": {"width": {"type": "integer"}, "height": {"type": "integer"}}, "required": ["width", "height"]},
                 "url": {"type": "string"}, "checksum": {"type": "string"},
                 "reducedMotionEmulated": {"type": "boolean"}},
             "required": ["mimeType", "bytes"], "additionalProperties": false},
@@ -1331,6 +1332,7 @@ fn node_json(it: &Value) -> Value {
 /// `nextOffset` is the next page's first line, `null` on the last page.
 /// Paging NEVER re-renders: it slices the cache stored by the `offset:0`
 /// call, so every page keeps the original render's ref namespace.
+#[allow(clippy::too_many_arguments)] // one render = one call; a param struct would add no check
 async fn emit_paged_snapshot(
     browser: &Browser,
     mode: &str,
