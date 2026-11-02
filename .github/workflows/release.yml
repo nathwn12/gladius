@@ -428,6 +428,7 @@ jobs:
         if: steps.release_mode.outputs.current == 'true' && (github.event_name != 'workflow_dispatch' || inputs.dry_run == false)
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ github.event.repository.name }} ${{ env.RELEASE_TAG }}
           body_path: dist/release-notes.md
           overwrite_files: true
