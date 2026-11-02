@@ -58,6 +58,8 @@ cargo test --locked
 
 `cargo fmt --all --check` and `cargo clippy --all-targets --locked -- -D warnings` are the static gate.
 
-## License
+## Links
 
-MIT. See [LICENSE](LICENSE).
+- [Guide](docs/GUIDE.md)
+- [Releases](https://github.com/nathwn12/gladius/releases)
+- [MIT](LICENSE)
