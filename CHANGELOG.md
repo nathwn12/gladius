@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - The release version is derived from history instead of typed: `scripts/derive-release.mjs` reads the commits since the last `vX.Y.Z` tag, classifies them (breaking -> major, `feat` -> minor, `fix`/`perf` -> patch, and on 0.x a major hop moves the minor), refuses when there is nothing releasable, when a subject is not a Conventional Commit, when `## [Unreleased]` is empty, or when a committed manifest is ahead of the derivation, and prints every commit it considered and every one it ignored.
 - The `release` workflow derives that version in seconds before any build, writes it into `Cargo.toml`, `Cargo.lock`, `npm/package.json` and `npm/engine-manifest.json`, closes the `## [Unreleased]` section after the build+test gate, and creates the tag in the publish job immediately before attaching the release — so the `version` dispatch input is gone and a tag can no longer claim a version the tree does not carry.
-- `derive-release.mjs --check` ships 21 fixture cases covering the major/minor/patch hops, the 0.x rule, every refusal, the forward-only write, the changelog close (twice), a rerun at a released tag and a hand-cut tag checked against the derivation.
+- `derive-release.mjs --check` ships 26 fixture cases covering the major/minor/patch hops, the 0.x rule, every refusal, the forward-only write, the changelog close (twice), a rerun at a released tag and a hand-cut tag checked against the derivation.
 - The GitHub Release body is now the changelog section the run closed (`dist/release-notes.md`) instead of boilerplate.
 - A `v*` tag push no longer defines the version: it is checked against the derivation, so a hand-cut tag is accepted only when it names the version the history implies.
 
@@ -40,6 +40,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `tokio-tungstenite` selects `rustls-tls-native-roots`. `webpki-roots` leaves
   the dependency graph; `rustls-native-certs` joins it. The rustls crypto
   provider moves from `ring` to `aws-lc-rs`.
+- Routine lockfile refresh inside the declared semver: `cc` 1.10.0 -> 1.11.1,
+  `itoa` 1.0.18 -> 1.0.19, `smallvec` 1.16.4 -> 1.16.5 and `syn` 3.0.9 ->
+  3.0.10. All four are transitive (no direct dependency in `Cargo.toml`
+  moved), no call site changed and no tool name, schema or behaviour is
+  touched. A re-run of `cargo update` locks 0 packages, so this is the
+  current resolve, and the highest `rust-version` in the graph stays 1.88:
+  the declared MSRV is unchanged.
 
 ## [0.6.2] - 2026-11-01
 
