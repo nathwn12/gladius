@@ -134,6 +134,18 @@ to the release body and a fixture case, and changes no arithmetic.
 
 ---
 
+## Amendments
+
+A frozen item implemented differently from its item block needs a written amendment naming
+what it reaches; that is what the last section below requires, and `SPEC.md` is not edited to
+provide it. The register:
+
+| Amendment | Sharpens or supersedes | Effort | Commit |
+|---|---|---|---|
+| `AMENDMENT-01-sizing.md` — sizing: no cap, declared units, a reported scale | Extends S1.1, S1.3, S1.4, S1.8 and §4's contract table; sharpens S1.3's last bullet and §11 ruling 5; adds a row to §10; records that §4 holds no cap row and gains none. Supersedes no frozen item. | 2.25 d | `3ca8f94` |
+
+---
+
 ## What would void this freeze
 
 - Any edit to `SPEC.md` after this record (the hash will not match).
