@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>wedge fixture</title>
+<style>body { margin: 0; font: 16px monospace; }</style>
+</head>
+<body>
+<p>GLADIUS_WEDGE_FIXTURE</p>
+<script>
+  // Block the renderer's main thread for `ms` synchronously. A wedged
+  // Runtime.evaluate is the case S2.3 bounds: the call must return inside its
+  // budget instead of holding the execution lock for the CDP timeout.
+  window.wedge = function (ms) {
+    var end = Date.now() + ms;
+    while (Date.now() < end) { /* spin */ }
+    return 'wedged';
+  };
+</script>
+</body>
+</html>

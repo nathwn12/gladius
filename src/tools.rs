@@ -443,9 +443,14 @@ impl From<String> for ToolErr {
 ///   target_changed   reason raced                             (+ tool, before, after)
 ///   engine_dead      reason respawn_failed|transport          (+ tool)
 ///   shadow_closed    reason unreachable                       (+ tool, element)
-///   timeout          reason budget_exceeded                   (+ tool)
-///   invalid_args     reason missing_arg|bad_value|bad_index|unknown_action|unknown_tool|need_option|unknown_arg (+ tool, arg?)
+///   cancelled        reason client_cancelled                  (+ tool)
+///   timeout          reason budget_exceeded                   (+ tool, budgetMs)
+///   invalid_args     reason missing_arg|bad_value|bad_index|unknown_action|unknown_tool|need_option|unknown_arg|budget_mismatch (+ tool, arg?)
 ///   error            fallback, code only (cdp/js-engine failures and anything untyped)
+///
+/// `_budgetMs` is the one argument every tool accepts without declaring it:
+/// the dispatcher strips and validates it before any tool's `check_unknown`
+/// runs, so it is a framework argument rather than a schema key.
 ///
 /// Fail loud: every tool rejects arguments outside its own schema with
 /// `invalid_args`/`unknown_arg` (never silent acceptance) via

@@ -262,6 +262,33 @@ fn assert_window(resps: &[Value], forbidden: &Value, allowed: &[Value], what: &s
     }
 }
 
+/// S2.3: a client cancel is answered immediately with a typed tool result
+/// (`cancelled`/`client_cancelled`) for the cancelled request id. Silence was
+/// the 0.7.x behaviour and is no longer the contract.
+fn assert_cancel_answer(v: &Value, id: &Value, what: &str) {
+    assert_eq!(
+        v.get("id"),
+        Some(id),
+        "{what}: the cancel answer carries the cancelled id: {v}"
+    );
+    assert!(
+        v.get("error").is_none(),
+        "{what}: the cancel answer is a tool result, never a protocol error: {v}"
+    );
+    assert_eq!(
+        v.pointer("/result/structuredContent/code")
+            .and_then(|c| c.as_str()),
+        Some("cancelled"),
+        "{what}: code cancelled: {v}"
+    );
+    assert_eq!(
+        v.pointer("/result/structuredContent/reason")
+            .and_then(|c| c.as_str()),
+        Some("client_cancelled"),
+        "{what}: reason client_cancelled: {v}"
+    );
+}
+
 #[test]
 fn ping_during_long_call() {
     let mut c = Client::spawn();
@@ -287,8 +314,11 @@ fn ping_during_long_call() {
     );
 }
 
+/// S2.3: a cancel answers the cancelled id immediately with a typed
+/// `cancelled`/`client_cancelled`, exactly once - never silence (the 0.7.x
+/// behaviour), never a second frame, never a late duplicate.
 #[test]
-fn cancelled_call_sends_no_response() {
+fn cancelled_call_answers_with_a_typed_cancel() {
     let mut c = Client::spawn();
     let t_start = Instant::now();
     c.wait_for(json!(1), 5000);
@@ -297,9 +327,15 @@ fn cancelled_call_sends_no_response() {
         &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
         "params": {"requestId": 1}}),
     );
-    // No response for the cancelled id within 2s; nothing else either.
-    let got = c.drain(Duration::from_secs(2));
-    assert_window(&got, &json!(1), &[], "cancelled wait");
+    let t_cancel = Instant::now();
+    // The answer arrives promptly, for the cancelled id, typed.
+    let answer = c.wait_id(&json!(1), Duration::from_secs(2), "cancel answer");
+    assert!(
+        t_cancel.elapsed() < Duration::from_secs(2),
+        "the cancel is answered in {:?}",
+        t_cancel.elapsed()
+    );
+    assert_cancel_answer(&answer, &json!(1), "cancelled wait");
     // Ping still answers on a live server.
     let t0 = Instant::now();
     c.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}}));
@@ -309,11 +345,11 @@ fn cancelled_call_sends_no_response() {
         t0.elapsed() < Duration::from_secs(2),
         "ping fast after cancel"
     );
-    // No late response for the cancelled id after another 1s; nothing else.
+    // No late duplicate for the cancelled id after another 1s; nothing else.
     let late = c.drain(Duration::from_secs(1));
-    assert_window(&late, &json!(1), &[], "no late response");
+    assert_window(&late, &json!(1), &[], "no late duplicate");
     // Keep observing PAST the original 5s deadline: the cancelled wait
-    // would have completed by then, and still nothing may arrive.
+    // would have completed by then, and still nothing else may arrive.
     let deadline = t_start + Duration::from_millis(6500);
     let rest = c.drain(deadline.saturating_duration_since(Instant::now()));
     assert_window(&rest, &json!(1), &[], "no response past 5s deadline");
@@ -566,8 +602,9 @@ fn many_cancels_then_healthy_and_id_reuse() {
         );
     }
     // Observe past the 2000ms wait (3s): map every response by id. A
-    // cancelled call may only ever surface as a single busy refusal
-    // (permit not yet reaped at dispatch); never a result, never twice.
+    // cancelled call answers exactly once - the typed cancel (S2.3) - or, if
+    // its permit was refused before dispatch, the busy refusal. Never a
+    // second frame, never a tool result from a call that actually ran.
     let got = c.drain(Duration::from_secs(3));
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for v in &got {
@@ -586,14 +623,19 @@ fn many_cancels_then_healthy_and_id_reuse() {
             (2000..2000 + N).contains(&num),
             "unexpected id outside batch window: {v}"
         );
-        if v.get("error").is_none() {
-            panic!("cancelled id {num} emitted a result: {v}");
+        match v.get("error") {
+            Some(e) => assert_eq!(
+                e.get("code"),
+                Some(&json!(-32603)),
+                "a refusal before dispatch must be busy: {v}"
+            ),
+            None => assert_eq!(
+                v.pointer("/result/structuredContent/code")
+                    .and_then(|c| c.as_str()),
+                Some("cancelled"),
+                "the only result a cancelled call may emit is the typed cancel: {v}"
+            ),
         }
-        assert_eq!(
-            v.get("error").and_then(|e| e.get("code")),
-            Some(&json!(-32603)),
-            "non-result must be busy: {v}"
-        );
     }
     // Reusing a cancelled id must answer (no stale suppression).
     c.wait_for(json!(2000), 100);
@@ -671,17 +713,29 @@ fn writer_death_exits_cleanly_no_panic() {
     }
 }
 
+/// S2.3: a cancel that lands before the call has started still answers the
+/// in-flight id (the entry exists from dispatch), while a cancel naming an id
+/// that was never dispatched has nothing to answer and stays silent.
 #[test]
-fn pre_start_cancel_sends_no_response() {
+fn pre_start_cancel_answers_the_cancelled_call() {
     let mut c = Client::spawn();
     c.wait_for(json!(1), 5000);
-    // Cancel immediately: the call must never produce a response.
     c.send(
         &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
         "params": {"requestId": 1}}),
     );
-    let got = c.drain(Duration::from_secs(2));
-    assert_window(&got, &json!(1), &[], "pre-start cancel");
+    let answer = c.wait_id(&json!(1), Duration::from_secs(2), "pre-start cancel answer");
+    assert_cancel_answer(&answer, &json!(1), "pre-start cancel");
+    // An id that was never dispatched: no entry, so no response at all.
+    c.send(
+        &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": {"requestId": 999}}),
+    );
+    let got = c.drain(Duration::from_secs(1));
+    assert!(
+        got.is_empty(),
+        "a cancel for an unknown id answers nothing: {got:?}"
+    );
     // Server still alive.
     c.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}}));
     let pong = c.wait_id(&json!(2), Duration::from_secs(2), "ping");
@@ -1142,6 +1196,9 @@ fn cancel_during_capture_restores_everything() {
         "params": {"requestId": 10}}),
     );
     let cancelled_at = Instant::now();
+    // S2.3: the cancel is answered immediately, before the restore finishes.
+    let cancel_answer = c.wait_id(&json!(10), Duration::from_secs(5), "cancel answer");
+    assert_cancel_answer(&cancel_answer, &json!(10), "cancel during capture");
 
     // This needs the execution lock, so it cannot answer until the cancelled
     // capture has finished cleaning up: "lock released only after cleanup".
@@ -1178,8 +1235,8 @@ fn cancel_during_capture_restores_everything() {
         "the state read had to wait for the rest of the capture ({waited:?}), \
          which proves the lock was held until cleanup"
     );
-    // `wait_id` fails on any unexpected frame, so it also proves the
-    // cancelled call emitted no response.
+    // `wait_id` fails on any unexpected frame, so the only frame for id 10 was
+    // the typed cancel answer consumed above.
 
     c.call(json!(30), "viewport", json!({"reset": true}));
     let _ = c.wait_id(&json!(30), Duration::from_secs(30), "viewport reset");
@@ -1268,6 +1325,9 @@ fn cancel_during_compare_closes_the_scratch_target() {
         &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
         "params": {"requestId": 30}}),
     );
+    // S2.3: answered immediately, while the section finishes its restore.
+    let cancel_answer = c.wait_id(&json!(30), Duration::from_secs(5), "cancel answer");
+    assert_cancel_answer(&cancel_answer, &json!(30), "cancel during compare");
 
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -1281,8 +1341,8 @@ fn cancel_during_compare_closes_the_scratch_target() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // The page is clean as well, and the cancelled compare emitted nothing
-    // (wait_id fails on unexpected frames).
+    // The page is clean as well, and the cancelled compare answered exactly
+    // once (its typed cancel answer, consumed below).
     c.call(
         json!(40),
         "evaluate",
@@ -1360,6 +1420,10 @@ fn cancel_in_the_entry_window_never_mutates() {
         "params": {"requestId": 10}}),
     );
     let cancelled_at = Instant::now();
+    // S2.3: the cancel is answered immediately, even while the parked task
+    // still holds the execution lock.
+    let cancel_answer = c.wait_id(&json!(10), Duration::from_secs(5), "cancel answer");
+    assert_cancel_answer(&cancel_answer, &json!(10), "cancel in the entry window");
 
     // The exec lock is held by the parked task, so this can only answer once
     // the cancel has been honoured and the task dropped.
@@ -1449,6 +1513,10 @@ fn cancel_while_queued_never_enters_the_section() {
         &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
         "params": {"requestId": 10}}),
     );
+    // S2.3: the cancel is answered now; the task still never enters the
+    // section (that is what this test proves, 2 s from now).
+    let cancel_answer = c.wait_id(&json!(10), Duration::from_secs(5), "cancel answer");
+    assert_cancel_answer(&cancel_answer, &json!(10), "cancel while queued");
 
     // Wait until the queued task has had the gate handed to it (entry 300 ms,
     // abort hold 1500 ms) and would be inside the section if the recheck were

@@ -22,6 +22,76 @@ const MODERN: &str = "2026-07-28";
 /// answers `-32603 Server busy` instead of queueing unboundedly.
 const MAX_IN_FLIGHT_CALLS: usize = 4;
 
+/// Total budget for one `tools/call` (S2.3). A wedged renderer used to turn
+/// one call into minutes while holding the execution lock; the budget is what
+/// makes "no call exceeds a budget" a guarantee instead of a hope.
+const DEFAULT_TOOL_BUDGET_MS: u64 = 90_000;
+/// Bounds of the per-call `_budgetMs` override.
+const MIN_TOOL_BUDGET_MS: u64 = 2_000;
+const MAX_TOOL_BUDGET_MS: u64 = 600_000;
+
+/// Read and strip the per-call budget.
+///
+/// `_budgetMs` is an explicit exception to the unknown-argument gate: it is
+/// removed from the arguments before any tool sees them (so no tool's
+/// `check_unknown` allow-list has to name a framework argument) and validated
+/// here. Precedence: `_budgetMs`, then `GLADIUS_TOOL_BUDGET_MS` (tests), then
+/// the 90 s default.
+fn call_budget(args: &mut Value) -> Result<Duration, crate::tools::ToolErr> {
+    if let Some(v) = args.as_object_mut().and_then(|o| o.remove("_budgetMs")) {
+        return match v
+            .as_u64()
+            .filter(|ms| (MIN_TOOL_BUDGET_MS..=MAX_TOOL_BUDGET_MS).contains(ms))
+        {
+            Some(ms) => Ok(Duration::from_millis(ms)),
+            None => Err(crate::tools::ToolErr::typed(
+                format!(
+                    "_budgetMs must be an integer number of milliseconds in \
+                     {MIN_TOOL_BUDGET_MS}..={MAX_TOOL_BUDGET_MS}; got {v}"
+                ),
+                json!({"code": "invalid_args", "reason": "budget_mismatch", "arg": "_budgetMs"}),
+            )),
+        };
+    }
+    Ok(Duration::from_millis(
+        std::env::var("GLADIUS_TOOL_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .unwrap_or(DEFAULT_TOOL_BUDGET_MS),
+    ))
+}
+
+/// Typed `timeout`/`budget_exceeded` tool result (S2.3): the call ran past its
+/// total budget and was stopped. `timeout` is the existing code; the guarantee
+/// that nothing exceeds a budget is what is new.
+fn budget_timeout(tool: &str, budget: Duration) -> Value {
+    crate::tools::ToolErr::typed(
+        format!(
+            "{tool}: call exceeded its total budget of {} ms and was stopped; nothing it had \
+             started is retried (raise `_budgetMs` for a legitimately long call)",
+            budget.as_millis()
+        ),
+        json!({"code": "timeout", "reason": "budget_exceeded", "tool": tool,
+               "budgetMs": budget.as_millis() as u64}),
+    )
+    .envelope()
+}
+
+/// Typed `cancelled`/`client_cancelled` tool result (S2.3): the client asked
+/// the call to stop and gets its answer immediately, while the call's restore
+/// keeps running in the detached waiter that already guards it.
+fn cancelled_result(tool: &str) -> Value {
+    crate::tools::ToolErr::typed(
+        format!(
+            "{tool}: cancelled by the client (notifications/cancelled); the call stopped and \
+             nothing is retried"
+        ),
+        json!({"code": "cancelled", "reason": "client_cancelled", "tool": tool}),
+    )
+    .envelope()
+}
+
 /// Bound for lingering cancelled entries (an aborted task never runs its
 /// epilogue, so its entry stays until evicted). Live entries are never
 /// evicted: with a 4-slot semaphore only a handful can exist at once.
@@ -179,6 +249,8 @@ struct CallState {
     gen: u64,
     cancelled: bool,
     emitted: bool,
+    /// The tool this call runs, so a cancel answer can name it.
+    tool: String,
     /// Cancellation-safety gate for tools that mutate page-visible state and
     /// restore it (`screenshot`, `assert_layout`, `visual`). The task holds
     /// this for the WHOLE call; a cancel waits for it before aborting, so the
@@ -608,7 +680,7 @@ pub async fn serve() -> Result<(), String> {
         // Cancellation is a notification: never a response, even when it
         // carries an `id` of its own.
         if method == "notifications/cancelled" {
-            handle_cancel(&req, &registry).await;
+            handle_cancel(&req, &registry, &tx).await;
             if tx.is_closed() {
                 break;
             }
@@ -652,13 +724,12 @@ fn send_resp(tx: &mpsc::UnboundedSender<Value>, v: Value) -> Result<(), ()> {
     tx.send(v).map_err(|_| ())
 }
 
-/// `notifications/cancelled`: under the single registry lock, abort the
-/// in-flight call whose canonical id matches `params.requestId`. Unknown,
-/// completed, evicted, and already-emitted ids are no-ops. The cancelled
-/// call sends no response: the flag suppresses even a task momentarily in
-/// a non-preemptible section, and the lingering entry is bounded by
-/// eviction.
-async fn handle_cancel(req: &Value, registry: &Registry) {
+/// `notifications/cancelled`: under the single registry lock, answer the
+/// cancelling client immediately with a typed `cancelled` (S2.3) and abort the
+/// in-flight call from a detached waiter, so a capture still finishes its
+/// restore. Unknown, completed, evicted, and already-emitted ids are no-ops:
+/// there is nothing left to answer.
+async fn handle_cancel(req: &Value, registry: &Registry, tx: &mpsc::UnboundedSender<Value>) {
     let Some(rid) = req.get("params").and_then(|p| p.get("requestId")) else {
         return;
     };
@@ -671,10 +742,18 @@ async fn handle_cancel(req: &Value, registry: &Registry) {
         return;
     }
     st.cancelled = true;
+    st.emitted = true;
+    // Answer NOW: the caller waited in silence for up to CANCEL_GRACE before
+    // this release. The restore keeps running behind the answer, so the page
+    // is still cleaned up - the answer just stops being held hostage to it.
+    let tool = st.tool.clone();
+    let _ = tx.send(json!({"jsonrpc": "2.0", "id": rid.clone(),
+        "result": cancelled_result(&tool)}));
     // Take the handle + its section gate out under the lock, then abort from
     // a detached waiter so the read loop is never blocked by a capture that
     // is finishing its restore (see `abort_after_critical`).
     let taken = st.handle.take().map(|h| (h, st.critical.clone()));
+    map.remove(&key);
     evict_stale_locked(&mut map);
     drop(map);
     if let Some((h, critical)) = taken {
@@ -754,6 +833,20 @@ async fn dispatch_call(
         return;
     }
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let mut args = args;
+    // The per-call budget (S2.3): `_budgetMs` is stripped here so no tool's
+    // unknown-argument gate ever sees it, and a value that cannot be honoured
+    // is refused as a tool result, never silently replaced.
+    let budget = match call_budget(&mut args) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = send_resp(
+                tx,
+                json!({"jsonrpc": "2.0", "id": id, "result": e.envelope()}),
+            );
+            return;
+        }
+    };
     let key = id_key(&id);
     let gen = gen_ctr.fetch_add(1, Ordering::Relaxed);
     // Duplicate-id supersession BEFORE the semaphore decision (idempotent
@@ -818,6 +911,7 @@ async fn dispatch_call(
                 gen,
                 cancelled: false,
                 emitted: false,
+                tool: name.clone(),
                 critical: critical.clone(),
             },
         );
@@ -830,6 +924,7 @@ async fn dispatch_call(
     let section_needed = needs_critical_section(&name, &args);
     let critical_task = critical.clone();
     let key_task = key.clone();
+    let tool_name = name.clone();
     let handle: JoinHandle<()> = tokio::spawn(async move {
         // The permit releases when the task ends (normal, abort, panic).
         let _permit = permit;
@@ -839,7 +934,7 @@ async fn dispatch_call(
         }
         // A tool panic is caught and converted to a `-32603` response for
         // the id (when not cancelled) instead of a silent entry leak.
-        let outcome = std::panic::AssertUnwindSafe(async {
+        let body = std::panic::AssertUnwindSafe(async {
             if lock_needed {
                 // A cancelled task waiting here aborts cleanly: the lock
                 // future is dropped, the tool never runs, nothing is sent.
@@ -875,8 +970,31 @@ async fn dispatch_call(
                 Some(tools::call(&name, &args, &browser).await)
             }
         })
-        .catch_unwind()
-        .await;
+        .catch_unwind();
+        // The WHOLE call - lock wait, section wait, tool work - runs inside
+        // one total budget (S2.3), so a wedged renderer can never hold the
+        // execution lock for minutes.
+        tokio::pin!(body);
+        let timer = tokio::time::sleep(budget);
+        tokio::pin!(timer);
+        let outcome = tokio::select! {
+            r = &mut body => Some(r),
+            _ = &mut timer => None,
+        };
+        let Some(outcome) = outcome else {
+            // Budget exceeded: answer typed and immediately, then make the
+            // future safe to drop. A call that restores page state keeps
+            // running until its restore is done (the future is NOT dropped
+            // mid-section); anything else is dropped here, which releases the
+            // execution lock with it.
+            let resp = json!({"jsonrpc": "2.0", "id": id,
+                "result": budget_timeout(&tool_name, budget)});
+            commit_emit(&registry_task, &key_task, gen, resp, &tx_task).await;
+            if section_needed {
+                let _ = (&mut body).await;
+            }
+            return;
+        };
         let resp_opt = match outcome {
             Ok(Some(mut result)) => {
                 if modern {
@@ -1125,6 +1243,7 @@ mod concurrency_tests {
             gen,
             cancelled: false,
             emitted: false,
+            tool: "wait_for".to_string(),
             critical: Arc::new(Mutex::new(())),
         }
     }
@@ -1151,6 +1270,7 @@ mod concurrency_tests {
                 gen: 9,
                 cancelled: true,
                 emitted: false,
+                tool: "screenshot".to_string(),
                 critical: Arc::new(Mutex::new(())),
             },
         );
@@ -1235,6 +1355,7 @@ mod concurrency_tests {
                     gen: i as u64,
                     cancelled: true,
                     emitted: false,
+                    tool: "wait_for".to_string(),
                     critical: Arc::new(Mutex::new(())),
                 },
             );

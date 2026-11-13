@@ -117,6 +117,7 @@ unsupported error and a pointer to `GLADIUS_CDP_URL`.
 | `GLADIUS_BACKEND_CAPS` | `render` | `render` or `dom-only`. `dom-only` declares no rendering pipeline: `screenshot` and `visual` refuse with `capability_gated` / `dom_only` instead of returning a fake image. Any other value is an error. |
 | `GLADIUS_VISUAL_DIR` | `%LOCALAPPDATA%/gladius/visual` | Root for `visual` baselines and their `.meta.json` sidecars. Never the caller's cwd by default. |
 | `GLADIUS_VISUAL_CAP` | `500` | Cap on stored baselines, and separately on `.diff.png` by-products. A save at the cap is a typed refusal; diff images are the only by-products aged out automatically. |
+| `GLADIUS_TOOL_BUDGET_MS` | `90000` | Total budget for one `tools/call`, in milliseconds. A per-call `_budgetMs` argument (`2000`..`600000`) overrides it. |
 | `GLADIUS_STARTUP_TIMEOUT_SECS` | `30` | Deadline for the owned-engine readiness poll, in seconds. |
 
 Test-only hooks, never set in production: `GLADIUS_TEST_CRITICAL_DELAY_MS`,
@@ -306,6 +307,8 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 | `scratch_background_unsupported` | The attached engine refuses a background target, so `visual compare` will not open a foreground tab. | Compare against the owned browser instead of your attached engine. |
 | `headed mode is not supported` | `--headed` or `GLADIUS_HEADED` was set. | Start your own browser and attach with `GLADIUS_CDP_URL`; gladius never owns a visible window. |
 | `timeout` from `navigate` or `wait_for` | The load or the predicate never settled (15 s cap on `wait_for`). | Poll with `wait_for`, or read `network` and `console` to see what stalled. |
+| `timeout` / `budget_exceeded` | The call ran past its total budget (90 s by default) - a wedged renderer or a page that never settles. The call is stopped and the execution lock is released, so the next call runs. | Raise `_budgetMs` (2000..600000) for a call that legitimately needs longer, or read `network`/`console` to see what stalled. |
+| `cancelled` / `client_cancelled` | You sent `notifications/cancelled` for that call, so it stopped. The answer arrives immediately; the page's overrides are restored behind it. | Nothing is retried. Re-issue the call if you still want it. |
 | `engine_dead` | The engine connection died: `respawn_failed` means the owned browser did not come back from its single automatic relaunch; `transport` means the socket closed (an engine you attached with `GLADIUS_CDP_URL` is never gladius's to restart). | Call `close` and retry - the next call launches a fresh engine. For an attached engine, start yours again first. |
 | Engine readiness never arrives | Spawn worked but `/json/version` stayed silent past the 30 s deadline. | Raise `GLADIUS_STARTUP_TIMEOUT_SECS` on a slow machine; otherwise check `GLADIUS_CHROMIUM` points at a real `chrome-headless-shell` binary, not full Chrome. |
 | `cookie_rejected` | The engine refused the cookie write, caught by read-back verification. | Check the domain, `SameSite` and `Secure` attributes for the scheme you are on. |
