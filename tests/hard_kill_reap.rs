@@ -28,12 +28,19 @@ struct Client {
 
 impl Client {
     fn spawn() -> Self {
+        Self::spawn_with_env(&[])
+    }
+
+    fn spawn_with_env(env_extra: &[(&str, &str)]) -> Self {
         let bin = env!("CARGO_BIN_EXE_gladius");
         let mut cmd = Command::new(bin);
         cmd.arg("mcp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        for (k, v) in env_extra {
+            cmd.env(k, v);
+        }
         // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
         // resolves from its versioned cache with no env override.
         #[cfg(windows)]
@@ -312,5 +319,128 @@ fn hard_kill_reaps_owned_browser_tree_and_sweeps_stale_profile() {
         profile_dirs(bpid).is_empty(),
         "graceful close swept B's profile dir: {:?}",
         profile_dirs(bpid)
+    );
+}
+
+/// The owned-launch record for one gladius pid: `%TEMP%/gladius-<pid>.json`.
+fn pid_record(owner_pid: u32) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("gladius-{owner_pid}.json"))
+}
+
+/// Kill one process tree (only ever a pid this test observed as its own).
+fn kill_tree(pid: u32) {
+    let mut cmd = Command::new("taskkill");
+    cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let _ = cmd.spawn().and_then(|mut c| c.wait());
+}
+
+/// S2.2: the job object is the primary reaper, but the launch path where job
+/// assignment FAILED has no cover at all. `GLADIUS_TEST_NO_JOB=1` reproduces
+/// that path honestly (no job is armed), so a hard-killed server leaves a
+/// live browser holding its profile - and only the pid file can reap it.
+#[test]
+fn pid_file_reaps_a_jobless_orphan() {
+    // --- server A: a launch with NO job cover ---
+    let mut a = Client::spawn_with_env(&[("GLADIUS_TEST_NO_JOB", "1")]);
+    let apid = a.child.id();
+    a.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+    let nav = a.call("navigate", json!({"url": fixture_url()}));
+    assert!(nav.get("isError").is_none(), "A navigate ok: {nav}");
+
+    // The record is written before readiness: it names the owner, the engine
+    // and the private profile the engine is holding.
+    let rec_path = pid_record(apid);
+    let rec_text = std::fs::read_to_string(&rec_path)
+        .unwrap_or_else(|e| panic!("owned launch writes {}: {e}", rec_path.display()));
+    let rec: Value = serde_json::from_str(&rec_text).expect("record is JSON");
+    assert_eq!(rec.get("pid").and_then(|v| v.as_u64()), Some(apid as u64));
+    let engine_pid = rec
+        .get("enginePid")
+        .and_then(|v| v.as_u64())
+        .expect("record names the engine pid") as u32;
+    let profile = rec
+        .get("profileDir")
+        .and_then(|v| v.as_str())
+        .expect("record names the profile dir")
+        .to_string();
+    assert!(
+        rec.get("startedAt").and_then(|v| v.as_u64()).unwrap_or(0) > 0,
+        "record carries startedAt: {rec_text}"
+    );
+    assert!(
+        std::path::Path::new(&profile).is_dir(),
+        "the recorded profile dir exists: {profile}"
+    );
+    assert!(
+        process_alive(engine_pid),
+        "the recorded engine pid is alive before the kill"
+    );
+
+    // --- hard kill ONLY server A: no Drop, no job cover ---
+    a.child.kill().expect("hard-kill server A");
+    let _ = a.child.wait();
+    drop(a);
+    assert!(!process_alive(apid), "server A is dead after the hard kill");
+    assert!(
+        process_alive(engine_pid),
+        "without a job cover the engine survives the hard kill (this is the path S2.2 covers)"
+    );
+    assert!(
+        std::path::Path::new(&profile).is_dir(),
+        "the orphan still holds its profile dir"
+    );
+
+    // --- server B: its launch kills the provable orphan, then sweeps ---
+    let mut b = Client::spawn();
+    b.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+    let navb = b.call("navigate", json!({"url": fixture_url()}));
+    assert!(navb.get("isError").is_none(), "B navigate ok: {navb}");
+
+    let mut deadline = 30;
+    while deadline > 0 && (process_alive(engine_pid) || std::path::Path::new(&profile).exists()) {
+        std::thread::sleep(Duration::from_millis(1000));
+        deadline -= 1;
+    }
+    let engine_gone = !process_alive(engine_pid);
+    let dir_gone = !std::path::Path::new(&profile).exists();
+    if !engine_gone {
+        kill_tree(engine_pid); // never leave the orphan behind on a failure
+    }
+    assert!(
+        engine_gone,
+        "B's launch terminated the job-less orphan (pid {engine_pid})"
+    );
+    assert!(
+        dir_gone,
+        "B's launch swept the orphan's profile dir: {profile}"
+    );
+    assert!(
+        !rec_path.exists(),
+        "the reaped record is removed: {}",
+        rec_path.display()
+    );
+
+    // B is healthy on its own engine and closes cleanly.
+    let bpid = b.child.id();
+    let snap = b.call("snapshot", json!({}));
+    assert!(
+        content_text(&snap).contains("GLADIUS_MARKER_hello-12345"),
+        "B renders the page: {}",
+        content_text(&snap).chars().take(200).collect::<String>()
+    );
+    let closed = b.call("close", json!({}));
+    assert!(closed.get("isError").is_none(), "close ok: {closed}");
+    shutdown(b);
+    assert!(
+        !pid_record(bpid).exists(),
+        "graceful close removes B's own record"
     );
 }

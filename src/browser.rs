@@ -217,6 +217,12 @@ enum Engine {
         pid: u32,
         #[cfg(windows)]
         _job: Option<std::os::windows::io::OwnedHandle>,
+        /// Owned-launch record (`%TEMP%/gladius-<gladius pid>.json`), written
+        /// before readiness and removed when this engine is dropped. It is the
+        /// fallback authority for the launch path where job assignment failed:
+        /// a hard kill never runs `Drop`, so the file survives for the next
+        /// launch to kill-then-sweep from (S2.2).
+        _record: Option<PidRecord>,
         /// Private profile dir for this instance (created fresh before
         /// launch; swept deterministically in `close()` after the tree is
         /// reaped, with a bounded retry in `Drop` as fallback). Declared
@@ -1455,6 +1461,7 @@ impl Browser {
             match engine {
                 Engine::Owned {
                     _profile: profile,
+                    _record,
                     #[cfg(windows)]
                         _job: job,
                     mut child,
@@ -3597,6 +3604,10 @@ async fn launch_owned_chromium() -> Result<Inner, String> {
 /// so clients connect lazily on first tool use and bound every wait).
 async fn launch_owned_chromium_once() -> Result<Inner, String> {
     let deadline = startup_timeout();
+    // Fallback authority first (S2.2): a record whose owner is dead gets its
+    // engine killed and its profile swept. The dir-only sweep below then
+    // covers profiles that have no record at all.
+    sweep_stale_records().await;
     sweep_stale_profiles();
     // Fresh private profile BEFORE launch (functional, not hygiene): since
     // Chrome 136 the remote-debugging switches are ignored on the default
@@ -3646,10 +3657,20 @@ async fn launch_owned_chromium_once() -> Result<Inner, String> {
         return Err("chromium child has no pid".to_string());
     }
     // Hard-kill cover (G-4): the OS reaps the tree
-    // when gladius dies by ANY means.
+    // when gladius dies by ANY means. `GLADIUS_TEST_NO_JOB` reproduces the
+    // launch path where assignment failed (no cover at all), which is the
+    // only path the pid file exists for.
     #[cfg(windows)]
-    let job = job::arm(guard.child.as_ref().expect("guard holds child"));
+    let job = if test_no_job() {
+        eprintln!("[gladius] job: assignment skipped by GLADIUS_TEST_NO_JOB (test-only)");
+        None
+    } else {
+        job::arm(guard.child.as_ref().expect("guard holds child"))
+    };
     let pid = guard.pid;
+    // Written BEFORE readiness is declared, so a hard kill during startup
+    // still leaves the fallback authority behind (S2.2).
+    let record = PidRecord::write(pid, profile.path())?;
     let base = format!("http://127.0.0.1:{port}");
     let start = Instant::now();
     let ws_request = loop {
@@ -3757,6 +3778,7 @@ async fn launch_owned_chromium_once() -> Result<Inner, String> {
     Ok(Inner {
         engine: Engine::Owned {
             _profile: profile,
+            _record: Some(record),
             #[cfg(windows)]
             _job: job,
             child: Box::new(child),
@@ -3863,6 +3885,185 @@ async fn sweep_profile_dir(path: &std::path::Path) -> Result<(), String> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// One owned-launch record: `%TEMP%/gladius-<gladius pid>.json`, holding
+/// `{pid, enginePid, profileDir, startedAt}` (`startedAt` is epoch millis).
+///
+/// The Windows job object is the PRIMARY hard-kill cover, and this file is
+/// the fallback authority for the launch path where job assignment failed
+/// (the `close()` path already logs "no job cover"): there a hard kill leaves
+/// a live browser holding its private profile, and a dir-only sweep cannot
+/// remove it. Written before readiness is declared; removed whenever this
+/// engine is dropped (graceful close, failed launch). A hard kill never runs
+/// `Drop`, so the file survives for the next launch to kill-then-sweep from
+/// (S2.2).
+struct PidRecord {
+    path: std::path::PathBuf,
+}
+
+impl PidRecord {
+    fn write(engine_pid: u32, profile: &std::path::Path) -> Result<Self, String> {
+        let path = std::env::temp_dir().join(format!("gladius-{}.json", std::process::id()));
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let body = json!({
+            "pid": std::process::id(),
+            "enginePid": engine_pid,
+            "profileDir": profile.to_string_lossy(),
+            "startedAt": started_at,
+        });
+        std::fs::write(&path, body.to_string())
+            .map_err(|e| format!("pid record {}: {e}", path.display()))?;
+        Ok(PidRecord { path })
+    }
+}
+
+impl Drop for PidRecord {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Test-only hook (never set in production): skip the Windows job-object
+/// assignment, reproducing the launch path where job assignment failed. That
+/// is the ONLY path L4-2 survives on (SPEC §11 ruling 1), and the only way to
+/// prove the pid file reaps an orphan the job cover is not reaping.
+fn test_no_job() -> bool {
+    std::env::var("GLADIUS_TEST_NO_JOB")
+        .map(|v| !v.trim().is_empty() && v.trim() != "0")
+        .unwrap_or(false)
+}
+
+/// Kill-then-sweep for owned-launch records whose owner is provably dead.
+///
+/// For each `%TEMP%/gladius-<pid>.json` whose owner gladius pid is gone: if
+/// the recorded engine pid is alive AND its command line carries our
+/// `--user-data-dir=<recorded profile>`, terminate that tree (bounded), then
+/// delete the profile dir and the record. Any doubt - an unreadable record, an
+/// unknown command line, a live owner, a pid we cannot check - leaves both
+/// alone, exactly as the dir-only sweep is conservative. Runs before the
+/// dir-only sweep, which still covers profiles with no record at all.
+async fn sweep_stale_records() {
+    let rd = match std::fs::read_dir(std::env::temp_dir()) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let owner: u32 = match name
+            .strip_prefix("gladius-")
+            .and_then(|r| r.strip_suffix(".json"))
+            .and_then(|p| p.parse().ok())
+        {
+            Some(p) => p,
+            None => continue,
+        };
+        if owner == std::process::id() || owner_alive(owner) {
+            continue;
+        }
+        // An unreadable or malformed record is doubt: keep everything.
+        let text = match std::fs::read_to_string(e.path()) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let rec: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let engine_pid = rec
+            .get("enginePid")
+            .and_then(|v| v.as_u64())
+            .filter(|p| *p > 0 && *p <= u32::MAX as u64)
+            .map(|p| p as u32);
+        let profile = rec
+            .get("profileDir")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if let Some(ep) = engine_pid {
+            if owner_alive(ep) {
+                // Only OUR engine, proven by the command line carrying the
+                // exact profile dir we created for it. Anything else - a
+                // reused pid, an unreadable command line - keeps both.
+                let ours = process_cmdline(ep)
+                    .map(|cl| match &profile {
+                        Some(dir) => cl.contains(&format!("--user-data-dir={dir}")),
+                        None => false,
+                    })
+                    .unwrap_or(false);
+                if !ours {
+                    continue;
+                }
+                eprintln!(
+                    "[gladius] sweep: terminating job-less orphan pid {ep} recorded by dead server {owner}"
+                );
+                kill_tree_bounded(ep).await;
+            }
+        }
+        if let Some(dir) = &profile {
+            let path = std::path::Path::new(dir);
+            if std::fs::symlink_metadata(path).is_ok() {
+                eprintln!("[gladius] sweep: removing recorded profile {dir}");
+                if let Err(err) = sweep_profile_dir(path).await {
+                    // The dir survived a bounded sweep: keep the record so the
+                    // next launch can try again instead of losing the only
+                    // authority that names the engine.
+                    eprintln!("[gladius] sweep: {err}");
+                    continue;
+                }
+            }
+        }
+        let _ = std::fs::remove_file(e.path());
+    }
+}
+
+/// Command line of a live process, or `None` when it cannot be read (any
+/// doubt keeps the process and its dir). Read-only WMI query, windowless,
+/// bounded: the launch path must never hang on a stuck query.
+#[cfg(windows)]
+fn process_cmdline(pid: u32) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &format!("(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"),
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let mut child = cmd.spawn().ok()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    use std::io::Read;
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    let t = out.trim().to_string();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+#[cfg(not(windows))]
+fn process_cmdline(_pid: u32) -> Option<String> {
+    None
 }
 
 /// Delete `gladius-<pid>-*` profile dirs whose owner gladius pid is dead.
@@ -4063,6 +4264,7 @@ mod job {
         fn AssignProcessToJobObject(job: RawHandle, process: RawHandle) -> i32;
         fn CloseHandle(handle: RawHandle) -> i32;
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> RawHandle;
+        fn GetExitCodeProcess(process: RawHandle, code: *mut u32) -> i32;
         fn GetLastError() -> u32;
     }
 
@@ -4111,14 +4313,26 @@ mod job {
 
     /// True unless the pid is provably dead (conservative: any doubt keeps
     /// the profile dir, so a live server's profile is never swept).
+    ///
+    /// A terminated process whose object has not been fully released yet is a
+    /// ZOMBIE: `OpenProcess` still succeeds on it (the object exists while any
+    /// handle remains), so an open handle alone does not prove liveness. The
+    /// exit code does: `STILL_ACTIVE` is the only answer that means running,
+    /// and a process that exited with 259 reads as alive (the safe direction).
     pub(super) fn process_alive(pid: u32) -> bool {
+        const STILL_ACTIVE: u32 = 259;
         unsafe {
             let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if !h.is_null() {
-                CloseHandle(h);
-                return true;
+            if h.is_null() {
+                return GetLastError() != ERROR_INVALID_PARAMETER;
             }
-            GetLastError() != ERROR_INVALID_PARAMETER
+            let mut code: u32 = 0;
+            let ok = GetExitCodeProcess(h, &mut code);
+            CloseHandle(h);
+            if ok == 0 {
+                return true; // unknown: never declare a process dead on doubt
+            }
+            code == STILL_ACTIVE
         }
     }
 }
@@ -4178,6 +4392,7 @@ mod tests {
         let inner = Inner {
             engine: Engine::Owned {
                 _profile: profile,
+                _record: None,
                 #[cfg(windows)]
                 _job: None,
                 child: Box::new(child),
@@ -4312,6 +4527,7 @@ mod tests {
         let inner = Inner {
             engine: Engine::Owned {
                 _profile: profile,
+                _record: None,
                 #[cfg(windows)]
                 _job: None,
                 child: Box::new(child),
