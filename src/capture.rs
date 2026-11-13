@@ -225,7 +225,30 @@ const SETTLE_JS: &str = r#"(() => {
     try { wait(() => { clearTimeout(timer); end(false); }); } catch (e) { clearTimeout(timer); end(false); }
   });
   return (async () => {
-    await race('fonts', 3000, (ok) => { document.fonts.ready.then(() => ok(), () => ok()); });
+    // Font readiness by STATUS, not by a single promise: `document.fonts.ready`
+    // resolves when the current loads finish, so a font-display:swap page can
+    // still swap after it. Every face must reach `loaded` or `error`; a face
+    // still `loading` at the budget is counted and named, never assumed.
+    const facesLoading = () => {
+      try {
+        return Array.from(document.fonts).filter((f) => f.status === 'loading');
+      } catch (e) { return []; }
+    };
+    await race('fonts', 3000, (ok) => {
+      const check = () => {
+        let pending = [];
+        try { pending = facesLoading(); } catch (e) { ok(); return; }
+        if (pending.length === 0) { ok(); return; }
+        try {
+          Promise.all(pending.map((f) => {
+            try { return f.loaded.catch(() => {}); } catch (e) { return null; }
+          })).then(check, check);
+        } catch (e) { ok(); }
+      };
+      check();
+    });
+    const fontsPending = facesLoading().length;
+    if (fontsPending > 0 && timeouts.indexOf('fonts') < 0) timeouts.push('fonts');
     const imgs = Array.prototype.slice.call(document.images || []);
     for (const i of imgs) {
       if (i.complete) continue;
@@ -236,7 +259,7 @@ const SETTLE_JS: &str = r#"(() => {
     }
     await race('raf', 250, (ok) => requestAnimationFrame(() => ok()));
     await race('raf', 250, (ok) => requestAnimationFrame(() => ok()));
-    return {settled: timeouts.length === 0, timeouts: timeouts};
+    return {settled: timeouts.length === 0, timeouts: timeouts, fontsPending: fontsPending};
   })();
 })()"#;
 
@@ -313,6 +336,8 @@ pub struct Capture {
     /// What the freeze walk actually reached: `{waapiPaused, smilPaused,
     /// mediaPaused, shadowRoots, frames, skipped[]}`. Deterministic only.
     pub freeze: Value,
+    /// `FontFace`s still `loading` when the capture was taken (0 = none).
+    pub fonts_pending: i64,
 }
 
 impl Capture {
@@ -348,6 +373,9 @@ impl Capture {
             // `animation-play-state:paused`, which would keep a
             // wall-clock-dependent frame.
             m.insert("freezeMode".to_string(), json!("animation-none"));
+            // Fonts are a status, not a race: the count of faces still loading
+            // is reported so "swapped late" and "loaded" cannot look alike.
+            m.insert("fontsPending".to_string(), json!(self.fonts_pending));
         }
         Value::Object(m)
     }
@@ -545,6 +573,7 @@ fn decode(r: &Value, deterministic: bool) -> Result<Capture, String> {
         settled: true,
         settle_timeouts: Vec::new(),
         freeze: Value::Null,
+        fonts_pending: 0,
     })
 }
 
@@ -676,6 +705,7 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
     // for a genuinely stuck renderer; when IT fires the reply names
     // `settleCap` rather than pretending the page was stable.
     let mut settle_timeouts: Vec<String> = Vec::new();
+    let mut fonts_pending: i64 = 0;
     match tokio::time::timeout(SETTLE_CAP, browser.eval(SETTLE_JS)).await {
         Ok(Ok(v)) => {
             for t in v
@@ -688,6 +718,7 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
                     settle_timeouts.push(s.to_string());
                 }
             }
+            fonts_pending = v.get("fontsPending").and_then(|n| n.as_i64()).unwrap_or(0);
         }
         Ok(Err(e)) => {
             warn(&format!(
@@ -771,6 +802,7 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
     cap.settled = settle_timeouts.is_empty();
     cap.settle_timeouts = settle_timeouts;
     cap.freeze = freeze;
+    cap.fonts_pending = fonts_pending;
     let arr = live.as_array().cloned().unwrap_or_default();
     let num = |i: usize| arr.get(i).and_then(|v| v.as_f64());
     cap.width = num(0).map(|v| v as i64).unwrap_or(width);

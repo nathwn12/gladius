@@ -167,6 +167,22 @@ fn flag(v: &Value, key: &str) -> Option<bool> {
     v.get(key).and_then(|x| x.as_bool())
 }
 
+/// The `text` part of a screenshot reply, parsed: the deterministic metadata.
+fn shot_meta(reply: &Value) -> Value {
+    let parts = reply
+        .get("content")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let text = parts
+        .iter()
+        .find(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .and_then(|p| p.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    serde_json::from_str(text).unwrap_or_else(|_| panic!("screenshot meta is not json: {text}"))
+}
+
 // --------------------------------------------------------------------- S1.1
 
 /// SPEC.md S1.1: identity and tolerance are two questions with two booleans.
@@ -529,6 +545,120 @@ fn settle_timeout_is_a_field() {
         sc.get("code").and_then(|c| c.as_str()),
         Some("baseline_environment_unsettled"),
         "and the refusal is typed: {strict}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    shutdown(c);
+}
+
+// --------------------------------------------------------------------- S1.7
+
+/// SPEC.md S1.7: font readiness is a status, not a race.
+///
+/// `document.fonts.ready` resolves when the CURRENT loads finish, so a
+/// `font-display:swap` page can capture mid-swap and a timed-out wait used to
+/// leave only a stderr line. The fixture's `@font-face` is served by a
+/// loopback that stalls past the 3 s budget: the capture must say
+/// `fontsPending >= 1`, name `fonts` in `settleTimeouts`, and be unsettled.
+/// A page whose font resolves at once is the clean path.
+#[test]
+fn fonts_report_pending_not_silent() {
+    let dir = scratch("fonts");
+    let vdir = dir.join("visual");
+    std::fs::create_dir_all(&vdir).expect("visual dir");
+    let vdir_s = vdir.to_string_lossy().to_string();
+
+    // Accept the request and stall well past the settle budget: the FontFace
+    // stays `loading`, which is exactly what must be reported.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in listener.incoming().flatten() {
+            held.push(s);
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    });
+
+    let slow = dir.join("slowfont.html");
+    std::fs::write(
+        &slow,
+        format!(
+            "<!doctype html><html><head><style>\
+             @font-face {{ font-family: SlowFace; src: url('http://127.0.0.1:{port}/slow.woff2'); }}\
+             body {{ margin: 0; background: #fff; font: 16px/20px SlowFace, sans-serif }}\
+             </style></head><body><p>FONT_MARKER</p></body></html>"
+        ),
+    )
+    .expect("write slow font fixture");
+
+    let mut c = Client::spawn_with_env(&[("GLADIUS_VISUAL_DIR", &vdir_s)]);
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+    goto(&mut c, &slow, 400, 200);
+
+    let shot = c.call("screenshot", json!({"deterministic": true}));
+    assert!(shot.get("isError").is_none(), "screenshot: {shot}");
+    let meta = shot_meta(&shot);
+    let pending = meta
+        .get("fontsPending")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+    assert!(
+        pending >= 1,
+        "a face still loading at capture time is counted: {meta}"
+    );
+    let timeouts: Vec<String> = meta
+        .get("settleTimeouts")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        timeouts.iter().any(|t| t == "fonts"),
+        "the font wait names itself in settleTimeouts: {meta}"
+    );
+    assert_eq!(
+        flag(&meta, "settled"),
+        Some(false),
+        "and the capture is honest about it: {meta}"
+    );
+
+    // Clean path: a font that resolves at once leaves nothing pending and two
+    // captures of the same page are byte-identical.
+    let fast = dir.join("fastfont.html");
+    std::fs::write(
+        &fast,
+        "<!doctype html><html><head><style>\
+         @font-face { font-family: FastFace; src: local('Arial'); }\
+         body { margin: 0; background: #fff; font: 16px/20px FastFace, sans-serif }\
+         </style></head><body><p>FONT_MARKER</p></body></html>",
+    )
+    .expect("write fast font fixture");
+    goto(&mut c, &fast, 400, 200);
+    let first = c.call("screenshot", json!({"deterministic": true}));
+    assert!(first.get("isError").is_none(), "fast capture: {first}");
+    let m1 = shot_meta(&first);
+    assert_eq!(
+        flag(&m1, "settled"),
+        Some(true),
+        "a page whose font resolves at once settles: {m1}"
+    );
+    assert_eq!(
+        m1.get("fontsPending").and_then(|v| v.as_i64()),
+        Some(0),
+        "nothing is pending: {m1}"
+    );
+    std::thread::sleep(Duration::from_millis(120));
+    let second = c.call("screenshot", json!({"deterministic": true}));
+    assert!(second.get("isError").is_none(), "fast capture 2: {second}");
+    let m2 = shot_meta(&second);
+    assert_eq!(
+        m1.get("checksum").and_then(|v| v.as_str()),
+        m2.get("checksum").and_then(|v| v.as_str()),
+        "two captures of the settled page are identical: {m1} vs {m2}"
     );
 
     std::fs::remove_dir_all(&dir).ok();
