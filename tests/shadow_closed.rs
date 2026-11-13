@@ -190,6 +190,89 @@ fn closed_shadow_target_is_typed_not_not_found() {
         );
     }
 
+    // --- 1b. a selector that names the HOST ancestor is still shadow_closed ---
+    // `#host` lives in the light DOM and is invisible from inside the closed
+    // root, so no selector engine can match `#host #inner`: the whole selector
+    // handed to the root is a guaranteed miss. The target still exists, so the
+    // answer is `shadow_closed`, never `not_found`.
+    //
+    // `#host > #direct` is the same boundary with a `>`: `#direct` IS a direct
+    // child of the root, so it would match in the flattened tree.
+    // `#\68 ost #inner` is `#host #inner` written with a CSS hex escape: the
+    // space terminates the escape and is not a descendant combinator.
+    for (tool, args, label) in [
+        (
+            "click",
+            json!({"element": "#host #inner"}),
+            "#host #inner (click)",
+        ),
+        (
+            "layout",
+            json!({"selector": "#host > #direct"}),
+            "#host > #direct (layout)",
+        ),
+        (
+            "click",
+            json!({"element": "#\\68 ost #inner"}),
+            "#\\68 ost #inner (click)",
+        ),
+        (
+            "layout",
+            json!({"selector": "#host #inner"}),
+            "#host #inner (layout)",
+        ),
+    ] {
+        let r = c.call(tool, args);
+        assert_eq!(
+            code_of(&r),
+            "shadow_closed",
+            "{label} names the host ancestor of a closed-root target: {r}"
+        );
+        assert_eq!(reason_of(&r), "unreachable", "{label}: {r}");
+        let prose = content_text(&r);
+        assert!(
+            prose.contains("closed shadow root") && prose.contains("@eN"),
+            "{label}: the prose names the closed root and the @eN lever: {prose}"
+        );
+    }
+
+    // --- 1c. the FULL selector inside the closed root is a match, not a miss ---
+    // `#container #inner` and `#first + #inner` live entirely inside the closed
+    // root, so the DOM domain resolves the whole selector there - a tail-only
+    // probe cannot see them, and reporting `not_found` would be the same lie.
+    for (tool, args, label) in [
+        (
+            "click",
+            json!({"element": "#container #inner"}),
+            "#container #inner (click)",
+        ),
+        (
+            "click",
+            json!({"element": "#first + #inner"}),
+            "#first + #inner (click)",
+        ),
+    ] {
+        let r = c.call(tool, args);
+        assert_eq!(
+            code_of(&r),
+            "shadow_closed",
+            "{label} resolves inside the closed root, so it is not a miss: {r}"
+        );
+        assert_eq!(reason_of(&r), "unreachable", "{label}: {r}");
+    }
+
+    // --- 1d. a `>` that crosses a WRAPPER names nothing: the ordinary miss ---
+    // `#inner` is not a direct child of the root, so `#host > #inner` would not
+    // match even in the flattened tree. Claiming `shadow_closed` here would be
+    // a false positive: the selector genuinely matches nothing.
+    let not_child = c.call("click", json!({"element": "#host > #inner"}));
+    assert_eq!(
+        code_of(&not_child),
+        "invalid_target",
+        "#host > #inner crosses a wrapper, so it matches nothing: {not_child}"
+    );
+    assert_eq!(reason_of(&not_child), "not_found", "{not_child}");
+
     // --- 2. a genuine miss is still not_found (the probe is precise) ---
     let missing = c.call("click", json!({"element": "#definitely-not-here"}));
     assert_eq!(
@@ -198,6 +281,17 @@ fn closed_shadow_target_is_typed_not_not_found() {
         "a selector that matches nothing anywhere is still not_found: {missing}"
     );
     assert_eq!(reason_of(&missing), "not_found", "{missing}");
+
+    // The element exists inside the closed root, but the selector's leading
+    // part matches no ancestor of the host: this path crosses nothing, so the
+    // honest answer stays the ordinary miss (no false `shadow_closed`).
+    let wrong_path = c.call("click", json!({"element": "#no-such-host #inner"}));
+    assert_eq!(
+        code_of(&wrong_path),
+        "invalid_target",
+        "a wrong ancestor path is still not_found, not shadow_closed: {wrong_path}"
+    );
+    assert_eq!(reason_of(&wrong_path), "not_found", "{wrong_path}");
 
     // --- 3. the AX `@eN` ref is the supported path ---
     let snap = c.call("snapshot", json!({}));

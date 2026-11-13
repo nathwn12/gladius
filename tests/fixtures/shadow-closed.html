@@ -14,7 +14,17 @@
   // accessibility tree (and therefore an AX `@eN` ref) still does.
   var host = document.getElementById('host');
   var root = host.attachShadow({ mode: 'closed' });
-  root.innerHTML = '<button id="inner" style="width:120px;height:40px">CLOSED_INNER_OK</button>';
+  // `#inner` sits under a wrapper, so a `>` at the boundary names nothing:
+  // `#host > #inner` must stay the ordinary miss, while `#container #inner`
+  // and `#first + #inner` live entirely inside the root and only the
+  // full-selector probe can see them. `#direct` IS a direct child of the root,
+  // so `#host > #direct` is a real (unreachable) target.
+  root.innerHTML =
+    '<div id="container">' +
+      '<button id="first" style="width:120px;height:40px">FIRST_IN_CLOSED</button>' +
+      '<button id="inner" style="width:120px;height:40px">CLOSED_INNER_OK</button>' +
+    '</div>' +
+    '<button id="direct" style="width:120px;height:40px">DIRECT_IN_CLOSED</button>';
   root.getElementById('inner').addEventListener('click', function () {
     window.__closedClicks = (window.__closedClicks || 0) + 1;
   });
