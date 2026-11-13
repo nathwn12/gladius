@@ -18,6 +18,13 @@ fn markdown_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
+            // The frozen spec bundle is evidence, not product documentation:
+            // SPEC.md and the audit reports quote the unscoped claim as the
+            // defect under attack, and their hashes are recorded in FREEZE.md,
+            // so they cannot be reworded. Only the shipped docs are checked.
+            if p.ends_with(Path::new("docs/specs")) {
+                continue;
+            }
             markdown_files(&p, out);
         } else if p.extension().and_then(|x| x.to_str()) == Some("md") {
             out.push(p);
