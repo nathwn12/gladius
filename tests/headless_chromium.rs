@@ -3,7 +3,7 @@
 //! from the versioned cache with no env override) and proves one property of
 //! the launch contract. Each test owns its server process(es) and reaps them.
 //!
-//! - `headless_owned_e2e_navigate_snapshot_screenshot`: initialize lists 21
+//! - `headless_owned_e2e_navigate_snapshot_screenshot`: initialize lists 25
 //!   tools; navigate a local file; snapshot returns a non-empty tree with the
 //!   marker; screenshot returns PNG bytes (base64 PNG signature,
 //!   non-trivial size); the UA reads `HeadlessChrome/` (the shell artifact).
