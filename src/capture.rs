@@ -49,14 +49,146 @@ const SETTLE_CAP: std::time::Duration = std::time::Duration::from_secs(5);
 /// Temporary freeze style. Injected with a stable id so removal is exact.
 const STYLE_ID: &str = "__gladius_deterministic";
 
-fn style_js() -> String {
+/// The freeze walk (S1.5): the stylesheet alone only reaches the main
+/// document, so a WAAPI animation, an SVG SMIL timeline, a playing video, an
+/// open shadow root or a same-process iframe kept moving. This pass visits
+/// every realm it can reach, injects the stylesheet there, pauses WAAPI
+/// animations, SMIL timelines and media playback, and records one restore
+/// closure per mutation so the undo is exact.
+///
+/// What it cannot reach is recorded, never silent: a cross-origin frame throws
+/// on `contentDocument` and lands in `skipped`. A CLOSED shadow root is not
+/// reachable from the page realm at all (`el.shadowRoot` is null for it), so
+/// it cannot be enumerated here; naming it is S2.5's job, where the CDP DOM
+/// tree is the ground truth.
+fn freeze_js() -> String {
     format!(
-        "(() => {{ const id = '{STYLE_ID}'; let el = document.getElementById(id); \
-         if (!el) {{ el = document.createElement('style'); el.id = id; \
-         (document.head || document.documentElement).appendChild(el); }} \
-         el.textContent = '{CSS}'; \
-         return true; }})()"
+        r#"(() => {{
+  const STYLE_ID = '{STYLE_ID}';
+  const CSS = '{CSS}';
+  const state = {{restore: [], skipped: [], shadowRoots: 0, frames: 0,
+                 waapiPaused: 0, smilPaused: 0, mediaPaused: 0}};
+  const seenAnims = new Set();
+  const applyStyle = (root, doc) => {{
+    try {{
+      let el = root.querySelector ? root.querySelector('#' + STYLE_ID) : null;
+      if (!el) {{
+        el = doc.createElement('style');
+        el.id = STYLE_ID;
+        const target = root.nodeType === 9 ? (doc.head || doc.documentElement) : root;
+        if (!target) return;
+        target.appendChild(el);
+      }}
+      el.textContent = CSS;
+      state.restore.push(() => {{ try {{ el.remove(); }} catch (e) {{}} }});
+    }} catch (e) {{}}
+  }};
+  const pauseAnims = (root) => {{
+    let anims = [];
+    try {{ anims = root.getAnimations ? root.getAnimations() : []; }} catch (e) {{ return; }}
+    for (const a of anims) {{
+      if (seenAnims.has(a)) continue;
+      seenAnims.add(a);
+      try {{
+        const was = a.playState;
+        const at = a.currentTime;
+        a.pause();
+        // Pausing alone freezes the animation at whatever frame the wall clock
+        // had reached, which differs between two captures. Pinning the hold to
+        // the animation's start is what makes the frozen state reproducible -
+        // the same reason the stylesheet uses animation:none rather than
+        // animation-play-state:paused.
+        try {{ a.currentTime = 0; }} catch (e) {{}}
+        state.waapiPaused++;
+        state.restore.push(() => {{
+          try {{
+            if (at !== null && at !== undefined) a.currentTime = at;
+            if (was === 'running') a.play();
+          }} catch (e) {{}}
+        }});
+      }} catch (e) {{}}
+    }}
+  }};
+  const visit = (root, doc) => {{
+    applyStyle(root, doc);
+    pauseAnims(root);
+    let svgs = [], media = [], hosts = [], frameEls = [];
+    try {{
+      svgs = Array.prototype.slice.call(root.querySelectorAll('svg'));
+      media = Array.prototype.slice.call(root.querySelectorAll('video,audio'));
+      hosts = Array.prototype.slice.call(root.querySelectorAll('*')).filter((el) => el.shadowRoot);
+      frameEls = Array.prototype.slice.call(root.querySelectorAll('iframe'));
+    }} catch (e) {{}}
+    for (const svg of svgs) {{
+      try {{
+        svg.pauseAnimations();
+        // Same reason as WAAPI: a paused SMIL timeline holds a wall-clock
+        // frame. Rewinding it to 0 is the reproducible hold.
+        try {{ svg.setCurrentTime(0); }} catch (e) {{}}
+        state.smilPaused++;
+        state.restore.push(() => {{ try {{ svg.unpauseAnimations(); }} catch (e) {{}} }});
+      }} catch (e) {{}}
+    }}
+    for (const m of media) {{
+      try {{
+        const wasPaused = m.paused;
+        const t = m.currentTime;
+        m.pause();
+        // Pin the displayed frame to the start for the same reason: a paused
+        // element at a wall-clock position is not reproducible.
+        try {{ m.currentTime = 0; }} catch (e) {{}}
+        state.mediaPaused++;
+        state.restore.push(() => {{
+          try {{
+            m.currentTime = t;
+            if (!wasPaused) {{
+              const p = m.play();
+              if (p && p.catch) p.catch(() => {{}});
+            }}
+          }} catch (e) {{}}
+        }});
+      }} catch (e) {{}}
+    }}
+    for (const el of hosts) {{
+      state.shadowRoots++;
+      visit(el.shadowRoot, el.shadowRoot.ownerDocument || doc);
+    }}
+    for (const f of frameEls) {{
+      let d = null;
+      try {{ d = f.contentDocument; }} catch (e) {{ d = null; }}
+      if (!d) {{
+        if (state.skipped.indexOf('cross-origin-iframe') < 0) state.skipped.push('cross-origin-iframe');
+        continue;
+      }}
+      state.frames++;
+      visit(d, d);
+    }}
+  }};
+  visit(document, document);
+  window.__gladiusFreeze = state;
+  return {{waapiPaused: state.waapiPaused, smilPaused: state.smilPaused,
+           mediaPaused: state.mediaPaused, shadowRoots: state.shadowRoots,
+           frames: state.frames, skipped: state.skipped}};
+}})()"#
     )
+}
+
+/// Undo the freeze walk in reverse order, from the state the apply pass left on
+/// the window. Every closure is guarded: a frame that navigated away must not
+/// abort the rest of the restore.
+fn freeze_restore_js() -> String {
+    r#"(() => {
+  const st = window.__gladiusFreeze;
+  let restored = 0;
+  if (st && Array.isArray(st.restore)) {
+    for (let i = st.restore.length - 1; i >= 0; i--) {
+      try { st.restore[i](); restored++; } catch (e) {}
+    }
+  }
+  window.__gladiusFreeze = null;
+  return restored;
+})()"#
+        .to_string()
 }
 
 fn style_restore_js() -> String {
@@ -151,6 +283,9 @@ pub struct Capture {
     /// The closed set of waits that lost: `fonts`, `images`, `raf`, `settleCap`
     /// (and, after S1.5, `waapi`, `smil`, `media`).
     pub settle_timeouts: Vec<String>,
+    /// What the freeze walk actually reached: `{waapiPaused, smilPaused,
+    /// mediaPaused, shadowRoots, frames, skipped[]}`. Deterministic only.
+    pub freeze: Value,
 }
 
 impl Capture {
@@ -180,6 +315,7 @@ impl Capture {
             // would make "stable" and "gave up waiting" look identical.
             m.insert("settled".to_string(), json!(self.settled));
             m.insert("settleTimeouts".to_string(), json!(self.settle_timeouts));
+            m.insert("freeze".to_string(), self.freeze.clone());
         }
         Value::Object(m)
     }
@@ -376,6 +512,7 @@ fn decode(r: &Value, deterministic: bool) -> Result<Capture, String> {
         reduced_motion_emulated: false,
         settled: true,
         settle_timeouts: Vec::new(),
+        freeze: Value::Null,
     })
 }
 
@@ -495,9 +632,22 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
             )),
         }
     }
-    if let Err(e) = browser.eval(&style_js()).await {
-        warn(&format!("deterministic capture: freeze style failed: {e}"));
-    }
+    // The walk: same stylesheet in every reachable realm, plus WAAPI, SMIL and
+    // media paused, applied BEFORE settling so the settle waits and the shot
+    // both see a frozen page. The counts are what the reply reports; a realm
+    // the walk could not reach is recorded in `skipped`.
+    let freeze = match browser.eval(&freeze_js()).await {
+        Ok(v) => {
+            if v.is_null() {
+                warn("deterministic capture: the freeze walk returned no state");
+            }
+            v
+        }
+        Err(e) => {
+            warn(&format!("deterministic capture: freeze walk failed: {e}"));
+            Value::Null
+        }
+    };
     // Test-only: widen the mutation window so a cancellation test can land
     // inside it deterministically.
     maybe_test_delay().await;
@@ -534,9 +684,15 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
         .command("Page.captureScreenshot", plain_params(opts.full_page), true)
         .await;
 
-    // Restore on every path, capture success or not: drop the freeze style,
-    // clear the media emulation, then replay the prior metrics override (or
-    // clear it when there was none). Each failure is logged, never swallowed.
+    // Restore on every path, capture success or not: undo the freeze walk in
+    // reverse (styles, WAAPI, SMIL, media), clear the media emulation, then
+    // replay the prior metrics override (or clear it when there was none).
+    // Each failure is logged, never swallowed.
+    if let Err(e) = browser.eval(&freeze_restore_js()).await {
+        warn(&format!(
+            "deterministic capture: could not undo the freeze walk: {e}"
+        ));
+    }
     if let Err(e) = browser.eval(&style_restore_js()).await {
         warn(&format!(
             "deterministic capture: could not remove the freeze stylesheet: {e}"
@@ -597,6 +753,7 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
     cap.reduced_motion_emulated = media_emulated;
     cap.settled = settle_timeouts.is_empty();
     cap.settle_timeouts = settle_timeouts;
+    cap.freeze = freeze;
     let arr = live.as_array().cloned().unwrap_or_default();
     let num = |i: usize| arr.get(i).and_then(|v| v.as_f64());
     cap.width = num(0).map(|v| v as i64).unwrap_or(width);
