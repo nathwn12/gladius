@@ -236,8 +236,6 @@ fn compare_separates_identity_from_tolerance() {
     shutdown(c);
 }
 
-// --------------------------------------------------------------------- S1.2
-
 /// SPEC.md S1.2: AA suppression is an opt-in, not the default.
 ///
 /// The fixture is the one `tests/review_findings.rs:353-440` proved produces
@@ -304,6 +302,101 @@ fn aa_suppression_is_opt_in() {
         flag(&loose, "pixelsIdentical"),
         Some(false),
         "and identity is still reported honestly: {loose}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    shutdown(c);
+}
+
+// --------------------------------------------------------------------- S1.3
+
+/// SPEC.md S1.3: a mask is metered, not an invisible hole.
+///
+/// One rect covering 15 % of an 800x600 capture must be counted (union, not
+/// sum), echoed back clipped and rounded, and announced as a warning that a
+/// regression inside it would be invisible. A rect that is degenerate after
+/// clipping is dropped and named instead of silently masking nothing.
+#[test]
+fn mask_coverage_is_reported_and_warns() {
+    let dir = scratch("mask");
+    let vdir = dir.join("visual");
+    std::fs::create_dir_all(&vdir).expect("visual dir");
+    let vdir_s = vdir.to_string_lossy().to_string();
+    let mut c = Client::spawn_with_env(&[("GLADIUS_VISUAL_DIR", &vdir_s)]);
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+
+    let page = dir.join("mask.html");
+    std::fs::write(
+        &page,
+        "<!doctype html><html><head><style>html,body{margin:0;padding:0;background:#fff}\
+         #box{position:absolute;left:0;top:0;width:800px;height:90px;background:#eee}\
+         </style></head><body><div id=\"box\"></div></body></html>",
+    )
+    .expect("write mask fixture");
+    goto(&mut c, &page, 800, 600);
+    c.call_ok("visual", json!({"action": "save", "name": "masked"}));
+
+    // 800 x 90 = 72,000 px = 15 % of 800 x 600.
+    let rect = json!({"x": 0, "y": 0, "w": 800, "h": 90});
+    let cmp = c.call_ok(
+        "visual",
+        json!({"action": "compare", "name": "masked", "maskRects": [rect]}),
+    );
+    let masked = num(&cmp, "maskedPixels").unwrap_or(-1);
+    assert!(
+        (masked - 72000).abs() <= 1,
+        "the masked area is counted, not assumed: {masked} (reply {cmp})"
+    );
+    let coverage = cmp
+        .get("maskCoverageRatio")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(-1.0);
+    assert!(
+        (coverage - 0.15).abs() <= 0.005,
+        "maskCoverageRatio is maskedPixels/totalPixels: {coverage} (reply {cmp})"
+    );
+    let applied = cmp
+        .get("maskRectsApplied")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        applied.len(),
+        1,
+        "the applied rect list echoes what was actually used: {cmp}"
+    );
+    assert_eq!(
+        applied[0], rect,
+        "an in-bounds integer rect is applied unchanged: {cmp}"
+    );
+    let warning = cmp.get("warning").and_then(|w| w.as_str()).unwrap_or("");
+    assert!(
+        warning.contains("mask_coverage"),
+        "a 15 % mask is over the 10 % line and must say so: {cmp}"
+    );
+
+    // A rect that clips away to nothing is dropped and named, never silently
+    // treated as a mask that covered something.
+    let degenerate = c.call_ok(
+        "visual",
+        json!({"action": "compare", "name": "masked",
+               "maskRects": [{"x": 900, "y": 0, "w": 50, "h": 50}]}),
+    );
+    assert_eq!(
+        degenerate
+            .get("maskRectsApplied")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len()),
+        Some(0),
+        "an out-of-bounds rect clips to nothing and is not applied: {degenerate}"
+    );
+    let dwarning = degenerate
+        .get("warning")
+        .and_then(|w| w.as_str())
+        .unwrap_or("");
+    assert!(
+        dwarning.contains("mask_rect_dropped"),
+        "a dropped rect is named in the warning: {degenerate}"
     );
 
     std::fs::remove_dir_all(&dir).ok();

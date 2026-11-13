@@ -519,6 +519,12 @@ pub struct PixelDiff {
     pub size_mismatch: bool,
     pub ignored_pixels: i64,
     pub ignored_clusters: i64,
+    /// Pixels covered by at least one applied mask rect (union, not sum).
+    pub masked_pixels: i64,
+    /// The rects actually used, after clipping to the image and rounding.
+    pub mask_rects_applied: Vec<Value>,
+    /// Requested rects that clipped away to nothing and were not applied.
+    pub mask_rects_dropped: i64,
     /// True when the engine accepted `Target.createTarget {background:true}`.
     pub scratch_background: bool,
 }
@@ -625,14 +631,33 @@ function load(src) {{
     }}
 
     const thr = Math.max(0, Math.min(1, OPT.threshold || 0)) * 255;
-    const rects = OPT.maskRects || [];
-    function masked(x, y) {{
-      for (let k = 0; k < rects.length; k++) {{
-        const m = rects[k];
-        if (x >= m.x && x < m.x + m.w && y >= m.y && y < m.y + m.h) return true;
+    // Mask accounting (S1.3): every requested rect is clipped to the image
+    // bounds and rounded to whole device pixels; a rect that is degenerate
+    // after clipping is dropped and counted, never silently treated as a mask.
+    // The covered pixels are a UNION: overlapping rects are not double counted.
+    const applied = [];
+    let dropped = 0;
+    const maskedPx = new Uint8Array(n);
+    const requested = OPT.maskRects || [];
+    for (let k = 0; k < requested.length; k++) {{
+      const m = requested[k] || {{}};
+      const mx = Number(m.x) || 0, my = Number(m.y) || 0;
+      const mw = Number(m.w) || 0, mh = Number(m.h) || 0;
+      let x0 = Math.round(mx), y0 = Math.round(my);
+      let x1 = Math.round(mx + mw), y1 = Math.round(my + mh);
+      if (x0 < 0) x0 = 0;
+      if (y0 < 0) y0 = 0;
+      if (x1 > w) x1 = w;
+      if (y1 > h) y1 = h;
+      if (x1 <= x0 || y1 <= y0) {{ dropped++; continue; }}
+      applied.push({{x: x0, y: y0, w: x1 - x0, h: y1 - y0}});
+      for (let y = y0; y < y1; y++) {{
+        const row = y * w;
+        for (let x = x0; x < x1; x++) maskedPx[row + x] = 1;
       }}
-      return false;
     }}
+    let maskedCount = 0;
+    for (let p = 0; p < n; p++) if (maskedPx[p]) maskedCount++;
 
     // 1. Candidates: channel delta above threshold, outside every mask rect.
     const mask = new Uint8Array(n);
@@ -646,7 +671,7 @@ function load(src) {{
           if (dd > d) d = dd;
         }}
         delta[p] = d;
-        if (d > thr && !masked(x, y)) mask[p] = 1;
+        if (d > thr && !maskedPx[p]) mask[p] = 1;
       }}
     }}
 
@@ -735,6 +760,7 @@ function load(src) {{
       sizeMismatch: false, w: w, h: h,
       diffPixels: diff, totalPixels: n,
       ignoredPixels: ignored, ignoredClusters: ignoredClusters,
+      maskedPixels: maskedCount, maskRectsApplied: applied, maskRectsDropped: dropped,
       maxChannelDelta: maxDelta,
       bbox: diff > 0 ? {{x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1}} : null,
       diffPng: diffPng
@@ -926,6 +952,9 @@ pub async fn png_diff(
             size_mismatch: true,
             ignored_pixels: 0,
             ignored_clusters: 0,
+            masked_pixels: 0,
+            mask_rects_applied: Vec::new(),
+            mask_rects_dropped: 0,
             scratch_background: true,
         });
     }
@@ -944,6 +973,13 @@ pub async fn png_diff(
         size_mismatch: false,
         ignored_pixels: num("ignoredPixels"),
         ignored_clusters: num("ignoredClusters"),
+        masked_pixels: num("maskedPixels"),
+        mask_rects_applied: v
+            .get("maskRectsApplied")
+            .and_then(|a| a.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        mask_rects_dropped: num("maskRectsDropped"),
         scratch_background: true,
     })
 }
@@ -1057,42 +1093,71 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
     // Environment check: a mismatch (or an unknown baseline environment) is a
     // WARNING by default - the pixels still decide - and a failure only when
     // the caller requires a match.
-    let (env_known, env_match, warning) = match meta_state.recorded() {
+    let (env_known, env_match, mut notes) = match meta_state.recorded() {
         Some(b) => {
             let diffs = b.differences(&current_env);
             if diffs.is_empty() {
-                (true, true, Value::Null)
+                (true, true, Vec::new())
             } else {
                 (
                     true,
                     false,
-                    json!(format!(
+                    vec![format!(
                         "baseline_environment_mismatch: {} (the baseline was recorded in a \
                          different environment; re-save it with update:true after confirming \
                          the change is expected)",
                         diffs.join("; ")
-                    )),
+                    )],
                 )
             }
         }
         None => (
             false,
             false,
-            json!(format!(
+            vec![format!(
                 "baseline_environment_unknown: {} (the baseline carries no usable environment \
                  record, so a match cannot be established; re-save it with update:true)",
                 meta_state.detail()
-            )),
+            )],
         ),
     };
-    let mut warning = warning;
     if let Some(aa) = aa_warning(diff.ignored_pixels, diff.ignored_clusters) {
-        warning = match warning {
-            Value::Null => json!(aa),
-            Value::String(s) => json!(format!("{s}; {aa}")),
-            other => other,
-        };
+        notes.push(aa);
     }
+    // Mask accounting: a mask is a legitimate tool, an unmetered one is not.
+    // None of these is a failure - the counts are true either way - but the
+    // reply never lets a masked regression pass as an unexplained silence.
+    if diff.mask_rects_dropped > 0 {
+        notes.push(format!(
+            "mask_rect_dropped: {} requested mask rect(s) were degenerate after clipping to \
+             the image and were not applied",
+            diff.mask_rects_dropped
+        ));
+    }
+    let mask_coverage = if diff.total_pixels > 0 {
+        diff.masked_pixels as f64 / diff.total_pixels as f64
+    } else {
+        0.0
+    };
+    if mask_coverage > 0.10 {
+        notes.push(format!(
+            "mask_coverage: {:.1}% of the diff area was masked; a regression inside a mask \
+             is invisible",
+            mask_coverage * 100.0
+        ));
+    }
+    if !opts.mask_rects.is_empty() && (cap.dsf - 1.0).abs() > 0.001 {
+        notes.push(format!(
+            "mask_scale_mismatch: deviceScaleFactor {} - mask rects are device pixels of the \
+             captured PNG, so they do not line up with CSS pixels",
+            cap.dsf
+        ));
+    }
+    let warning = if notes.is_empty() {
+        Value::Null
+    } else {
+        json!(notes.join("; "))
+    };
     let pixel_pass = aa_tolerated(diff.ignored_pixels, opts.allow_ignored_aa)
         && !diff.size_mismatch
         && diff.diff_pixels <= opts.max_diff_pixels
@@ -1123,6 +1188,9 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
         "minDiffCluster": opts.min_diff_cluster,
         "ignoredPixels": diff.ignored_pixels,
         "ignoredClusters": diff.ignored_clusters,
+        "maskedPixels": diff.masked_pixels,
+        "maskCoverageRatio": mask_coverage,
+        "maskRectsApplied": diff.mask_rects_applied,
         "sizeMismatch": diff.size_mismatch,
         "size": {"width": diff.width, "height": diff.height},
         "baselineChecksum": baseline_checksum,
