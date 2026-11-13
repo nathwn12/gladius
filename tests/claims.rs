@@ -133,7 +133,24 @@ fn tools_list() -> Vec<String> {
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
     );
     drop(stdin);
-    let _ = child.wait();
+    // Bounded: a wedged server must not hang the suite. The same 10 s budget
+    // the other suites use for a clean EOF exit.
+    let mut exited = false;
+    for _ in 0..100 {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                assert!(status.success(), "server exit status: {status}");
+                exited = true;
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(e) => panic!("try_wait: {e}"),
+        }
+    }
+    if !exited {
+        child.kill().ok();
+        panic!("server did not exit after stdin EOF");
+    }
     let tools = list
         .pointer("/result/tools")
         .and_then(|t| t.as_array())
