@@ -126,8 +126,14 @@ struct Shared {
     /// Reader-liveness flag: set when the WS reader loop exits (the engine
     /// connection is gone). `ensure_session` fails fast on it instead of
     /// sending into a dead socket; the cached session/target are cleared at
-    /// the same time so nothing reuses them.
+    /// the same time so nothing reuses them. `Browser::shared` reads it to
+    /// relaunch an owned engine once (S2.1).
     dead: AtomicBool,
+    /// Does this connection own its engine? True only for the owned
+    /// Chromium launch; an engine attached with `GLADIUS_CDP_URL` is never
+    /// gladius's to restart, so a transport death there says so instead of
+    /// relaunching (S2.1).
+    owned: AtomicBool,
     /// Latest auto-handled dialog (drained by each acting tool before it
     /// runs, so a record found afterwards belongs to that action).
     dialog: AsyncMutex<Option<DialogRecord>>,
@@ -309,6 +315,7 @@ fn new_shared(sink: WsSink) -> Arc<Shared> {
         session: AsyncMutex::new(None),
         target: AsyncMutex::new(None),
         dead: AtomicBool::new(false),
+        owned: AtomicBool::new(false),
         dialog: AsyncMutex::new(None),
         load_notify: tokio::sync::Notify::new(),
         tab_order: AsyncMutex::new(Vec::new()),
@@ -423,6 +430,13 @@ pub struct SnapshotCache {
 pub struct Browser {
     state: AsyncMutex<Option<Inner>>,
     pid: Mutex<Option<u32>>,
+    /// Serialises launches and recoveries: exactly one task may build an
+    /// engine, so two calls racing a dead engine cannot launch two browsers.
+    launch_lock: AsyncMutex<()>,
+    /// One automatic relaunch per death (S2.1). Set when a dead owned engine
+    /// is about to be relaunched, cleared only by a successful launch, so a
+    /// browser that dies again immediately cannot be relaunched in a loop.
+    respawn_used: AtomicBool,
     refs: AsyncMutex<HashMap<String, RefEntry>>,
     snap_url: AsyncMutex<String>,
     ref_seq: std::sync::atomic::AtomicUsize,
@@ -436,6 +450,8 @@ impl Browser {
         Browser {
             state: AsyncMutex::new(None),
             pid: Mutex::new(None),
+            launch_lock: AsyncMutex::new(()),
+            respawn_used: AtomicBool::new(false),
             refs: AsyncMutex::new(HashMap::new()),
             snap_url: AsyncMutex::new(String::new()),
             ref_seq: AtomicUsize::new(0),
@@ -534,14 +550,85 @@ impl Browser {
         v
     }
 
+    /// The live connection, launching or relaunching as needed.
+    ///
+    /// Recovery (S2.1): a transport-dead engine is not terminal. The OWNED
+    /// engine is relaunched once, lazily, inside the call that finds it dead —
+    /// the same `launch()` path a cold start uses. A successful relaunch is
+    /// never a silent retry: `shared()` only hands out the fresh connection,
+    /// and the caller's own command is dispatched once against it (a command
+    /// already in flight failed typed and is not resent). A failed relaunch is
+    /// a typed `engine_dead`/`respawn_failed` whose prose names `close`. An
+    /// ATTACHED engine (`GLADIUS_CDP_URL`) is never relaunched: it is not
+    /// gladius's to restart, so the answer is `engine_dead`/`transport`.
     async fn shared(&self) -> Result<Arc<Shared>, String> {
+        // Fast path: a live engine.
         {
             let guard = self.state.lock().await;
             if let Some(inner) = guard.as_ref() {
-                return Ok(inner.shared.clone());
+                if !inner.shared.dead.load(Ordering::SeqCst) {
+                    return Ok(inner.shared.clone());
+                }
             }
         }
-        let inner = launch().await?;
+        // One builder at a time: a task arriving while another recovers waits
+        // for that launch instead of starting a second browser.
+        let _launch = self.launch_lock.lock().await;
+        {
+            let guard = self.state.lock().await;
+            if let Some(inner) = guard.as_ref() {
+                if !inner.shared.dead.load(Ordering::SeqCst) {
+                    return Ok(inner.shared.clone());
+                }
+            }
+        }
+        let corpse_owned = {
+            let guard = self.state.lock().await;
+            guard
+                .as_ref()
+                .map(|inner| matches!(&inner.engine, Engine::Owned { .. }))
+        };
+        if let Some(owned) = corpse_owned {
+            // Reap the corpse exactly as `close` does (bounded), so its tree,
+            // job cover and private profile never outlive the relaunch.
+            let _ = self.close().await;
+            if !owned {
+                return Err(crate::tools::typed_marker(
+                    "engine_dead",
+                    "transport",
+                    "the engine attached with GLADIUS_CDP_URL closed the connection; it is not \
+                     gladius's to restart - start it again, call `close` to drop the stale \
+                     connection, then retry",
+                ));
+            }
+            if self.respawn_used.swap(true, Ordering::SeqCst) {
+                return Err(crate::tools::typed_marker(
+                    "engine_dead",
+                    "respawn_failed",
+                    "the owned browser died again before it came back; call `close` and retry \
+                     (the next call launches a fresh engine)",
+                ));
+            }
+        }
+        let inner = match launch().await {
+            Ok(inner) => inner,
+            Err(e) => {
+                if corpse_owned.is_some() {
+                    return Err(crate::tools::typed_marker(
+                        "engine_dead",
+                        "respawn_failed",
+                        &format!(
+                            "the owned browser did not come back ({e}); call `close` and retry \
+                             (the next call launches a fresh engine)"
+                        ),
+                    ));
+                }
+                return Err(e);
+            }
+        };
+        // Cleared only by a successful launch: the next death gets its own
+        // single automatic attempt.
+        self.respawn_used.store(false, Ordering::SeqCst);
         let shared = inner.shared.clone();
         let owned_pid: Option<u32> = match &inner.engine {
             Engine::Owned { pid, .. } => Some(*pid),
@@ -2209,6 +2296,24 @@ async fn send_raw(
     send_raw_with_timeout(shared, method, params, session, Duration::from_secs(30)).await
 }
 
+/// Transport death, typed at the error site: `engine_dead` with reason
+/// `transport` (SPEC §4.1). The prose names the recovery and differs by
+/// ownership: the next call relaunches an owned engine, while an engine
+/// attached with `GLADIUS_CDP_URL` is the caller's to restart. Marked with
+/// `tools::typed_marker` because this crosses the `Result<_, String>`
+/// boundary; `ToolErr` turns it into `code:"engine_dead"` without re-reading
+/// the prose.
+fn engine_dead_transport(shared: &Arc<Shared>, what: &str) -> String {
+    let next = if shared.owned.load(Ordering::SeqCst) {
+        "the next call relaunches the owned engine once (and answers \
+         engine_dead/respawn_failed if it does not come back)"
+    } else {
+        "the engine attached with GLADIUS_CDP_URL is not gladius's to restart: start it again, \
+         call `close` to drop the stale connection, then retry"
+    };
+    crate::tools::typed_marker("engine_dead", "transport", &format!("{what}; {next}"))
+}
+
 /// `send_raw` with an injectable response timeout (production passes 30s;
 /// tests pass a short budget against the black-hole rig).
 async fn send_raw_with_timeout(
@@ -2238,7 +2343,10 @@ async fn send_raw_with_timeout(
     {
         let mut sink = shared.sink.lock().await;
         if let Err(e) = sink.send(Message::Text(text.into())).await {
-            return Err(format!("ws send: {e}"));
+            // The socket is gone: this engine is dead, so the NEXT call takes
+            // the recovery path instead of sending into the same corpse.
+            shared.dead.store(true, Ordering::SeqCst);
+            return Err(engine_dead_transport(shared, &format!("ws send: {e}")));
         }
     }
     match tokio::time::timeout(timeout, rx).await {
@@ -2248,10 +2356,20 @@ async fn send_raw_with_timeout(
             }
             Ok(resp.get("result").cloned().unwrap_or(Value::Null))
         }
-        Ok(Err(_)) => Err("cdp: response channel closed".to_string()),
+        // The sender was dropped: the reader drained the pending map on exit
+        // (or the connection closed), so the engine is gone.
+        Ok(Err(_)) => {
+            shared.dead.store(true, Ordering::SeqCst);
+            Err(engine_dead_transport(
+                shared,
+                "cdp: response channel closed",
+            ))
+        }
         // Timeout path: the entry is removed by `_guard`'s drop, so one
         // unanswered call never leaves a `tx` behind (a late response is the
-        // only other exit, and a dead peer never sends one).
+        // only other exit, and a dead peer never sends one). A timeout is not
+        // proof of death - a wedged renderer answers nothing either - so the
+        // dead flag is left alone and the per-call budget owns this case.
         Err(_) => Err("cdp: response timeout".to_string()),
     }
 }
@@ -2318,8 +2436,13 @@ async fn send_session(
 async fn ensure_session(shared: &Arc<Shared>) -> Result<String, String> {
     // A dead reader means a dead socket: fail fast instead of sending into
     // it (the cached session/target were cleared when the reader exited).
+    // Typed at the site (S2.1): transport death is `engine_dead`/`transport`,
+    // never the generic `error`, and the prose names the recovery.
     if shared.dead.load(Ordering::SeqCst) {
-        return Err("cdp: engine connection closed (reader exited)".to_string());
+        return Err(engine_dead_transport(
+            shared,
+            "cdp: engine connection closed (reader exited)",
+        ));
     }
     if let Some(s) = shared.session.lock().await.clone() {
         return Ok(s);
@@ -3117,9 +3240,15 @@ async fn reader_loop(mut stream: WsReader, shared: Arc<Shared>) {
     // The stream ended (the engine went away or the socket dropped): mark
     // the engine dead and clear the cached session/target (+ realm cache)
     // so no later call reuses the corpse. `ensure_session` fails fast on
-    // the flag; `close()` still reaps/aborts as before. The RAII
-    // pending-map guard is untouched (late responses still route to no one).
+    // the flag; `close()` still reaps/aborts as before, and `shared()`
+    // relaunches an owned engine once (S2.1). In-flight calls are failed
+    // here instead of being left to their own timeouts.
     shared.dead.store(true, Ordering::SeqCst);
+    // Fail every in-flight call NOW instead of leaving each one to its 30 s
+    // per-command timeout: dropping the senders closes each waiting channel,
+    // and `send_raw` reports that as transport death. A late response from a
+    // dead peer can never arrive, so nothing is lost by clearing the map.
+    shared.pending.lock().unwrap().clear();
     *shared.session.lock().await = None;
     *shared.target.lock().await = None;
     shared.extra_sessions.lock().await.clear();
@@ -3618,6 +3747,9 @@ async fn launch_owned_chromium_once() -> Result<Inner, String> {
     }
     let (sink, stream) = ws.split();
     let shared = new_shared(sink);
+    // This connection owns its engine: a transport death is recoverable by
+    // relaunching it (S2.1), while an attached engine never is.
+    shared.owned.store(true, Ordering::SeqCst);
     let reader = tokio::spawn(reader_loop(stream, shared.clone()));
     eprintln!("[gladius] browser ready pid={pid} (chromium)");
     let child = guard.child.take().expect("guard holds child");
@@ -4057,6 +4189,8 @@ mod tests {
         let browser = Browser {
             state: AsyncMutex::new(Some(inner)),
             pid: Mutex::new(Some(pid)),
+            launch_lock: AsyncMutex::new(()),
+            respawn_used: AtomicBool::new(false),
             refs: AsyncMutex::new(HashMap::new()),
             snap_url: AsyncMutex::new(String::new()),
             ref_seq: AtomicUsize::new(0),
@@ -4189,6 +4323,8 @@ mod tests {
         let browser = Browser {
             state: AsyncMutex::new(Some(inner)),
             pid: Mutex::new(Some(pid)),
+            launch_lock: AsyncMutex::new(()),
+            respawn_used: AtomicBool::new(false),
             refs: AsyncMutex::new(HashMap::new()),
             snap_url: AsyncMutex::new(String::new()),
             ref_seq: AtomicUsize::new(0),
@@ -5231,6 +5367,8 @@ mod tests {
         Browser {
             state: AsyncMutex::new(Some(inner)),
             pid: Mutex::new(None),
+            launch_lock: AsyncMutex::new(()),
+            respawn_used: AtomicBool::new(false),
             refs: AsyncMutex::new(HashMap::new()),
             snap_url: AsyncMutex::new(String::new()),
             ref_seq: AtomicUsize::new(0),

@@ -391,11 +391,25 @@ impl ToolErr {
     }
 }
 
+/// Marker for a typed error minted deep inside the browser/visual layers,
+/// which return `Result<_, String>`: `typed:<code>:<reason>: <prose>`.
+/// `ToolErr`'s `From<String>` reads it and mints the same
+/// `{code, reason}` a tool-site `ToolErr::typed` would, so the type is
+/// decided where the failure is known and never re-derived from prose.
+pub(crate) const TYPED_MARKER: &str = "typed:";
+
+/// Mint a marker string for [`TYPED_MARKER`].
+pub(crate) fn typed_marker(code: &str, reason: &str, prose: &str) -> String {
+    format!("{TYPED_MARKER}{code}:{reason}: {prose}")
+}
+
 /// `?` on engine calls (`browser.command` / `browser.eval` / serde): those
 /// failures carry no site-known type, so they keep the generic fallback —
-/// except the `stale session: ` prefix minted by `send_session`, which is
-/// the typed invalid-target the caller retries explicitly (the session was
-/// dropped without proof of non-execution, so no silent resend happened).
+/// except two shapes that DO carry one: the `stale session: ` prefix minted
+/// by `send_session` (the typed invalid-target the caller retries
+/// explicitly, because the session was dropped without proof of
+/// non-execution, so no silent resend happened), and the `typed:` marker
+/// minted at a deep site (`engine_dead`, the baseline cap).
 impl From<String> for ToolErr {
     fn from(prose: String) -> Self {
         if prose.starts_with("stale session: ") {
@@ -403,6 +417,16 @@ impl From<String> for ToolErr {
                 prose,
                 json!({"code": "invalid_target", "reason": "stale_session"}),
             );
+        }
+        if let Some(rest) = prose.strip_prefix(TYPED_MARKER) {
+            if let Some((code, rest)) = rest.split_once(':') {
+                if let Some((reason, msg)) = rest.split_once(':') {
+                    return Self::typed(
+                        msg.trim_start().to_string(),
+                        json!({"code": code, "reason": reason}),
+                    );
+                }
+            }
         }
         Self::fallback(prose)
     }
@@ -416,6 +440,7 @@ impl From<String> for ToolErr {
 ///   option_not_found reason no_match                         (+ tool, want)
 ///   capability_gated reason dom_only                         (+ tool)
 ///   target_changed   reason raced                             (+ tool, before, after)
+///   engine_dead      reason respawn_failed|transport          (+ tool)
 ///   timeout          reason budget_exceeded                   (+ tool)
 ///   invalid_args     reason missing_arg|bad_value|bad_index|unknown_action|unknown_tool|need_option|unknown_arg (+ tool, arg?)
 ///   error            fallback, code only (cdp/js-engine failures and anything untyped)
