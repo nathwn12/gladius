@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Gladius frozen-layout fixture</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #ffffff; }
+  /* The box the camera sees is translated 200 px to the right, for an hour:
+     a step-end animation whose keyframes never move again, so the live state
+     is stable but NOT the base box. The freeze stylesheet turns `animation`
+     off, which resets the transform and leaves the untransformed base box -
+     that difference is what proves the measurement and the capture agree. */
+  #t { position: absolute; left: 20px; top: 40px; width: 50px; height: 20px;
+       background: #1e64c8;
+       animation: slide 3600s step-end infinite; }
+  @keyframes slide {
+    from { transform: translateX(200px); }
+    to { transform: translateX(200px); }
+  }
+</style>
+</head>
+<body>
+<div id="t"></div>
+</body>
+</html>

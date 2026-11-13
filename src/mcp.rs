@@ -132,10 +132,18 @@ fn needs_exec_lock(name: &str, args: &Value) -> bool {
             .get("deterministic")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
-        "assert_layout" => args
-            .get("screenshotOnFail")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        "assert_layout" => {
+            // The freeze walk (S1.6) mutates page-visible state exactly like a
+            // deterministic capture, so a deterministic assert_layout must hold
+            // the same locks; without either flag it stays a pure read.
+            args.get("screenshotOnFail")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || args
+                    .get("deterministic")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+        }
         // `visual` writes baseline files and opens a scratch target for the
         // in-engine diff: serialise it with the mutating tools so a compare
         // cannot race another page action mid-capture.
@@ -194,10 +202,18 @@ fn needs_critical_section(name: &str, args: &Value) -> bool {
             .get("deterministic")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
-        "assert_layout" => args
-            .get("screenshotOnFail")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        "assert_layout" => {
+            // A deterministic measurement applies the freeze walk and restores
+            // it, so a cancel must wait for that section exactly as it does for
+            // a deterministic capture (S1.6).
+            args.get("screenshotOnFail")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || args
+                    .get("deterministic")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+        }
         "visual" => true,
         _ => false,
     }

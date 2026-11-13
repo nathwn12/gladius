@@ -240,6 +240,33 @@ const SETTLE_JS: &str = r#"(() => {
   })();
 })()"#;
 
+/// Apply the freeze walk to the page and return the counts it reached.
+/// `pub(crate)` because `assert_layout {deterministic:true}` must measure the
+/// same state the camera sees - one freeze implementation, not two (S1.6).
+pub(crate) async fn apply_freeze(browser: &Browser) -> Value {
+    match browser.eval(&freeze_js()).await {
+        Ok(v) => {
+            if v.is_null() {
+                warn("deterministic capture: the freeze walk returned no state");
+            }
+            v
+        }
+        Err(e) => {
+            warn(&format!("deterministic capture: freeze walk failed: {e}"));
+            Value::Null
+        }
+    }
+}
+
+/// Undo the freeze walk (reverse order, every closure guarded).
+pub(crate) async fn restore_freeze(browser: &Browser) {
+    if let Err(e) = browser.eval(&freeze_restore_js()).await {
+        warn(&format!(
+            "deterministic capture: could not undo the freeze walk: {e}"
+        ));
+    }
+}
+
 /// Live `(innerWidth, innerHeight, devicePixelRatio, href)` for the capture
 /// metadata. Every value is read back from the page, never assumed.
 async fn live_metrics(browser: &Browser) -> Value {
@@ -316,6 +343,11 @@ impl Capture {
             m.insert("settled".to_string(), json!(self.settled));
             m.insert("settleTimeouts".to_string(), json!(self.settle_timeouts));
             m.insert("freeze".to_string(), self.freeze.clone());
+            // The mode, named rather than implied: the freeze is
+            // `animation:none` (the animation-off state), never
+            // `animation-play-state:paused`, which would keep a
+            // wall-clock-dependent frame.
+            m.insert("freezeMode".to_string(), json!("animation-none"));
         }
         Value::Object(m)
     }
@@ -636,18 +668,7 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
     // media paused, applied BEFORE settling so the settle waits and the shot
     // both see a frozen page. The counts are what the reply reports; a realm
     // the walk could not reach is recorded in `skipped`.
-    let freeze = match browser.eval(&freeze_js()).await {
-        Ok(v) => {
-            if v.is_null() {
-                warn("deterministic capture: the freeze walk returned no state");
-            }
-            v
-        }
-        Err(e) => {
-            warn(&format!("deterministic capture: freeze walk failed: {e}"));
-            Value::Null
-        }
-    };
+    let freeze = apply_freeze(browser).await;
     // Test-only: widen the mutation window so a cancellation test can land
     // inside it deterministically.
     maybe_test_delay().await;
@@ -688,11 +709,7 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
     // reverse (styles, WAAPI, SMIL, media), clear the media emulation, then
     // replay the prior metrics override (or clear it when there was none).
     // Each failure is logged, never swallowed.
-    if let Err(e) = browser.eval(&freeze_restore_js()).await {
-        warn(&format!(
-            "deterministic capture: could not undo the freeze walk: {e}"
-        ));
-    }
+    restore_freeze(browser).await;
     if let Err(e) = browser.eval(&style_restore_js()).await {
         warn(&format!(
             "deterministic capture: could not remove the freeze stylesheet: {e}"

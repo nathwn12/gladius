@@ -251,8 +251,8 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 - **Example:** `{"selector": "#results", "ms": 5000}`
 
 #### `assert_layout`
-- **Args:** `ref?: string | string[]` or `selector?: string | string[]` (exactly one of them), `checks?: object`, `screenshotOnFail?: bool`, `screenshotPath?: string`
-- **Returns:** geometry proved without pixels: `{ pass, checks: [{ target, check, pass, expected, actual, delta }], targets: [...] }`. Checks are `exists`, `visible`, `stableFrames`, `box {x,y,w,h,tolerance}`, `hitTarget`, `computed`, `noOverflow`, `inViewport`. `screenshotOnFail` adds one deterministic capture's path, bytes and checksum.
+- **Args:** `ref?: string | string[]` or `selector?: string | string[]` (exactly one of them), `checks?: object`, `screenshotOnFail?: bool`, `screenshotPath?: string`, `deterministic?: bool` (default `false`)
+- **Returns:** geometry proved without pixels: `{ pass, checks: [{ target, check, pass, expected, actual, delta }], targets: [...] }`. Checks are `exists`, `visible`, `stableFrames`, `box {x,y,w,h,tolerance}`, `hitTarget`, `computed`, `noOverflow`, `inViewport`. `screenshotOnFail` adds one deterministic capture's path, bytes and checksum. `deterministic: true` measures under the same freeze a deterministic capture uses and echoes `freezeApplied: true` - the only way to compare geometry with that capture, because **a deterministic capture measures the animation-off state**: `animation: none` resets a mid-flight transform to its untransformed base box. `animation-play-state: paused` is deliberately not the default, because a paused animation keeps a wall-clock-dependent frame.
 - **Example:** `{"selector": "#hero", "checks": {"visible": true, "inViewport": true}}`
 
 #### `layout`

@@ -3,6 +3,9 @@
 //! - `assert_layout`: one call proves a set of geometric invariants for one
 //!   or many targets (`exists`, `visible`, `stableFrames`, `box`, `hitTarget`,
 //!   `computed`, `noOverflow`, `inViewport`) and returns a per-check record.
+//!   `deterministic:true` measures under the same freeze a deterministic
+//!   capture uses, because that capture measures the animation-off state; the
+//!   reply then echoes `freezeApplied`.
 //! - `layout`: the "where is it actually" primitive - a box, scroll size,
 //!   computed display/visibility/opacity, a z-order hint and every detected
 //!   overlapping pair for each match of a selector or ref list.
@@ -547,12 +550,56 @@ fn cmp(actual: f64, expected: f64, tol: f64) -> (bool, f64) {
 }
 
 /// `assert_layout`: prove geometry without pixels.
+/// `assert_layout`: prove a set of geometric invariants per target.
+///
+/// `deterministic:true` measures under the SAME freeze the camera uses
+/// (S1.6): the walk is applied, the checks run, and the walk is undone before
+/// returning - on the error path too. Without it the geometry proof and the
+/// pixel proof disagree by construction, because a deterministic capture
+/// measures the animation-off state.
 pub async fn assert_layout(
     browser: &Browser,
     specs: &[Spec],
     checks: Option<&Value>,
     screenshot_on_fail: bool,
     screenshot_path: Option<&str>,
+    deterministic: bool,
+) -> Result<Value, ToolErr> {
+    if !deterministic {
+        return assert_layout_inner(
+            browser,
+            specs,
+            checks,
+            screenshot_on_fail,
+            screenshot_path,
+            false,
+        )
+        .await;
+    }
+    // Apply the freeze inside the caller's critical section, measure, restore.
+    // The restore must run whatever the checks do, so the outcome is captured
+    // in a value and the restore happens before it is returned.
+    let _ = crate::capture::apply_freeze(browser).await;
+    let outcome = assert_layout_inner(
+        browser,
+        specs,
+        checks,
+        screenshot_on_fail,
+        screenshot_path,
+        true,
+    )
+    .await;
+    crate::capture::restore_freeze(browser).await;
+    outcome
+}
+
+async fn assert_layout_inner(
+    browser: &Browser,
+    specs: &[Spec],
+    checks: Option<&Value>,
+    screenshot_on_fail: bool,
+    screenshot_path: Option<&str>,
+    deterministic: bool,
 ) -> Result<Value, ToolErr> {
     let wanted = parse_checks("assert_layout", checks)?;
     let nodes = resolve(browser, "assert_layout", specs).await?;
@@ -860,6 +907,9 @@ pub async fn assert_layout(
             .iter()
             .all(|c| c.get("pass").and_then(|b| b.as_bool()).unwrap_or(false));
     let mut out = json!({"pass": pass, "checks": results, "targets": targets});
+    if deterministic {
+        out["freezeApplied"] = json!(true);
+    }
     if !pass && screenshot_on_fail {
         let cap = crate::capture::capture(
             browser,

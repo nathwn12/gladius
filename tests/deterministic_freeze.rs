@@ -237,3 +237,77 @@ fn freeze_reaches_shadow_waapi_smil_and_media() {
 
     shutdown(c);
 }
+
+// --------------------------------------------------------------------- S1.6
+
+/// SPEC.md S1.6: the freeze and the measurement agree.
+///
+/// The fixture's box is translated 200 px by a step-end animation, so the live
+/// box and the animation-off box are different numbers. A plain
+/// `assert_layout` measures the live box; `assert_layout {deterministic:true}`
+/// measures the frozen one and echoes `freezeApplied`; a deterministic
+/// `screenshot` names its mode so "geometry under freeze" is searchable.
+#[test]
+fn assert_layout_can_measure_the_frozen_state() {
+    let mut c = Client::spawn_with_env(&[]);
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+    let nav = c.call(
+        "navigate",
+        json!({"url": fixture_url("frozen-layout.html")}),
+    );
+    assert!(nav.get("isError").is_none(), "navigate: {nav}");
+    let vp = c.call("viewport", json!({"width": 400, "height": 300}));
+    assert!(vp.get("isError").is_none(), "viewport: {vp}");
+
+    let box_x = |reply: &Value| -> Option<f64> {
+        let text = content_text(reply);
+        let v: Value = serde_json::from_str(&text).expect("assert_layout json");
+        v.get("targets")
+            .and_then(|t| t.get(0))
+            .and_then(|t| t.get("box"))
+            .and_then(|b| b.get("x"))
+            .and_then(|x| x.as_f64())
+    };
+
+    let live = c.call(
+        "assert_layout",
+        json!({"selector": "#t", "checks": {"box": {}}}),
+    );
+    assert!(live.get("isError").is_none(), "plain assert_layout: {live}");
+    let live_x = box_x(&live).unwrap_or_else(|| panic!("live box measured: {live}"));
+    assert!(
+        (live_x - 220.0).abs() <= 1.0,
+        "the live box is the translated one (20 + 200): {live_x} in {live}"
+    );
+
+    let frozen = c.call(
+        "assert_layout",
+        json!({"selector": "#t", "checks": {"box": {}}, "deterministic": true}),
+    );
+    assert!(
+        frozen.get("isError").is_none(),
+        "deterministic assert_layout is an accepted argument: {frozen}"
+    );
+    let frozen_x = box_x(&frozen).unwrap_or_else(|| panic!("frozen box measured: {frozen}"));
+    assert!(
+        (frozen_x - 20.0).abs() <= 1.0,
+        "under the freeze the transform is gone, so the base box is measured: {frozen_x} in {frozen}"
+    );
+    let frozen_json: Value = serde_json::from_str(&content_text(&frozen)).expect("json");
+    assert_eq!(
+        frozen_json.get("freezeApplied").and_then(|v| v.as_bool()),
+        Some(true),
+        "the reply echoes that the freeze was on: {frozen_json}"
+    );
+
+    let shot = c.call("screenshot", json!({"deterministic": true}));
+    assert!(shot.get("isError").is_none(), "screenshot: {shot}");
+    let meta = shot_meta(&shot);
+    assert_eq!(
+        meta.get("freezeMode").and_then(|v| v.as_str()),
+        Some("animation-none"),
+        "a deterministic capture names the mode it measured: {meta}"
+    );
+
+    shutdown(c);
+}

@@ -246,7 +246,7 @@ pub fn list() -> Value {
             .position(|t| t.get("name").and_then(|v| v.as_str()) == Some("close"))
             .unwrap_or(tools.len());
         tools.insert(at, json!({"name": "assert_layout", "title": "Assert Layout",
-          "description": "Prove geometry without pixels: one call, one or many targets (ref @eN and/or CSS selector, string or array), several checks. Checks: exists (default true; false asserts absence), visible (a real box, not display:none/visibility:hidden/collapse, opacity>0), stableFrames (N animation frames, identical bbox), box {x,y,w,h,tolerance} in VIEWPORT CSS px from DOM.getBoxModel, hitTarget (elementFromPoint at the exact centre is the target or a descendant - the same guard click uses), computed (subset of getComputedStyle, string-exact), noOverflow (scrollWidth/Height <= clientWidth/Height + tolerance), inViewport (whole box inside the visual viewport). Returns per-check {target, check, pass, expected, actual, delta} plus an overall pass. screenshotOnFail:true adds one deterministic capture's path/bytes/checksum. Values are engine measurements (DOM.getBoxModel + Runtime.evaluate), never guesses. Headless + CDP only: no OS cursor, no OS keyboard, no window, no foreground tab.",
+          "description": "Prove geometry without pixels: one call, one or many targets (ref @eN and/or CSS selector, string or array), several checks. Checks: exists (default true; false asserts absence), visible (a real box, not display:none/visibility:hidden/collapse, opacity>0), stableFrames (N animation frames, identical bbox), box {x,y,w,h,tolerance} in VIEWPORT CSS px from DOM.getBoxModel, hitTarget (elementFromPoint at the exact centre is the target or a descendant - the same guard click uses), computed (subset of getComputedStyle, string-exact), noOverflow (scrollWidth/Height <= clientWidth/Height + tolerance), inViewport (whole box inside the visual viewport). Returns per-check {target, check, pass, expected, actual, delta} plus an overall pass. deterministic:true measures under the same freeze a deterministic screenshot uses (animation:none, WAAPI/SMIL/media held, frames and open shadow roots walked) and echoes freezeApplied:true - the ONLY way to compare geometry with a deterministic capture, because that capture measures the animation-off state. screenshotOnFail:true adds one deterministic capture's path/bytes/checksum. Values are engine measurements (DOM.getBoxModel + Runtime.evaluate), never guesses. Headless + CDP only: no OS cursor, no OS keyboard, no window, no foreground tab.",
           "inputSchema": {"type": "object", "properties": {
               "ref": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
               "selector": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
@@ -264,12 +264,14 @@ pub fn list() -> Value {
                   "inViewport": {"type": "boolean"}},
                   "additionalProperties": false},
               "screenshotOnFail": {"type": "boolean"},
-              "screenshotPath": {"type": "string"}},
+              "screenshotPath": {"type": "string"},
+              "deterministic": {"type": "boolean"}},
               "anyOf": [{"required": ["ref"]}, {"required": ["selector"]}],
               "additionalProperties": false},
           "outputSchema": {"type": "object",
              "properties": {"pass": {"type": "boolean"}, "checks": {"type": "array"},
-                 "targets": {"type": "array"}, "screenshot": {"type": "object"}},
+                 "targets": {"type": "array"}, "screenshot": {"type": "object"},
+                 "freezeApplied": {"type": "boolean"}},
              "required": ["pass", "checks", "targets"], "additionalProperties": false},
           "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}}));
         tools.insert(at + 1, json!({"name": "layout", "title": "Layout",
@@ -2464,11 +2466,16 @@ async fn tool_assert_layout(browser: &Browser, args: &Value) -> Result<Value, To
             "checks",
             "screenshotOnFail",
             "screenshotPath",
+            "deterministic",
         ],
     )?;
     let specs = layout_specs(browser, "assert_layout", args).await?;
     let on_fail = args
         .get("screenshotOnFail")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let deterministic = args
+        .get("deterministic")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let shot_path = args.get("screenshotPath").and_then(|v| v.as_str());
@@ -2478,9 +2485,16 @@ async fn tool_assert_layout(browser: &Browser, args: &Value) -> Result<Value, To
             json!({"code": "invalid_args", "reason": "need_option", "tool": "assert_layout", "arg": "screenshotPath"}),
         ));
     }
-    crate::layout::assert_layout(browser, &specs, args.get("checks"), on_fail, shot_path)
-        .await
-        .map(|v| ok_text(v.to_string()))
+    crate::layout::assert_layout(
+        browser,
+        &specs,
+        args.get("checks"),
+        on_fail,
+        shot_path,
+        deterministic,
+    )
+    .await
+    .map(|v| ok_text(v.to_string()))
 }
 
 /// `layout` body.
