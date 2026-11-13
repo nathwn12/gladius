@@ -49,6 +49,15 @@ directory per owned instance, created before launch and swept after the tree
 is reaped. Never passed: `--no-sandbox`, `--disable-dev-shm-usage`,
 keychain/password-store flags, `--remote-debugging-pipe`.
 
+Every owned launch also writes `%TEMP%/gladius-<gladius pid>.json`
+(`pid`, `enginePid`, `profileDir`, `startedAt`) before readiness is declared, and
+removes it when the engine is dropped. The Windows job object is the primary
+hard-kill cover; this record is the fallback authority for the launch path where
+job assignment failed. At the next launch, a record whose owner pid is provably
+dead, whose `enginePid` is alive and whose command line carries the recorded
+`--user-data-dir`, is killed (bounded) and then swept; any doubt leaves both
+alone.
+
 Full capability record: `docs/CHROMIUM.md`.
 
 ## Historical note

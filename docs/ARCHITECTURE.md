@@ -109,9 +109,17 @@ running by design - no `kill_tree`, no pid kill, nothing deleted.
 - **One session per agent connection:** each stdio client gets its own browser context/page;
   contexts never leak across connections (RESEARCH rule 6).
 - **Kill-tree on close:** the child is spawned in a Windows **job object**; `close`/EOF kills the
-  job (whole owned-engine tree), then reaps. No orphans.
-- **Crash recovery:** a dead child surfaces as a tool error; the *next* call re-spawns lazily.
-  No watchdog threads, no pre-warming.
+  job (whole owned-engine tree), then reaps. No orphans. Every owned launch also writes
+  `%TEMP%/gladius-<pid>.json` (`pid`, `enginePid`, `profileDir`, `startedAt`) before readiness
+  and removes it on close: it is the fallback authority for the launch path where job
+  assignment failed, where the next launch kills a provable orphan (a live `enginePid` whose
+  command line carries the recorded `--user-data-dir`) and then sweeps its profile. The job
+  object stays the primary reaper.
+- **Crash recovery:** a transport-dead **owned** engine is relaunched once, lazily, inside the
+  call that finds it dead. That call is never silently retried (a mutation is never re-sent), and
+  a relaunch that fails is a typed `engine_dead`/`respawn_failed` whose prose names `close`. An
+  engine attached with `GLADIUS_CDP_URL` is never relaunched - `engine_dead`/`transport` says it
+  is the caller's to restart. No watchdog threads, no pre-warming.
 
 ## 5. RAM / latency budget + how it is measured
 
@@ -260,12 +268,16 @@ raises, focuses or moves a window on any path.
   page's own override intact; without that lock they all report the last
   override written (measured, and asserted by the selftest).
 - **Cancellation cannot skip cleanup.** Those same three tools also hold a
-  per-call *section gate* for the whole call. `notifications/cancelled` (and a
-  duplicate-id supersede) marks the call cancelled and then aborts from a
-  detached waiter that first takes the section gate — so the future can never
-  be dropped mid-restore, and the execution lock is released only after
-  metrics, emulated media, freeze stylesheet and scratch target are back to
-  their prior state. The response is still suppressed. The gate is acquired
+  per-call *section gate* for the whole call. `notifications/cancelled` marks the
+  call cancelled and then aborts from a detached waiter that first takes the
+  section gate — so the future can never be dropped mid-restore, and the
+  execution lock is released only after metrics, emulated media, freeze
+  stylesheet and scratch target are back to their prior state. The cancel is
+  answered **immediately** with a typed `cancelled`/`client_cancelled` tool
+  result; the restore keeps running behind that answer, so cleanup is never
+  traded for latency and the caller never waits in silence. (A duplicate-id
+  supersede still emits nothing for the superseded call: the newest generation
+  answers for that id.) The gate is acquired
   BEFORE the decisive liveness recheck, so a cancel that lands in the entry
   window stops the call at the gate instead of admitting it into the section;
   the abort waiter holds the gate across `handle.abort()` for the same reason.
@@ -273,6 +285,16 @@ raises, focuses or moves a window on any path.
   the lock) aborts immediately, exactly as before. `GLADIUS_TEST_CRITICAL_DELAY_MS` is the
   test-only hook that widens the window so the cancellation tests can cancel
   deterministically; it is never set in production.
+- **Every call has a total budget.** One `tools/call` runs inside a budget
+  (90 s by default, `_budgetMs` 2000..600000 per call, `GLADIUS_TOOL_BUDGET_MS`
+  for tests) that covers the lock wait, the section wait and the tool work, so a
+  wedged renderer stops at the budget instead of at a 30 s CDP timeout
+  multiplied by the phases. Past it the call answers `timeout` /
+  `budget_exceeded` with `tool` and `budgetMs`, and the execution lock is
+  released. A call that restores page state is never dropped mid-section: it
+  finishes its restore after the answer, exactly like a cancelled one.
+  `_budgetMs` is the one argument every tool accepts without declaring it — the
+  dispatcher strips and validates it before any tool's unknown-argument gate.
 
 ## 7. Non-goals (explicit)
 
