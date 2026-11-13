@@ -664,3 +664,90 @@ fn fonts_report_pending_not_silent() {
     std::fs::remove_dir_all(&dir).ok();
     shutdown(c);
 }
+
+// --------------------------------------------------------------------- S1.8
+
+/// SPEC.md S1.8: the environment fingerprint covers the axes that differ.
+///
+/// A baseline saved on another machine used to match, because only browser
+/// major, viewport and DSF were compared. Every axis is now read live and
+/// participates: editing the sidecar's `platform` alone must fail the match and
+/// name `platform` in the warning, and an untouched compare must report every
+/// axis with a real value.
+#[test]
+fn environment_fingerprint_names_every_axis() {
+    let dir = scratch("env");
+    let vdir = dir.join("visual");
+    std::fs::create_dir_all(&vdir).expect("visual dir");
+    let vdir_s = vdir.to_string_lossy().to_string();
+    let mut c = Client::spawn_with_env(&[("GLADIUS_VISUAL_DIR", &vdir_s)]);
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+
+    let page = dir.join("env.html");
+    std::fs::write(
+        &page,
+        "<!doctype html><html><head><style>html,body{margin:0;background:#fff}\
+         p{font:16px/20px sans-serif}</style></head><body><p>ENV_MARKER</p></body></html>",
+    )
+    .expect("write env fixture");
+    goto(&mut c, &page, 400, 200);
+    c.call_ok("visual", json!({"action": "save", "name": "env"}));
+
+    // The untouched compare: every axis is present and real.
+    let clean = c.call_ok("visual", json!({"action": "compare", "name": "env"}));
+    assert_eq!(
+        clean
+            .pointer("/environment/match")
+            .and_then(|v| v.as_bool()),
+        Some(true),
+        "an untouched baseline matches: {clean}"
+    );
+    let current = clean
+        .pointer("/environment/current")
+        .cloned()
+        .unwrap_or(Value::Null);
+    for axis in [
+        "browserFullVersion",
+        "platform",
+        "userAgent",
+        "colorScheme",
+        "forcedColors",
+        "contrast",
+        "reducedMotion",
+        "fontCountHash",
+        "scrollbarWidth",
+    ] {
+        assert!(
+            current.get(axis).map(|v| !v.is_null()).unwrap_or(false),
+            "environment.current carries a real {axis}: {current}"
+        );
+    }
+
+    // Hand-edit the sidecar's platform: that alone must break the match.
+    let meta_file = vdir.join("env.meta.json");
+    let text = std::fs::read_to_string(&meta_file).expect("sidecar");
+    let mut meta: Value = serde_json::from_str(&text).expect("sidecar json");
+    meta["platform"] = json!("SomeOtherPlatform");
+    std::fs::write(
+        &meta_file,
+        serde_json::to_string_pretty(&meta).expect("encode sidecar"),
+    )
+    .expect("rewrite sidecar");
+
+    let edited = c.call_ok("visual", json!({"action": "compare", "name": "env"}));
+    assert_eq!(
+        edited
+            .pointer("/environment/match")
+            .and_then(|v| v.as_bool()),
+        Some(false),
+        "a different platform is a different environment: {edited}"
+    );
+    let warning = edited.get("warning").and_then(|w| w.as_str()).unwrap_or("");
+    assert!(
+        warning.contains("platform"),
+        "the mismatch names the axis that differs: {edited}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    shutdown(c);
+}

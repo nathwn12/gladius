@@ -186,6 +186,27 @@ pub struct EnvMeta {
     pub settled: Option<bool>,
     /// Which settle waits lost, when the sidecar records it.
     pub settle_timeouts: Option<Vec<String>>,
+    // The 0.8.0 fingerprint (S1.8). Every one is `Option` because a 0.7.x
+    // sidecar has none of them: a missing axis is UNKNOWN, and the compare says
+    // so instead of letting the baseline match silently.
+    /// Full engine version string (`155.0.8059.84`), not just the major.
+    pub full_version: Option<String>,
+    /// `navigator.platform`.
+    pub platform: Option<String>,
+    /// `navigator.userAgent`.
+    pub user_agent: Option<String>,
+    /// `prefers-color-scheme`: `dark` or `light`.
+    pub color_scheme: Option<String>,
+    /// `forced-colors: active`.
+    pub forced_colors: Option<bool>,
+    /// `prefers-contrast`: `more`, `less` or `no-preference`.
+    pub contrast: Option<String>,
+    /// `prefers-reduced-motion`: `reduce` or `no-preference`.
+    pub reduced_motion: Option<String>,
+    /// FNV-1a over the sorted `family|weight|style` of every `FontFace`.
+    pub font_count_hash: Option<String>,
+    /// `innerWidth - documentElement.clientWidth`.
+    pub scrollbar_width: Option<i64>,
 }
 
 impl EnvMeta {
@@ -210,6 +231,21 @@ impl EnvMeta {
         if let Some(t) = &self.settle_timeouts {
             m.insert("settleTimeouts".to_string(), json!(t));
         }
+        for (key, v) in [
+            ("browserFullVersion", json!(self.full_version)),
+            ("platform", json!(self.platform)),
+            ("userAgent", json!(self.user_agent)),
+            ("colorScheme", json!(self.color_scheme)),
+            ("forcedColors", json!(self.forced_colors)),
+            ("contrast", json!(self.contrast)),
+            ("reducedMotion", json!(self.reduced_motion)),
+            ("fontCountHash", json!(self.font_count_hash)),
+            ("scrollbarWidth", json!(self.scrollbar_width)),
+        ] {
+            if !v.is_null() {
+                m.insert(key.to_string(), v);
+            }
+        }
         Value::Object(m)
     }
 
@@ -231,14 +267,68 @@ impl EnvMeta {
                     .filter_map(|x| x.as_str().map(|s| s.to_string()))
                     .collect()
             }),
+            full_version: v
+                .get("browserFullVersion")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string()),
+            platform: v
+                .get("platform")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string()),
+            user_agent: v
+                .get("userAgent")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string()),
+            color_scheme: v
+                .get("colorScheme")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string()),
+            forced_colors: v.get("forcedColors").and_then(|b| b.as_bool()),
+            contrast: v
+                .get("contrast")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string()),
+            reduced_motion: v
+                .get("reducedMotion")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string()),
+            font_count_hash: v
+                .get("fontCountHash")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string()),
+            scrollbar_width: v.get("scrollbarWidth").and_then(|n| n.as_i64()),
         })
     }
 
-    /// The three axes that decide `environment.match`: browser major,
-    /// viewport, deviceScaleFactor. The url is recorded (and returned) but a
-    /// baseline is allowed to be compared from a different path.
-    fn differences(&self, current: &EnvMeta) -> Vec<String> {
+    /// Every axis that decides `environment.match`: browser major, viewport,
+    /// deviceScaleFactor, and (S1.8) the full version, platform, user agent,
+    /// colour scheme, forced colours, contrast preference, reduced-motion
+    /// preference, the installed-font fingerprint and the scrollbar width. The
+    /// url is recorded (and returned) but a baseline is allowed to be compared
+    /// from a different path.
+    ///
+    /// Returns `(differences, unknown_axes)`. An axis the BASELINE does not
+    /// record (a 0.7.x sidecar) is unknown, never a match: the caller reports
+    /// it so the compare cannot look clean by omission.
+    fn differences(&self, current: &EnvMeta) -> (Vec<String>, Vec<String>) {
+        fn axis<T: PartialEq + std::fmt::Debug>(
+            name: &str,
+            base: &Option<T>,
+            cur: &Option<T>,
+            out: &mut Vec<String>,
+            unknown: &mut Vec<String>,
+        ) {
+            match base {
+                None => unknown.push(name.to_string()),
+                Some(b) => {
+                    if cur.as_ref() != Some(b) {
+                        out.push(format!("{name}: {b:?} -> {cur:?}"));
+                    }
+                }
+            }
+        }
         let mut out = Vec::new();
+        let mut unknown = Vec::new();
         if self.browser_major != current.browser_major {
             out.push(format!(
                 "browser major {} ({}) -> {} ({})",
@@ -254,7 +344,70 @@ impl EnvMeta {
         if (self.dsf - current.dsf).abs() > f64::EPSILON {
             out.push(format!("deviceScaleFactor {} -> {}", self.dsf, current.dsf));
         }
-        out
+        axis(
+            "browserFullVersion",
+            &self.full_version,
+            &current.full_version,
+            &mut out,
+            &mut unknown,
+        );
+        axis(
+            "platform",
+            &self.platform,
+            &current.platform,
+            &mut out,
+            &mut unknown,
+        );
+        axis(
+            "userAgent",
+            &self.user_agent,
+            &current.user_agent,
+            &mut out,
+            &mut unknown,
+        );
+        axis(
+            "colorScheme",
+            &self.color_scheme,
+            &current.color_scheme,
+            &mut out,
+            &mut unknown,
+        );
+        axis(
+            "forcedColors",
+            &self.forced_colors,
+            &current.forced_colors,
+            &mut out,
+            &mut unknown,
+        );
+        axis(
+            "contrast",
+            &self.contrast,
+            &current.contrast,
+            &mut out,
+            &mut unknown,
+        );
+        axis(
+            "reducedMotion",
+            &self.reduced_motion,
+            &current.reduced_motion,
+            &mut out,
+            &mut unknown,
+        );
+        axis(
+            "fontCountHash",
+            &self.font_count_hash,
+            &current.font_count_hash,
+            &mut out,
+            &mut unknown,
+        );
+        axis(
+            "scrollbarWidth",
+            &self.scrollbar_width,
+            &current.scrollbar_width,
+            &mut out,
+            &mut unknown,
+        );
+        (out, unknown)
     }
 }
 
@@ -263,7 +416,7 @@ impl EnvMeta {
 /// them as a match would let `requireEnvironmentMatch:true` pass without
 /// evidence.
 pub enum MetaState {
-    Recorded(EnvMeta),
+    Recorded(Box<EnvMeta>),
     Missing,
     Malformed(String),
     Unreadable(String),
@@ -282,7 +435,7 @@ impl MetaState {
 
     fn recorded(&self) -> Option<&EnvMeta> {
         match self {
-            MetaState::Recorded(m) => Some(m),
+            MetaState::Recorded(m) => Some(m.as_ref()),
             _ => None,
         }
     }
@@ -308,7 +461,7 @@ fn read_meta(name: &str) -> MetaState {
     };
     match serde_json::from_str::<Value>(&text) {
         Ok(v) => match EnvMeta::from_json(&v) {
-            Some(m) => MetaState::Recorded(m),
+            Some(m) => MetaState::Recorded(Box::new(m)),
             None => MetaState::Malformed(format!(
                 "{} is not a complete environment record",
                 p.display()
@@ -318,15 +471,15 @@ fn read_meta(name: &str) -> MetaState {
     }
 }
 
-/// `(browser product, major version)` from the engine itself. Never fails the
-/// caller: an engine that will not answer `Browser.getVersion` is recorded as
-/// `unknown`/0 and the mismatch logic simply never keys on it.
-async fn engine_identity(browser: &Browser) -> (String, i64) {
+/// `(browser product, major version, full version)` from the engine itself.
+/// Never fails the caller: an engine that will not answer `Browser.getVersion`
+/// is recorded as `unknown`/0 and the mismatch logic simply never keys on it.
+async fn engine_identity(browser: &Browser) -> (String, i64, String) {
     let v = match browser.cdp_raw("Browser.getVersion", json!({}), None).await {
         Ok(v) => v,
         Err(e) => {
             capture::warn(&format!("visual: Browser.getVersion failed: {e}"));
-            return ("unknown".to_string(), 0);
+            return ("unknown".to_string(), 0, "unknown".to_string());
         }
     };
     let product = v
@@ -334,7 +487,7 @@ async fn engine_identity(browser: &Browser) -> (String, i64) {
         .and_then(|p| p.as_str())
         .unwrap_or("")
         .to_string();
-    let version = product.rsplit('/').next().unwrap_or("");
+    let version = product.rsplit('/').next().unwrap_or("").to_string();
     let major = version
         .split('.')
         .next()
@@ -345,11 +498,45 @@ async fn engine_identity(browser: &Browser) -> (String, i64) {
     } else {
         product
     };
-    (browser, major)
+    let full = if version.is_empty() {
+        "unknown".to_string()
+    } else {
+        version
+    };
+    (browser, major, full)
+}
+
+/// The environment axes the PAGE can answer (S1.8): platform, user agent,
+/// media preferences, the installed-font fingerprint and the scrollbar width.
+/// Read live in one evaluate - never assumed, never cached across calls.
+async fn live_axes(browser: &Browser) -> Value {
+    let expr = "(() => { \
+        const mq = (q) => { try { return matchMedia(q).matches; } catch (e) { return null; } }; \
+        const faces = []; \
+        try { for (const f of document.fonts) faces.push(f.family + '|' + f.weight + '|' + f.style); } catch (e) {} \
+        faces.sort(); \
+        const dark = mq('(prefers-color-scheme: dark)'); \
+        const more = mq('(prefers-contrast: more)'); \
+        const less = mq('(prefers-contrast: less)'); \
+        const reduce = mq('(prefers-reduced-motion: reduce)'); \
+        return { \
+          platform: navigator.platform || '', \
+          userAgent: navigator.userAgent || '', \
+          colorScheme: dark === true ? 'dark' : 'light', \
+          forcedColors: mq('(forced-colors: active)') === true, \
+          contrast: more === true ? 'more' : (less === true ? 'less' : 'no-preference'), \
+          reducedMotion: reduce === true ? 'reduce' : 'no-preference', \
+          scrollbarWidth: window.innerWidth - document.documentElement.clientWidth, \
+          fontKeys: faces.join('\\n') \
+        }; })()";
+    browser.eval(expr).await.unwrap_or(Value::Null)
 }
 
 async fn current_environment(browser: &Browser, cap: &capture::Capture) -> EnvMeta {
-    let (product, major) = engine_identity(browser).await;
+    let (product, major, full) = engine_identity(browser).await;
+    let axes = live_axes(browser).await;
+    let text = |k: &str| axes.get(k).and_then(|v| v.as_str()).map(|s| s.to_string());
+    let font_keys = text("fontKeys").unwrap_or_default();
     EnvMeta {
         browser: product,
         browser_major: major,
@@ -361,6 +548,17 @@ async fn current_environment(browser: &Browser, cap: &capture::Capture) -> EnvMe
         created_at: iso8601_now(),
         settled: Some(cap.settled),
         settle_timeouts: Some(cap.settle_timeouts.clone()),
+        full_version: Some(full),
+        platform: text("platform"),
+        user_agent: text("userAgent"),
+        color_scheme: text("colorScheme"),
+        forced_colors: axes.get("forcedColors").and_then(|b| b.as_bool()),
+        contrast: text("contrast"),
+        reduced_motion: text("reducedMotion"),
+        // The same FNV-1a the capture checksum uses: cheap, dependency free,
+        // and enough to catch a font set that changed under a baseline.
+        font_count_hash: Some(capture::checksum(font_keys.as_bytes())),
+        scrollbar_width: axes.get("scrollbarWidth").and_then(|n| n.as_i64()),
     }
 }
 
@@ -1131,9 +1329,9 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
     // Environment check: a mismatch (or an unknown baseline environment) is a
     // WARNING by default - the pixels still decide - and a failure only when
     // the caller requires a match.
-    let (env_known, env_match, mut notes) = match meta_state.recorded() {
+    let (env_known, env_match, mut notes, unknown_axes) = match meta_state.recorded() {
         Some(b) => {
-            let diffs = b.differences(&current_env);
+            let (diffs, unknown) = b.differences(&current_env);
             // An unsettled baseline is not a match: the artifact carries its
             // own honesty, so a strict gate cannot pass on pixels that were
             // captured mid-flight. `None` is a 0.7.x sidecar: unknown, never
@@ -1163,6 +1361,16 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
                     diffs.join("; ")
                 ));
             }
+            // An axis the sidecar does not record is UNKNOWN, and unknown is
+            // never a match: a 0.7.x baseline must not look clean by omission.
+            if !unknown.is_empty() {
+                out.push(format!(
+                    "baseline_environment_unknown_axes: the baseline records no {} (a 0.7.x \
+                     sidecar), so a match cannot be established for them; re-save it with \
+                     update:true",
+                    unknown.join(", ")
+                ));
+            }
             match b.settled {
                 Some(false) => out.push(format!(
                     "baseline_unsettled: the baseline was captured before it settled \
@@ -1180,7 +1388,7 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
                 ),
                 Some(true) => {}
             }
-            (true, diffs.is_empty(), out)
+            (true, diffs.is_empty(), out, unknown)
         }
         None => (
             false,
@@ -1190,6 +1398,7 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
                  record, so a match cannot be established; re-save it with update:true)",
                 meta_state.detail()
             )],
+            Vec::new(),
         ),
     };
     if let Some(aa) = aa_warning(diff.ignored_pixels, diff.ignored_clusters) {
@@ -1273,6 +1482,7 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
         "environment": {
             "match": env_match,
             "known": env_known,
+            "unknownAxes": unknown_axes,
             "baseline": match meta_state.recorded() { Some(b) => b.to_json(), None => Value::Null },
             "current": current_env.to_json(),
         },
