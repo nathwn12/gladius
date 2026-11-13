@@ -24,7 +24,7 @@ established by hashes + mtimes + an isolated fresh rebuild.
 | Artifact | Size (B) | mtime (local) | SHA256 |
 |---|---|---|---|
 | `bin\gladius.exe` | 5,497,344 | 2026-10-10 5:23:32 PM | `DCD0CE9F82C36BE2365B4EE7B8C5CF439D80E40C66F2A9B059BF7F038C2F8C63` |
-| `target\release\gladius.exe` | 5,497,344 | 2026-10-10 5:23:32 PM | `DCD0CE9F82C36BE2365B4EE7B8C5CF439D80E40C66F2A9B059BF7F038C2F8C63` (byte-identical to `bin`) |
+| `target\release\gladius.exe` | 5,497,344 | 2026-10-10 5:23:32 PM | `DCD0CE9F82C36BE2365B4EE7B8C5CF439D80E40C66F2A9B059BF7F038C2F8C63` (identical to `bin`) |
 | fresh isolated build (`CARGO_TARGET_DIR=%TEMP%\opencode\ses_ed8bd551cffeHmdMpTecyGZT4W\fresh-target`) | 5,497,344 | 2026-10-11 3:34:45 AM | `456F56816CDE9A2B87F9ED8564140A83C3E014DE3A710ADD2A599632C5BC5BDC` |
 
 Crate identity: `gladius` **v0.1.0** (edition 2021), `[[bin]] gladius -> src/main.rs`

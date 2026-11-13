@@ -264,7 +264,7 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 
 #### `screenshot`
 - **Args:** `fullPage?: bool`, `path?: string` (absolute only), `deterministic?: bool` (default `false`), `width?: number`, `height?: number` (only with `deterministic`)
-- **Returns:** an `image` content part with base64 PNG, plus `size` (the PNG's real pixel width/height, parsed from its IHDR chunk - on `fullPage` this is taller than `viewport` by construction), `viewport`, `deviceScaleFactor`, `url`, `bytes` and a FNV-1a `checksum`. `deterministic: true` fixes metrics, forces `prefers-reduced-motion`, freezes animation/transition/caret/scrollbars, waits for fonts and images, and restores everything afterwards - two captures of the same page are provably identical. A deterministic reply also carries `settled` (did every settle wait finish in budget?), `settleTimeouts` (the closed set `fonts`/`images`/`raf`/`settleCap` that lost) and `fontsPending` (how many `FontFace`s were still `loading` when the shot was taken); a capture that gave up still returns its PNG, only the claim changes. Fonts are waited by status - `document.fonts.status` plus every face `loaded` or `error` - so a `font-display:swap` page that swaps late is reported, not repaired. Refuses with `capability_gated` under `dom-only`.
+- **Returns:** an `image` content part with base64 PNG, plus `size` (the PNG's real pixel width/height, parsed from its IHDR chunk - on `fullPage` this is taller than `viewport` by construction), `viewport`, `deviceScaleFactor`, `url`, `bytes` and a FNV-1a `checksum`. `deterministic: true` pins the capture so two captures of the same page in the same engine produce the same PNG bytes; the scope of the freeze is the main document, same-process frames, open shadow roots, CSS animation, WAAPI, SMIL and media (see `freeze`). Canvas, WebGL, video *frames* and cross-process iframes are **sampled**, not frozen. It fixes metrics, applies the freeze walk, waits for fonts (by `FontFace` status), images and animation frames, and restores everything afterwards. Byte-identity assumes gladius's own PNG encoder: an attached engine may encode differently. Note that no scrolling is performed: below-the-fold `loading="lazy"` content is captured unloaded. A deterministic reply also carries `settled` (did every settle wait finish in budget?), `settleTimeouts` (the closed set `fonts`/`images`/`raf`/`settleCap` that lost), `fontsPending` (how many `FontFace`s were still `loading` when the shot was taken), `freezeMode` (`animation-none`) and `freeze` (what the walk reached); a capture that gave up still returns its PNG, only the claim changes. Fonts are waited by status - `document.fonts.status` plus every face `loaded` or `error` - so a `font-display:swap` page that swaps late is reported, not repaired. Refuses with `capability_gated` under `dom-only`.
 - **Example:** `{"deterministic": true, "fullPage": true}`
 
 #### `visual`
@@ -327,6 +327,11 @@ rather than the chat - STDOUT belongs to the protocol.
   explicit `mode:"legacy"` heuristic still stamps `data-gladius-ref` into the page.
 - **No vision or coordinate grounding.** `snapshot` and `@eN` refs are the
   contract; there is no model in the server.
+- **Determinism is scoped, and the docs say so.** The freeze covers the main
+  document, same-process frames, open shadow roots, CSS animation, WAAPI, SMIL
+  and media playback. Canvas, WebGL, video *frames*, cross-process iframes and
+  below-the-fold lazy content are **sampled**, not frozen: no scrolling is
+  performed and no canvas is read back.
 - **No PDF generation, no fleet or cloud operation, no in-server planning or LLM
   calls.** gladius is the fast local minimum underneath those systems.
 - **No fully offline fresh install.** The first run always downloads the pinned

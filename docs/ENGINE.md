@@ -39,8 +39,8 @@ The three `--disable-*` flags are the background-correctness contract: a tab
 that is not the active page must still render, still screenshot and still run
 its timers, and none of the three touch the OS (no cursor, no keyboard, no
 window, no focus). The `selftest` asserts it on the real engine - a capture
-taken on a backgrounded tab's own session is byte-identical to the foreground
-capture and its `setInterval` keeps firing (25 ticks in 1.2 s).
+taken on a backgrounded tab's own session matches the foreground capture and
+its `setInterval` keeps firing (25 ticks in 1.2 s).
 
 The profile is functional, not hygiene: since Chrome 136 the
 remote-debugging switches are ignored on the default data directory, so a

@@ -85,7 +85,7 @@ from the real files (version, download URL, zip sha256 + size, file count, total
 every per-file name/sha256/size), rewrites `scripts/chromium-manifest.json`, updates the
 pin constants in `scripts/fetch-chromium.ps1`, places the new versioned cache dir, and
 prints `old -> new`, file count, total size delta, and the zip hash. If it equals the
-pin it is a NO-OP: the manifest stays byte-identical (no churn, no rewrite).
+pin it is a NO-OP: the manifest stays unchanged (no churn, no rewrite).
 
 Monthly PR workflow: `.github/workflows/browser-update.yml` (`schedule:` monthly plus
 `workflow_dispatch`) runs `-Check` then `-Update` on a GitHub-hosted runner and, if the

@@ -51,7 +51,7 @@ fn capabilities() -> Value {
 }
 
 fn instructions() -> &'static str {
-    "Gladius is headless-only (no headed mode). Always start with snapshot to get stable @eN refs, then act with @eN refs or CSS selectors. All 25 tools report typed errors (structuredContent code/reason alongside the prose); tool failures are results, never protocol errors. Everything rides CDP: no OS cursor, no OS keyboard, no focus stealing, no visible window on the owned headless engine (an engine you attached with GLADIUS_CDP_URL is yours, and visual compare opens one scratch tab there). screenshot {deterministic:true}, assert_layout, layout and visual prove pixels and geometry without a foreground tab."
+    "Gladius is headless-only (no headed mode). Always start with snapshot to get stable @eN refs, then act with @eN refs or CSS selectors. All 25 tools report typed errors (structuredContent code/reason alongside the prose); tool failures are results, never protocol errors. Everything rides CDP: no OS cursor, no OS keyboard, no focus stealing, no visible window on the owned headless engine (an engine you attached with GLADIUS_CDP_URL is yours, and visual compare opens one scratch tab there). screenshot {deterministic:true}, assert_layout, layout and visual prove pixels and geometry without a foreground tab. deterministic captures are frozen for CSS/WAAPI/SMIL/media in the main document and same-process frames; canvas, WebGL and cross-process iframes are sampled."
 }
 
 fn server_info() -> Value {

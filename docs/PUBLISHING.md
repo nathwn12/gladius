@@ -135,7 +135,7 @@ itself:
   as fixture repos, including the one that matters here: a tree whose commits
   outran the manifests is refused with exit 1 and
   `refuse: version-mismatch: … this lane asserts the version, it never writes
-  it`, and the refused run leaves the manifests byte-identical.
+  it`, and the refused run leaves the manifests unchanged.
 - `node scripts/check-release-workflow.mjs` — the ordering invariants of
   `.github/workflows/release.yml` (derive before any version assert, no step
   that writes a version, changelog closed after the gates, tag created in the

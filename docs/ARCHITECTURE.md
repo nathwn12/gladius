@@ -11,7 +11,7 @@
 |---|---|---|
 | `navigate` | `url: string` | text after load event (timeout -> error) |
 | `snapshot` | `mode?: "ax"\|"legacy"\|"text"` (default AX) | Real Accessibility tree: one line per actionable node with a stable ref (`@e1`, `@e2`, ...), role/name/value, plus page text (capped 8000 chars). Hidden/ignored subtrees (display:none, aria-hidden) are excluded from the lines; an old ref to such a node is a typed `stale_ref`, never a silent click. `mode:"legacy"` keeps the old DOM heuristic (stamps hidden nodes); `mode:"text"` = text-only output. Shadow-DOM nodes resolve in the snapshot, but acting on a shadow ref through the main-document resolver is not yet supported (typed `stale_ref`, G4). `frame` (CDP frameId) scopes the snapshot to that iframe |
-| `screenshot` | `fullPage?: bool`, `path?: string`, `deterministic?: bool` (default false), `width?: number`, `height?: number` (only with `deterministic`) | PNG bytes (base64 `image` part) of viewport / full page; refuses under `dom-only`. `deterministic:true` fixes device metrics (current viewport or `width`/`height`, `deviceScaleFactor:1`, `mobile:false`) and restores them afterwards, sets `prefers-reduced-motion:reduce`, injects a temporary style freezing `animation`/`transition`/`caret-color`/scrollbars, waits on `document.fonts.ready` + every `img` `complete` + two animation frames, then captures `{format:png, fromSurface:true, captureBeyondViewport:fullPage}`. The reply adds `viewport`, `deviceScaleFactor`, `url`, `bytes` and a FNV-1a `checksum`, so two captures of the same page are provably identical |
+| `screenshot` | `fullPage?: bool`, `path?: string`, `deterministic?: bool` (default false), `width?: number`, `height?: number` (only with `deterministic`) | PNG bytes (base64 `image` part) of viewport / full page; refuses under `dom-only`. `deterministic:true` fixes device metrics (current viewport or `width`/`height`, `deviceScaleFactor:1`, `mobile:false`) and restores them afterwards, sets `prefers-reduced-motion:reduce`, applies the freeze walk (a stylesheet plus WAAPI/SMIL/media holds over the main document, same-process frames and open shadow roots), waits on font STATUS plus every `img` `complete` plus two animation frames, then captures `{format:png, fromSurface:true, captureBeyondViewport:fullPage}`. The reply adds `viewport`, `deviceScaleFactor`, `url`, `bytes`, a FNV-1a `checksum`, `settled`, `settleTimeouts`, `fontsPending`, `freezeMode` and `freeze`. deterministic pins the capture so two captures of the same page in the same engine produce the same PNG bytes; the scope of the freeze is the main document, same-process frames, open shadow roots, CSS animation, WAAPI, SMIL and media (see `freeze`). Canvas, WebGL, video frames and cross-process iframes are sampled, not frozen. |
 | `assert_layout` | `ref?: string\|string[]`, `selector?: string\|string[]` (one of them), `checks?: object`, `screenshotOnFail?: bool`, `screenshotPath?: string` | geometry proved without pixels. Checks: `exists`, `visible`, `stableFrames` (N animation frames, identical bbox), `box {x,y,w,h,tolerance}` (VIEWPORT css px from `DOM.getBoxModel`), `hitTarget` (`elementFromPoint` at the centre is the target or a descendant), `computed` (subset of `getComputedStyle`), `noOverflow` (`scrollWidth/Height <= clientWidth/Height + tolerance`), `inViewport`. Returns `{pass, checks:[{target,check,pass,expected,actual,delta}], targets:[...]}`; `screenshotOnFail` adds one deterministic capture's path/bytes/checksum |
 | `layout` | `ref?`, `selector?`, `includeOverlaps?: bool` (default true) | every match's viewport `rect`, page-coordinate `box` (`DOM.getBoxModel`), content quad count, scroll size (`scrollWidth/Height` vs `clientWidth/Height`), computed `display`/`visibility`/`opacity`, a z-order hint (`paintIndex`, `zIndex`, `position`, `stackingContext`) and every overlapping pair with its intersection rect and area |
 | `visual` | `action: "save"\|"compare"\|"list"\|"delete"`, `name?: string`, `fullPage?: bool`, `threshold?: number` (per-channel 0..1, default 0.1), `maxDiffPixels?: number`, `maxDiffRatio?: number`, `maskRects?: {x,y,w,h}[]`, `update?: bool`, `antialias?: bool` (default true), `includeAA?: bool` (default false, the inverse), `minDiffCluster?: number` (default 2), `requireEnvironmentMatch?: bool` | deterministic baselines under `GLADIUS_VISUAL_DIR` (default `<cwd>/.gladius/visual`), names sanitised to `[A-Za-z0-9._-]`; each baseline writes a `<name>.meta.json` sidecar (browser, browserMajor, viewport, deviceScaleFactor, url, checksum, createdAt). `compare` diffs the current deterministic capture against the baseline **inside a scratch headless target created with `background:true`** (both PNGs ride in as `data:` URLs and are decoded onto a canvas, so no PNG crate is added) and returns `{pixelsIdentical, passWithinTolerance, pass, diffPixels, totalPixels, ratio, bbox, maxChannelDelta, ignoredPixels, ignoredClusters, baselinePath, diffPath, antialias, minDiffCluster, scratchBackground, environment {match, baseline, current}}`. `pixelsIdentical` is checksum equality (a fact about the bytes); `passWithinTolerance` is the whole predicate; `pass` is an alias of `passWithinTolerance`, always equal to it, and means "within the requested tolerance", never "the images are the same". Anti-aliasing is subtracted by a mechanical rule, but since 0.8.0 the subtraction does not pass by default: `ignoredPixels > 0` fails `passWithinTolerance` unless `allowIgnoredAA:true` is passed explicitly. The rule: a candidate is suppressed only when its 3x3 luminance neighbourhood has ≥32 levels of contrast in **both** images, so a 1 px edge artefact can be subtracted while a 1 px change in a flat fill or a 2x2 block counts. A browser-major / viewport / DSF mismatch raises a `baseline_environment_mismatch` warning (not a failure unless `requireEnvironmentMatch:true`); `update:true` rewrites the PNG and the sidecar |
@@ -199,20 +199,24 @@ raises, focuses or moves a window on any path.
   `--disable-renderer-backgrounding` and
   `--disable-background-timer-throttling` (`chromium_argv`). The selftest
   proves it: with the fixture in a background tab, a capture taken on that
-  tab's own session is byte-identical to the foreground capture and its
+  tab's own session matches the foreground capture and its
   `setInterval` keeps firing (25 ticks in 1.2 s instead of ~0-1).
 - **Deterministic pixels.** `screenshot {deterministic:true}` pins metrics,
-  motion, caret and scrollbars and waits for fonts/images/frames before
-  capturing, then restores every override **and confirms the restore from the
-  page** (bounded poll of viewport/dsf, the freeze stylesheet and
-  `matchMedia`, with one re-apply if the clear did not land): an awaited CDP
-  reply is not proof that the page has applied it. The motion preference is
-  restored to the **engine/host default**, so the guarantee is
+  applies the freeze walk (stylesheet, WAAPI/SMIL/media holds) over the main
+  document, same-process frames and open shadow roots, waits for font STATUS,
+  images and frames before capturing, then restores every override **and
+  confirms the restore from the page** (bounded poll of viewport/dsf, the freeze
+  stylesheet and `matchMedia`, with one re-apply if the clear did not land): an
+  awaited CDP reply is not proof that the page has applied it. The motion
+  preference is restored to the **engine/host default**, so the guarantee is
   "unchanged from the pre-capture value" - a host that asks for reduced motion
   (CI runners disable animations) reports `reduce` again afterwards, and the
   reply says whether the emulation was applied at all
-  (`reducedMotionEmulated`). Two captures of the same page
-  return the same checksum - the assertion the selftest makes.
+  (`reducedMotionEmulated`). Two captures of the same page in the same engine
+  return the same checksum - the assertion the selftest makes - and the reply
+  says whether the capture actually settled (`settled`, `settleTimeouts`).
+  Canvas, WebGL, video *frames* and cross-process iframes are **sampled**: no
+  scroll, no canvas readback, no claim.
 - **Geometry without pixels.** `assert_layout` and `layout` answer "where is
   it / is it really there" from `DOM.getBoxModel` + `Runtime.evaluate`, so a
   layout regression is caught and reported as numbers (`{check, pass,
@@ -276,3 +280,10 @@ Multi-browser support (Chromium-family only), vision/coordinate grounding, PDF g
 fleet/cloud operation, in-server planning or LLM calls, and any dependency on Node.js,
 Python, or Playwright at runtime. Those live in other systems (see RESEARCH.md); gladius is
 the fast local minimum underneath them.
+
+**Sampled, not frozen.** Canvas, WebGL, video *frames*, cross-process iframes and
+below-the-fold content that needs a scroll to exist are outside the freeze. A
+deterministic capture does not scroll, so `loading="lazy"` content below the fold is
+captured unloaded, and it does not touch a canvas or a WebGL surface at all. Where a
+page's pixels come from one of those, the honest word is **sampled**: two captures may
+differ, and nothing in gladius claims otherwise.
