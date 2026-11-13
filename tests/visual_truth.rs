@@ -817,6 +817,7 @@ fn baselines_do_not_default_into_the_cwd() {
         num(&list, "count").is_some() && num(&list, "diffCount").is_some(),
         "list reports its counts: {list}"
     );
+    std::fs::remove_dir_all(&cwd).ok();
     shutdown(c);
 
     // --- (b) the cap refuses growth, typed ---
