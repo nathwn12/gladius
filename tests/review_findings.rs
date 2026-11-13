@@ -345,10 +345,10 @@ fn password_value_masked_in_snapshot() {
     shutdown(c);
 }
 
-/// P2: `allowIgnoredAA:false` must be a real gate, not a helper-only rule.
+/// P2: `allowIgnoredAA` must be a real gate, not a helper-only rule.
 /// A 1x2 px colour change sitting on a high-contrast edge is exactly what the
-/// AA subtraction hides: the default passes with a warning, the strict call
-/// fails and names the 2 ignored pixels.
+/// AA subtraction hides: the default (strict since 0.8.0, S1.2) fails and names
+/// the 2 ignored pixels, and `allowIgnoredAA:true` re-admits the rule.
 #[test]
 fn strict_allow_ignored_aa_fails_a_two_pixel_edge_diff() {
     let dir = std::env::temp_dir().join(format!(
@@ -395,7 +395,12 @@ fn strict_allow_ignored_aa_fails_a_two_pixel_edge_diff() {
     );
     assert!(painted.get("isError").is_none(), "evaluate: {painted}");
 
-    let loose = c.call("visual", json!({"action": "compare", "name": "aa"}));
+    // The AA rule is re-admitted only when asked for explicitly (0.8.0:
+    // strictness is the default, S1.2).
+    let loose = c.call(
+        "visual",
+        json!({"action": "compare", "name": "aa", "allowIgnoredAA": true}),
+    );
     assert!(loose.get("isError").is_none(), "loose compare: {loose}");
     let loose_json: Value = serde_json::from_str(&content_text(&loose)).expect("loose json");
     assert_eq!(

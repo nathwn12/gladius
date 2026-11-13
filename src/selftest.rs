@@ -881,7 +881,7 @@ pub async fn run() -> i32 {
     .await;
     let aa_on = crate::tools::call(
         "visual",
-        &serde_json::json!({"action": "compare", "name": "aa_probe"}),
+        &serde_json::json!({"action": "compare", "name": "aa_probe", "allowIgnoredAA": true}),
         &b,
     )
     .await;

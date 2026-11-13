@@ -285,7 +285,7 @@ pub fn list() -> Value {
              "required": ["elements", "overlaps", "viewport"], "additionalProperties": false},
           "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}}));
         tools.insert(at + 2, json!({"name": "visual", "title": "Visual Baselines",
-          "description": "Deterministic visual-regression baselines under GLADIUS_VISUAL_DIR (default <cwd>/.gladius/visual), names sanitised to [A-Za-z0-9._-]. action save captures a deterministic PNG named <name> plus <name>.meta.json (browser, viewport, deviceScaleFactor, url, checksum, createdAt). compare captures the same deterministic shot and diffs it against the baseline in a scratch headless target created with background:true (the engine decodes both PNGs onto a canvas - no new runtime dependency), returning pass, diffPixels, totalPixels, ratio, bbox, maxChannelDelta, baselinePath, diffPath and environment {match, baseline, current}; a browser-major, viewport or deviceScaleFactor mismatch adds a baseline_environment_mismatch warning (not a failure unless requireEnvironmentMatch:true). Anti-aliasing is ignored by default with a deterministic rule: a candidate whose 3x3 luminance neighbourhood has >=32 levels of contrast in BOTH images is suppressed when its 4-connected component is no larger than minDiffCluster (default 2); the threshold is never raised for tolerance. antialias (default true) and includeAA (default false) are inverses. threshold is a per-channel fraction of the 0-255 range (default 0.1), maxDiffPixels/maxDiffRatio set the pass bar (default 0/0), maskRects skip regions; update:true rewrites the baseline and its sidecar; list and delete manage them. compare opens and closes one scratch target on the connected engine, always created with background:true so it never activates (on an external attach that is a real extra tab for a moment); an engine that refuses a background target is refused with a typed scratch_background_unsupported error, never retried in the foreground. Headless + CDP only: no OS input, no window.",
+          "description": "Deterministic visual-regression baselines under GLADIUS_VISUAL_DIR (default <cwd>/.gladius/visual), names sanitised to [A-Za-z0-9._-]. action save captures a deterministic PNG named <name> plus <name>.meta.json (browser, viewport, deviceScaleFactor, url, checksum, createdAt). compare captures the same deterministic shot and diffs it against the baseline in a scratch headless target created with background:true (the engine decodes both PNGs onto a canvas - no new runtime dependency), returning two separate verdicts plus the numbers: pixelsIdentical (checksum == baselineChecksum, a fact about the bytes, never a judgement) and passWithinTolerance (the whole predicate: no size mismatch, diffPixels/maxDiffPixels, ratio/maxDiffRatio, ignoredPixels when allowIgnoredAA is off, and environment.match when requireEnvironmentMatch is on). pass is an ALIAS of passWithinTolerance, always equal to it, kept for 0.7.x clients; it means 'the diff is within the requested tolerance', never 'the images are the same'. Also returned: diffPixels, totalPixels, ratio, bbox, maxChannelDelta, baselinePath, diffPath and environment {match, baseline, current}; a browser-major, viewport or deviceScaleFactor mismatch adds a baseline_environment_mismatch warning (not a failure unless requireEnvironmentMatch:true). Anti-aliasing is subtracted by a deterministic rule - a candidate whose 3x3 luminance neighbourhood has >=32 levels of contrast in BOTH images is suppressed when its 4-connected component is no larger than minDiffCluster (default 2) - and that subtraction does NOT pass by default: allowIgnoredAA:true is the explicit opt-in that re-admits it, and the warning always names the count and the flag. The threshold is never raised for tolerance. antialias (default true) and includeAA (default false) are inverses. threshold is a per-channel fraction of the 0-255 range (default 0.1), maxDiffPixels/maxDiffRatio set the pass bar (default 0/0), maskRects skip regions; update:true rewrites the baseline and its sidecar; list and delete manage them. compare opens and closes one scratch target on the connected engine, always created with background:true so it never activates (on an external attach that is a real extra tab for a moment); an engine that refuses a background target is refused with a typed scratch_background_unsupported error, never retried in the foreground. Headless + CDP only: no OS input, no window.",
           "inputSchema": {"type": "object", "properties": {
               "action": {"type": "string", "enum": ["save", "compare", "list", "delete"]},
               "name": {"type": "string"}, "fullPage": {"type": "boolean"},
@@ -304,7 +304,12 @@ pub fn list() -> Value {
               "required": ["action"], "additionalProperties": false},
           "outputSchema": {"type": "object",
              "properties": {"ok": {"type": "boolean"}, "action": {"type": "string"},
-                 "name": {"type": "string"}, "pass": {"type": "boolean"}, "updated": {"type": "boolean"},
+                 "name": {"type": "string"},
+                 // The two questions, then the 0.7.x alias that can only ever
+                 // equal the second.
+                 "pixelsIdentical": {"type": "boolean"},
+                 "passWithinTolerance": {"type": "boolean"},
+                 "pass": {"type": "boolean"}, "updated": {"type": "boolean"},
                  "diffPixels": {"type": "integer"}, "totalPixels": {"type": "integer"},
                  "ratio": {"type": "number"},
                  // `null` in the documented cases: bbox only exists when
@@ -2632,7 +2637,7 @@ async fn tool_visual(browser: &Browser, args: &Value) -> Result<Value, ToolErr> 
                 allow_ignored_aa: args
                     .get("allowIgnoredAA")
                     .and_then(|v| v.as_bool())
-                    .unwrap_or(true),
+                    .unwrap_or(false),
             };
             // A per-channel threshold is a 0..1 fraction; a value outside
             // that range would silently compare nothing (or everything), so

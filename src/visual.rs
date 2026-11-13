@@ -25,7 +25,7 @@
 //! Counting every channel delta above a threshold makes a baseline fail on
 //! sub-pixel rasterisation noise, so the diff follows the prior art
 //! (the pixelmatch-family `includeAA:false` default, Chromatic, odiff) and
-//! ignores anti-aliasing by default. The rule is deliberately mechanical:
+//! knows how to ignore anti-aliasing. The rule is deliberately mechanical:
 //!
 //! 1. A pixel is a *candidate* when its largest channel delta exceeds
 //!    `threshold` (unchanged) and it is not inside a `maskRects` region.
@@ -37,10 +37,16 @@
 //!    it is AA-eligible, and it is no larger than `minDiffCluster` (default
 //!    2). Everything else counts.
 //!
-//! That is why a 1 px edge artefact passes while a 1 px colour change in a
-//! flat area fails (the baseline neighbourhood there has no contrast, so the
-//! pixel is not AA-eligible) and a 2x2 change fails (a 4-pixel component is
-//! larger than the minimum). The threshold is never raised to buy tolerance.
+//! That is why a 1 px edge artefact can be subtracted while a 1 px colour
+//! change in a flat area is not (the baseline neighbourhood there has no
+//! contrast, so the pixel is not AA-eligible) and a 2x2 change fails (a
+//! 4-pixel component is larger than the minimum). The threshold is never
+//! raised to buy tolerance.
+//!
+//! Since 0.8.0 the subtraction does not buy a PASS by default: `passWithinTolerance`
+//! is false while `ignoredPixels > 0` unless the caller passes
+//! `allowIgnoredAA:true`. Strictness is the default; the escape hatch is
+//! explicit and always announced in `warning`.
 //!
 //! ## Baseline environment metadata (browser-update rot)
 //!
@@ -478,8 +484,9 @@ pub struct DiffOpts {
     pub antialias: bool,
     pub min_diff_cluster: i64,
     pub require_environment_match: bool,
-    /// When false, a compare passes only if NO anti-aliased component was
-    /// subtracted (`ignored_pixels == 0`).
+    /// When false (the default since 0.8.0), a compare passes only if NO
+    /// anti-aliased component was subtracted (`ignored_pixels == 0`).
+    /// `allowIgnoredAA:true` re-admits the AA rule explicitly.
     pub allow_ignored_aa: bool,
 }
 
@@ -495,7 +502,7 @@ impl Default for DiffOpts {
             antialias: true,
             min_diff_cluster: 2,
             require_environment_match: false,
-            allow_ignored_aa: true,
+            allow_ignored_aa: false,
         }
     }
 }
@@ -943,21 +950,22 @@ pub async fn png_diff(
 
 /// Diff the current deterministic capture against the stored baseline, and
 /// check the recorded environment.
-/// True when the AA subtraction may still count as a pass. With
-/// `allow_ignored_aa:false` the caller demands a zero-ignored diff, which is
-/// the only way to catch a 1-2 px edge change the AA rule subtracts.
+/// True when the AA subtraction may still count as a pass. `allow_ignored_aa`
+/// is FALSE by default since 0.8.0, so strictness is the default and
+/// `allowIgnoredAA:true` is the explicit opt-in that re-admits the rule.
 fn aa_tolerated(ignored_pixels: i64, allow_ignored_aa: bool) -> bool {
     allow_ignored_aa || ignored_pixels == 0
 }
 
 /// Warning text whenever the AA rule subtracted pixels: a pass is never
-/// silently explained away.
+/// silently explained away, and the flag that decides whether those pixels
+/// count is named as it currently stands.
 fn aa_warning(ignored_pixels: i64, ignored_clusters: i64) -> Option<String> {
     if ignored_pixels <= 0 {
         return None;
     }
     Some(format!(
-        "ignored_antialiasing: {ignored_pixels} pixel(s) in {ignored_clusters} cluster(s) were subtracted as anti-aliasing; a 1-2 px edge change can hide there (set allowIgnoredAA:false to require a zero-ignored diff)"
+        "ignored_antialiasing: {ignored_pixels} pixel(s) in {ignored_clusters} cluster(s) were subtracted as anti-aliasing; a 1-2 px edge change can hide there (allowIgnoredAA:false is the default, so they fail the compare; pass allowIgnoredAA:true to re-admit the AA rule)"
     ))
 }
 
@@ -1005,8 +1013,12 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
     if opts.update {
         write_png(&base, &cap.bytes)?;
         write_json(&meta_path(&safe), &current_env.to_json())?;
+        // The baseline on disk IS this capture now, so the identity pair is
+        // stated about the file that was just written: same checksum, same
+        // bytes, within any tolerance by construction.
         return Ok(json!({
-            "ok": true, "action": "compare", "name": safe, "updated": true, "pass": true,
+            "ok": true, "action": "compare", "name": safe, "updated": true,
+            "pixelsIdentical": true, "passWithinTolerance": true, "pass": true,
             "baselinePath": base.to_string_lossy(),
             "metaPath": meta_path(&safe).to_string_lossy(),
             "diffPath": Value::Null,
@@ -1016,7 +1028,7 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
             "maxDiffRatio": opts.max_diff_ratio,
             "antialias": opts.antialias, "minDiffCluster": opts.min_diff_cluster,
             "ignoredPixels": 0, "ignoredClusters": 0,
-            "checksum": cap.checksum, "baselineChecksum": baseline_checksum,
+            "checksum": cap.checksum, "baselineChecksum": cap.checksum,
             "viewport": {"width": cap.width, "height": cap.height}, "url": cap.url,
             "sizeMismatch": false,
             "environment": {"match": true, "baseline": current_env.to_json(),
@@ -1085,9 +1097,17 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
         && !diff.size_mismatch
         && diff.diff_pixels <= opts.max_diff_pixels
         && ratio <= opts.max_diff_ratio;
-    let pass = pixel_pass && (env_match || !opts.require_environment_match);
+    // Two questions, two booleans, no summary that can disagree with either:
+    // `pixels_identical` is a fact about the bytes, `pass_within_tolerance` is
+    // the judgement. `pass` is the 0.7.x name and is emitted as the alias, so
+    // it can never say something the judgement does not.
+    let pixels_identical = baseline_checksum == cap.checksum;
+    let pass_within_tolerance = pixel_pass && (env_match || !opts.require_environment_match);
     Ok(json!({
-        "ok": true, "action": "compare", "name": safe, "updated": false, "pass": pass,
+        "ok": true, "action": "compare", "name": safe, "updated": false,
+        "pixelsIdentical": pixels_identical,
+        "passWithinTolerance": pass_within_tolerance,
+        "pass": pass_within_tolerance,
         "baselinePath": base.to_string_lossy(),
         "metaPath": meta_path(&safe).to_string_lossy(),
         "diffPath": match &wrote_diff { Some(p) => json!(p), None => Value::Null },
@@ -1136,14 +1156,19 @@ mod tests {
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
     }
 
-    /// A 1-2 px anti-aliased component can hide a real edge change, so
-    /// `allowIgnoredAA:false` requires a zero-ignored diff; the default keeps
-    /// the historic behaviour and a warning always names what was ignored.
+    /// A 1-2 px anti-aliased component can hide a real edge change, so since
+    /// 0.8.0 the DEFAULT requires a zero-ignored diff and
+    /// `allowIgnoredAA:true` is the explicit opt-in; a warning always names
+    /// what was ignored.
     #[test]
     fn ignored_aa_can_be_made_a_pass_condition() {
         assert!(aa_tolerated(0, false), "zero ignored is a clean pass");
         assert!(!aa_tolerated(2, false), "allowIgnoredAA:false rejects 2 px");
-        assert!(aa_tolerated(2, true), "default still tolerates AA");
+        assert!(aa_tolerated(2, true), "allowIgnoredAA:true admits AA");
+        assert!(
+            !DiffOpts::default().allow_ignored_aa,
+            "strictness is the default, not the opt-in"
+        );
         assert!(aa_warning(0, 0).is_none(), "no ignored pixels, no warning");
         let w = aa_warning(2, 1).expect("warning names the subtraction");
         assert!(w.contains("2 pixel(s)") && w.contains("allowIgnoredAA:false"));
