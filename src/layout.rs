@@ -215,6 +215,15 @@ async fn resolve(browser: &Browser, tool: &str, specs: &[Spec]) -> Result<Vec<No
             .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
             .unwrap_or_default();
         let many = ids.len() > 1;
+        if ids.is_empty() {
+            // Zero matches from the page realm is not proof of absence: a
+            // closed shadow root is invisible to `querySelectorAll`, and
+            // reporting `exists:false` for an element that IS there is the
+            // lie S2.5 removes.
+            if crate::tools::closed_shadow_hit(browser, &selector).await {
+                return Err(crate::tools::shadow_closed(tool, &spec.label()));
+            }
+        }
         for (i, id) in ids.into_iter().enumerate() {
             out.push(Node {
                 label: if many {

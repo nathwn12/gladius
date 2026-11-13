@@ -1,0 +1,29 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>closed shadow root fixture</title>
+<style>body { margin: 8px; font: 16px monospace; }</style>
+</head>
+<body>
+<p id="outside">GLADIUS_CLOSED_SHADOW_FIXTURE</p>
+<div id="host"></div>
+<script>
+  // A CLOSED shadow root: the page realm cannot see into it, so
+  // document.querySelector('#inner') can never match, while the
+  // accessibility tree (and therefore an AX `@eN` ref) still does.
+  var host = document.getElementById('host');
+  var root = host.attachShadow({ mode: 'closed' });
+  root.innerHTML = '<button id="inner" style="width:120px;height:40px">CLOSED_INNER_OK</button>';
+  root.getElementById('inner').addEventListener('click', function () {
+    window.__closedClicks = (window.__closedClicks || 0) + 1;
+  });
+  // An OPEN shadow root next to it, as the contrast case: that one IS
+  // reachable through the AX ref path and is not a closed-root answer.
+  var openHost = document.createElement('div');
+  document.body.appendChild(openHost);
+  var openRoot = openHost.attachShadow({ mode: 'open' });
+  openRoot.innerHTML = '<button id="openinner" style="width:120px;height:40px">OPEN_INNER_OK</button>';
+</script>
+</body>
+</html>

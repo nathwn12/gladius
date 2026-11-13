@@ -442,6 +442,7 @@ impl From<String> for ToolErr {
 ///   capability_gated reason dom_only                         (+ tool)
 ///   target_changed   reason raced                             (+ tool, before, after)
 ///   engine_dead      reason respawn_failed|transport          (+ tool)
+///   shadow_closed    reason unreachable                       (+ tool, element)
 ///   timeout          reason budget_exceeded                   (+ tool)
 ///   invalid_args     reason missing_arg|bad_value|bad_index|unknown_action|unknown_tool|need_option|unknown_arg (+ tool, arg?)
 ///   error            fallback, code only (cdp/js-engine failures and anything untyped)
@@ -2706,6 +2707,87 @@ async fn tool_visual(browser: &Browser, args: &Value) -> Result<Value, ToolErr> 
     }
 }
 
+/// Does `selector` resolve inside a CLOSED shadow root?
+///
+/// Ground truth from the DOM domain, never a guess: `DOM.getDocument
+/// {pierce:true}` exposes closed shadow roots (the page realm cannot see
+/// them, so `document.querySelector` can never match), and `DOM.querySelector`
+/// accepts a shadow-root nodeId. Read-only, and only run on a MISS, so a real
+/// page pays nothing.
+///
+/// `true` means the element EXISTS and the page realm cannot reach it - a
+/// different answer from "not found", which is the lie S2.5 removes.
+pub(crate) async fn closed_shadow_hit(browser: &Browser, selector: &str) -> bool {
+    let doc = match browser
+        .command(
+            "DOM.getDocument",
+            json!({"depth": -1, "pierce": true}),
+            true,
+        )
+        .await
+    {
+        Ok(d) => d,
+        Err(_) => return false, // any doubt keeps the old answer
+    };
+    let mut roots: Vec<i64> = Vec::new();
+    collect_closed_roots(doc.get("root"), &mut roots);
+    for node_id in roots {
+        let r = match browser
+            .command(
+                "DOM.querySelector",
+                json!({"nodeId": node_id, "selector": selector}),
+                true,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if r.get("nodeId").and_then(|v| v.as_i64()).unwrap_or(0) > 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Collect the nodeId of every `shadowRootType:"closed"` shadow root in a
+/// `DOM.getDocument {pierce:true}` tree (nested closed roots included).
+fn collect_closed_roots(node: Option<&Value>, out: &mut Vec<i64>) {
+    let Some(n) = node else {
+        return;
+    };
+    if let Some(roots) = n.get("shadowRoots").and_then(|v| v.as_array()) {
+        for r in roots {
+            if r.get("shadowRootType").and_then(|t| t.as_str()) == Some("closed") {
+                if let Some(id) = r.get("nodeId").and_then(|v| v.as_i64()) {
+                    out.push(id);
+                }
+            }
+            collect_closed_roots(Some(r), out);
+        }
+    }
+    if let Some(kids) = n.get("children").and_then(|v| v.as_array()) {
+        for k in kids {
+            collect_closed_roots(Some(k), out);
+        }
+    }
+}
+
+/// `shadow_closed`/`unreachable` (S2.5): the element exists inside a closed
+/// shadow root, which no selector can pierce. The prose names the one lever
+/// that works - the AX `@eN` ref from `snapshot` - instead of pretending the
+/// element is absent.
+pub(crate) fn shadow_closed(tool: &str, selector: &str) -> ToolErr {
+    ToolErr::typed(
+        format!(
+            "{tool}: '{selector}' is inside a closed shadow root; the AX @eN ref from \
+             `snapshot` is the only path that can reach it (no selector syntax can pierce \
+             a closed root)"
+        ),
+        json!({"code": "shadow_closed", "reason": "unreachable", "tool": tool, "element": selector}),
+    )
+}
+
 /// Main-frame click preflight (shared by the ref and selector paths): resolve,
 /// visibility/disabled checks (as before), `scrollIntoView`, rect center, then
 /// a `document.elementFromPoint(cx, cy)` hit-test. The hit element must be the
@@ -2892,10 +2974,16 @@ async fn tool_click(
             click_settle(browser, &st).await;
             Ok(click_ok(browser).await)
         }
-        Some("GLADIUS_NOTFOUND") => Err(ToolErr::typed(
-            format!("click: element not found: {element}"),
-            json!({"code": "invalid_target", "reason": "not_found", "tool": "click", "element": element}),
-        )),
+        Some("GLADIUS_NOTFOUND") => {
+            // The element may exist where no selector can look (S2.5).
+            if closed_shadow_hit(browser, element).await {
+                return Err(shadow_closed("click", element));
+            }
+            Err(ToolErr::typed(
+                format!("click: element not found: {element}"),
+                json!({"code": "invalid_target", "reason": "not_found", "tool": "click", "element": element}),
+            ))
+        }
         Some("GLADIUS_DISABLED") => Err(ToolErr::typed(
             format!("click: element is disabled: {element}"),
             json!({"code": "not_actionable", "reason": "disabled", "tool": "click", "element": element}),
@@ -3298,6 +3386,16 @@ async fn tool_type(
                 "type",
                 kind,
                 &json!({"element": element}),
+            ));
+        }
+        Some("GLADIUS_NOTFOUND") => {
+            // The element may exist where no selector can look (S2.5).
+            if closed_shadow_hit(browser, element).await {
+                return Err(shadow_closed("type", element));
+            }
+            return Err(ToolErr::typed(
+                format!("type: element not found: {element}"),
+                json!({"code": "invalid_target", "reason": "not_found", "tool": "type", "element": element}),
             ));
         }
         _ => {
@@ -3946,6 +4044,10 @@ async fn tool_hover(
     );
     let v = browser.eval(&expr).await?;
     if v.as_str() == Some("GLADIUS_NOTFOUND") {
+        // The element may exist where no selector can look (S2.5).
+        if closed_shadow_hit(browser, element).await {
+            return Err(shadow_closed("hover", element));
+        }
         return Err(ToolErr::typed(
             format!("hover: element not found: {element}"),
             json!({"code": "invalid_target", "reason": "not_found", "tool": "hover", "element": element}),
@@ -4090,10 +4192,16 @@ async fn tool_select(
     let v = browser.eval(&expr).await?;
     match v.as_str() {
         Some("GLADIUS_OK") => Ok(ok_text(json!({"ok": true}).to_string())),
-        Some("GLADIUS_NOTFOUND") => Err(ToolErr::typed(
-            format!("select: element not found: {element}"),
-            json!({"code": "invalid_target", "reason": "not_found", "tool": "select", "element": element}),
-        )),
+        Some("GLADIUS_NOTFOUND") => {
+            // The element may exist where no selector can look (S2.5).
+            if closed_shadow_hit(browser, element).await {
+                return Err(shadow_closed("select", element));
+            }
+            Err(ToolErr::typed(
+                format!("select: element not found: {element}"),
+                json!({"code": "invalid_target", "reason": "not_found", "tool": "select", "element": element}),
+            ))
+        }
         Some("GLADIUS_NOTSELECT") => Err(ToolErr::typed(
             format!("select: element is not a <select>: {element}"),
             json!({"code": "invalid_target", "reason": "not_select", "tool": "select", "element": element}),

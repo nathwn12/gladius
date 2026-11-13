@@ -1440,6 +1440,91 @@ pub async fn run() -> i32 {
     )
     .await;
 
+    // Closed shadow root (S2.5): the ground truth is whatever this engine
+    // does, recorded rather than assumed. The fixture's button lives in a
+    // `mode:"closed"` root, which no selector can pierce; the AX `@eN` ref
+    // either reaches it or the engine proves it unreachable.
+    {
+        let sp = dir.path().join("shadow-closed.html");
+        match std::fs::write(&sp, SHADOW_CLOSED_HTML) {
+            Ok(()) => {
+                let surl = format!("file:///{}", sp.to_string_lossy().replace('\\', "/"));
+                let nav =
+                    crate::tools::call("navigate", &serde_json::json!({"url": surl}), &b).await;
+                let sel =
+                    crate::tools::call("click", &serde_json::json!({"element": "#inner"}), &b)
+                        .await;
+                let sel_code = sel
+                    .get("structuredContent")
+                    .and_then(|s| s.get("code"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+                check(
+                    "shadow-closed-typed",
+                    nav.get("isError").is_none() && sel_code == "shadow_closed",
+                    &format!("selector answer code={sel_code:?}"),
+                );
+                let snap =
+                    content_text(&crate::tools::call("snapshot", &serde_json::json!({}), &b).await);
+                let reference = snap
+                    .lines()
+                    .find(|l| l.contains("CLOSED_INNER_OK"))
+                    .and_then(|line| line.find('@').map(|i| (line, i)))
+                    .map(|(line, i)| {
+                        let rest = &line[i + 1..];
+                        let end = rest
+                            .find(|c: char| !c.is_ascii_alphanumeric())
+                            .unwrap_or(rest.len());
+                        rest[..end].to_string()
+                    });
+                match reference {
+                    Some(r) => {
+                        let by_ref = crate::tools::call(
+                            "click",
+                            &serde_json::json!({"element": format!("@{r}")}),
+                            &b,
+                        )
+                        .await;
+                        if by_ref.get("isError").is_none() {
+                            let n = crate::tools::call(
+                                "evaluate",
+                                &serde_json::json!({"expression": "window.__closedClicks"}),
+                                &b,
+                            )
+                            .await;
+                            let clicked = content_text(&n).contains('1');
+                            check(
+                                "shadow-closed-ref",
+                                clicked,
+                                &format!("@{r} CLICKS the closed-root button (clicks={clicked})"),
+                            );
+                        } else {
+                            let code = by_ref
+                                .get("structuredContent")
+                                .and_then(|s| s.get("code"))
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("");
+                            check(
+                                "shadow-closed-ref",
+                                code == "shadow_closed",
+                                &format!("@{r} is typed {code:?} (engine proves it unreachable)"),
+                            );
+                        }
+                    }
+                    None => check(
+                        "shadow-closed-ref",
+                        false,
+                        "the AX tree carries no CLOSED_INNER_OK node",
+                    ),
+                }
+            }
+            Err(e) => {
+                check("shadow-closed-typed", false, &format!("write fixture: {e}"));
+                check("shadow-closed-ref", false, &format!("write fixture: {e}"));
+            }
+        }
+    }
+
     // close
     let closed = crate::tools::call("close", &serde_json::json!({}), &b).await;
     check(
@@ -1726,6 +1811,26 @@ async fn loopback_server() -> (u16, tokio::task::JoinHandle<()>) {
     });
     (port, h)
 }
+
+/// Closed-shadow-root fixture for the S2.5 selftest checks: a `mode:"closed"`
+/// root, which no selector can pierce, holding one button whose click count
+/// the page exposes. The answer (typed, or reachable by `@eN`) is whatever the
+/// pinned engine does and is reported by the check, never assumed.
+pub const SHADOW_CLOSED_HTML: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>closed shadow</title></head>
+<body style="margin:8px;font:16px monospace">
+<p>GLADIUS_CLOSED_SHADOW_FIXTURE</p>
+<div id="host"></div>
+<script>
+  var host = document.getElementById('host');
+  var root = host.attachShadow({ mode: 'closed' });
+  root.innerHTML = '<button id="inner" style="width:120px;height:40px">CLOSED_INNER_OK</button>';
+  root.getElementById('inner').addEventListener('click', function () {
+    window.__closedClicks = (window.__closedClicks || 0) + 1;
+  });
+</script>
+</body></html>
+"#;
 
 pub const FIXTURE_HTML: &str = r#"<!doctype html>
 <html>

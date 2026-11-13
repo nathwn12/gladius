@@ -300,6 +300,7 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 | First tool call takes seconds | The browser is provisioning or spawning. | Expected once. `--doctor` shows the resolved paths without downloading. |
 | `stale_ref` | The `@eN` ref came from an older `snapshot`, the node was removed, or the page navigated. | Re-run `snapshot` and use the new ref. Shadow-DOM refs are supported. |
 | `not_actionable` | The target is covered by another element or never became clickable. | Close the overlay, scroll it into view, or assert with `assert_layout` first. |
+| `shadow_closed` / `unreachable` | The element lives inside a **closed** shadow root: it exists, but no selector can see into a closed root, so `document.querySelector` cannot match it and `layout` cannot measure it. | Take the `@eN` ref from `snapshot` and use that: the accessibility tree does cross a closed root, and the ref resolves through a backend node id, so `click`/`type`/`hover`/`select`/`assert_layout` all work with it. |
 | `not_editable` | `type` hit a file/date-like or non-editable node. | Use `upload` for file inputs; use `evaluate` for exotic editors. |
 | `capability_gated` / `dom_only` on `screenshot` or `visual` | `GLADIUS_BACKEND_CAPS=dom-only` is set. | Unset it to get the `render` pipeline back. |
 | `scratch_background_unsupported` | The attached engine refuses a background target, so `visual compare` will not open a foreground tab. | Compare against the owned browser instead of your attached engine. |
@@ -327,6 +328,13 @@ rather than the chat - STDOUT belongs to the protocol.
   no focus stealing, no window to raise. This is a guarantee, not a setting.
 - **No attribute-based refs on the AX path.** Refs are backend node ids; only the
   explicit `mode:"legacy"` heuristic still stamps `data-gladius-ref` into the page.
+- **A closed shadow root is reachable by ref, never by selector.** The
+  accessibility tree crosses a closed root, so a `snapshot` `@eN` ref resolves
+  there and every action tool works with it; no selector does, so a selector
+  aimed inside a closed root is a typed `shadow_closed`/`unreachable` (with the
+  `@eN` lever in the prose), never a `not_found` that reads as "the element is
+  not there". There is deliberately no `>>>`-style piercing syntax: it would
+  promise what `querySelector` cannot do.
 - **No vision or coordinate grounding.** `snapshot` and `@eN` refs are the
   contract; there is no model in the server.
 - **Determinism is scoped, and the docs say so.** The freeze covers the main
