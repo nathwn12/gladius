@@ -817,8 +817,10 @@ fn baselines_do_not_default_into_the_cwd() {
         num(&list, "count").is_some() && num(&list, "diffCount").is_some(),
         "list reports its counts: {list}"
     );
-    std::fs::remove_dir_all(&cwd).ok();
     shutdown(c);
+    // Only after the server exits: on Windows a directory cannot be removed
+    // while it is a live process's working directory.
+    std::fs::remove_dir_all(&cwd).ok();
 
     // --- (b) the cap refuses growth, typed ---
     let dir = scratch("s24-cap");
