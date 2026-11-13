@@ -38,11 +38,27 @@
 //   --check            run the fixture cases; exit 0 only if every one passes.
 //   --repo <dir>       operate on <dir> instead of this script's parent.
 //   --date YYYY-MM-DD  heading date for --changelog (default: UTC today).
-//   --notes-out <path> also write the closed section as release-body markdown.
+//   --notes-out <path> also write the closed section as release-body markdown,
+//                      with the provenance footer (the commit and the
+//                      Cargo.lock digest the release was built from).
+//   --assert-body <p>  refuse a release body that does not name a 40-hex
+//                      commit; --commit <sha> also requires that exact commit.
+//
+// PROVENANCE (S3.4)
+//   The body written by --notes-out ends with a machine-checkable footer:
+//
+//     commit: <40-hex sha>
+//     cargo-lock-sha256: <64-hex digest>
+//
+//   so "which bytes is the user running?" is answerable from the release page
+//   instead of from version-string convention. The release lane runs
+//   `--assert-body dist/release-notes.md --commit $(git rev-parse HEAD)` after
+//   it writes the notes, so a body without the footer cannot be published.
 //
 // No dependencies beyond Node stdlib and git.
 
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -790,6 +806,42 @@ function runCheck() {
       const ok = !got.ok && got.code === "version-mismatch";
       record("refuse-tag-ahead-of-manifests", ok, ok ? "refused version-mismatch" : `got ${got.ok ? got.result.version : got.code}`);
     }
+
+    // S3.4: the release body names the commit it was built from, and the
+    // assertion refuses a body that does not. A body carrying a DIFFERENT
+    // commit is refused too - "some commit" is not the claim.
+    {
+      const commit = "0123456789abcdef0123456789abcdef01234567";
+      const lock = "b".repeat(64);
+      const body = `## [1.0.0]\n\n### Fixed\n\n- something real.\n\n${provenanceFooter(commit, lock)}\n`;
+      const bare = "## [1.0.0]\n\n### Fixed\n\n- something real.\n";
+      const wrong = `commit: ${"f".repeat(40)}\n`;
+      const ok = commitInBody(body) === commit
+        && lockInBody(body) === lock
+        && commitInBody(bare) === null
+        && commitInBody(wrong) !== commit;
+      record("body-carries-commit", ok, ok
+        ? "footer names the commit + lock digest; a bare body and a wrong commit are refused"
+        : `body=${commitInBody(body)} lock=${lockInBody(body)} bare=${commitInBody(bare)}`);
+    }
+
+    // The writer path the lane actually runs: `--changelog --notes-out` on a
+    // fixture whose manifests already carry the derived version. The body it
+    // writes must name THIS commit, and `--assert-body` must accept it - so a
+    // footer dropped from the writer turns --check red.
+    {
+      const dir = makeFixture({ base: "1.0.0", manifestAt: "1.1.0", commits: [{ subject: "feat: thing" }] });
+      fixtures.push(dir);
+      const notes = join(dir, "dist", "release-notes.md");
+      const wrote = runCli(dir, ["--changelog", "--notes-out", notes]);
+      const head = execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      const body = existsSync(notes) ? readFileSync(notes, "utf8") : "";
+      const accepted = runCli(dir, ["--assert-body", notes, "--commit", head]);
+      const ok = wrote.status === 0 && commitInBody(body) === head && accepted.status === 0;
+      record("notes-out-names-commit", ok, ok
+        ? `--notes-out wrote commit ${head.slice(0, 12)}, --assert-body accepted it`
+        : `write=${wrote.status} commitInBody=${commitInBody(body)} head=${head} assert=${accepted.status} ${accepted.stderr.trim().split("\n")[0]}`);
+    }
   } finally {
     for (const dir of fixtures) {
       try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -808,16 +860,49 @@ function runCheck() {
 
 function main(argv) {
   const has = (f) => argv.includes(f);
+  const valueOf = (flag) => {
+    const i = argv.indexOf(flag);
+    return i >= 0 ? argv[i + 1] : null;
+  };
   if (has("--check")) return runCheck();
   if (has("--help") || has("-h")) {
     console.log(readFileSync(fileURLToPath(import.meta.url), "utf8").split("\n").slice(1, 45).join("\n"));
     return 0;
   }
 
-  const valueOf = (flag) => {
-    const i = argv.indexOf(flag);
-    return i >= 0 ? argv[i + 1] : null;
-  };
+  // The gate the release lane runs on the body it just wrote (S3.4): a body
+  // that names no commit, or a commit that is not this release's, is refused.
+  if (has("--assert-body")) {
+    const path = valueOf("--assert-body");
+    if (!path) {
+      console.error("--assert-body needs a path");
+      return 2;
+    }
+    let body;
+    try {
+      body = readFileSync(resolve(path), "utf8");
+    } catch (err) {
+      console.error(`cannot read ${path}: ${err.message}`);
+      return 1;
+    }
+    const got = commitInBody(body);
+    if (!got) {
+      console.error(
+        `refuse: body-without-commit: ${path} carries no 40-hex commit line (a release body must name the commit it was built from)`,
+      );
+      return 1;
+    }
+    const want = valueOf("--commit");
+    if (want && want.trim().toLowerCase() !== got) {
+      console.error(
+        `refuse: body-commit-mismatch: ${path} names ${got}, the release is ${want.trim().toLowerCase()}`,
+      );
+      return 1;
+    }
+    console.log(`body names its commit: ${got}${want ? " (matches the release commit)" : ""}`);
+    return 0;
+  }
+
   const root = valueOf("--repo") ? resolve(valueOf("--repo")) : SELF_ROOT;
   const date = valueOf("--date") ?? new Date().toISOString().slice(0, 10);
   const notesOut = valueOf("--notes-out");
@@ -880,9 +965,31 @@ function main(argv) {
     console.log(`  changelog    ${closed.changed ? closed.reason : `unchanged (${closed.reason})`}`);
     if (notesOut) {
       const section = sectionBody(closed.text, result.version);
+      // Fail closed: a release body without its commit is the defect S3.4
+      // closes, so an unresolvable HEAD refuses instead of writing one.
+      let commit = null;
+      try {
+        commit = headSha(root);
+      } catch {
+        commit = null;
+      }
+      if (!commit) {
+        console.error(
+          "refuse: no-commit: cannot resolve HEAD, and the release body must name the commit it was built from",
+        );
+        return 1;
+      }
+      const lockPath = join(root, FILES.lock);
+      if (!existsSync(lockPath)) {
+        console.error(`refuse: no-lock: ${lockPath} is missing, so the release body cannot name its lock digest`);
+        return 1;
+      }
       mkdirSync(dirname(resolve(notesOut)), { recursive: true });
-      writeFileSync(resolve(notesOut), `${section}\n`);
-      console.log(`  notes        ${notesOut}`);
+      writeFileSync(
+        resolve(notesOut),
+        `${section}\n\n${provenanceFooter(commit, sha256File(lockPath))}\n`,
+      );
+      console.log(`  notes        ${notesOut} (commit ${commit}, lock ${sha256File(lockPath).slice(0, 12)}…)`);
     }
     return 0;
   }
@@ -901,6 +1008,34 @@ function sectionBody(text, version) {
   if (start < 0) return "";
   const end = lines.findIndex((l, i) => i > start && /^##\s+\[/.test(l));
   return lines.slice(start + 1, end < 0 ? lines.length : end).join("\n").trim();
+}
+
+// ------------------------------------------------------- provenance (S3.4)
+//
+// A release body that names only a version is a claim about a string. These
+// two lines make it a claim about bytes: the commit the bundle was built from
+// and the digest of the lockfile that was compiled. They are deliberately
+// machine-readable, because the release lane asserts them before publishing.
+
+const COMMIT_LINE = /^commit: ([0-9a-f]{40})$/m;
+const LOCK_LINE = /^cargo-lock-sha256: ([0-9a-f]{64})$/m;
+
+function provenanceFooter(commit, lockSha) {
+  return ["---", "", `commit: ${commit}`, `cargo-lock-sha256: ${lockSha}`].join("\n");
+}
+
+function commitInBody(body) {
+  const m = COMMIT_LINE.exec(body ?? "");
+  return m ? m[1] : null;
+}
+
+function lockInBody(body) {
+  const m = LOCK_LINE.exec(body ?? "");
+  return m ? m[1] : null;
+}
+
+function sha256File(path) {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
 process.exitCode = main(process.argv.slice(2));

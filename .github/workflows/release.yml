@@ -24,7 +24,11 @@
 #           Google's Chrome-for-Testing endpoint at provision time), closes the
 #           `## [Unreleased]` changelog section AFTER the gate, asserts every
 #           version against the derivation, computes every hash from the REAL
-#           artifacts, and fills npm/engine-manifest.json.
+#           artifacts, and fills npm/engine-manifest.json - including the
+#           commit the bundle was built from. The release body is written with
+#           that commit and the Cargo.lock digest, and asserted to carry them
+#           (S3.4), so "which bytes is the user running?" is answerable from
+#           the release page instead of from version-string convention.
 #   publish (ubuntu-latest) re-derives on the same commit as a provenance
 #           check, skips a tag older than the current release, creates the tag,
 #           creates the current release from those artifacts, publishes npm
@@ -188,6 +192,14 @@ jobs:
       - name: close the changelog section
         shell: bash
         run: node scripts/derive-release.mjs --changelog --notes-out dist/release-notes.md
+      # S3.4: the body the release publishes must name the commit it was built
+      # from, and that commit must be THIS one. The writer puts it there; this
+      # refuses a body that lost it, before anything is tagged or attached.
+      - name: assert the release body names the commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/derive-release.mjs --assert-body dist/release-notes.md --commit "$(git rev-parse HEAD)"
       - name: assemble archives
         shell: pwsh
         run: |
@@ -250,6 +262,13 @@ jobs:
           }
           $man = Get-Content npm/engine-manifest.json -Raw | ConvertFrom-Json
           if ($man.serverVersion -ne $ver) { throw "manifest serverVersion $($man.serverVersion) != derived version $ver" }
+          # 1b. Provenance (S3.4): the manifest names the commit this bundle was
+          # built from, so the launcher's --doctor can report both sides of a
+          # skew instead of comparing version strings alone.
+          $commit = (& git rev-parse HEAD).Trim()
+          if ($commit -notmatch '^[0-9a-f]{40}$') { throw "git rev-parse HEAD gave '$commit', not a 40-hex commit" }
+          $man.commit = $commit
+          Write-Host "manifest commit: $commit"
           # 2. Browser identity drift gate: the npm manifest's browser pin must
           # equal the integrity root scripts/chromium-manifest.json, agree with
           # the pin constants in scripts/fetch-chromium.ps1, and match the

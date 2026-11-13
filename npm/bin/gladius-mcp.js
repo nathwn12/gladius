@@ -54,7 +54,7 @@ const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
-const { spawn } = require('node:child_process');
+const { spawn, execFileSync } = require('node:child_process');
 
 const PKG_DIR = path.dirname(path.dirname(__filename));
 const MANIFEST_PATH = path.join(PKG_DIR, 'engine-manifest.json');
@@ -159,12 +159,42 @@ function resolveBrowserDir(manifest) {
   return { dir: path.join(root, 'gladius', 'chromium', leaf), overridden, notes };
 }
 
+// The built commit of an already-provisioned engine, read from its own
+// `--version` stamp (build.rs embeds it). `null` when no engine is provisioned
+// or the stamp cannot be read: the diagnostic must never fail or hang, so the
+// spawn is bounded and every error is a `null`.
+function engineCommit(runtimeDir, manifest) {
+  if (runtimeDir.startsWith('<unresolvable>')) return null;
+  const exe = path.join(runtimeDir, manifest.runtime.server.name);
+  if (!fs.existsSync(exe)) return null;
+  try {
+    const out = execFileSync(exe, ['--version'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    const m = /\(([0-9a-f]{40})(-dirty)?\)/.exec(out);
+    return m ? m[1] + (m[2] || '') : null;
+  } catch {
+    return null;
+  }
+}
+
 function printDoctor(manifest) {
   const runtime = resolveRuntimeDir(manifest);
   const browser = resolveBrowserDir(manifest);
+  // The built commit, and the engine's own stamp when one is already
+  // provisioned: "which bytes am I running" is a question about both sides,
+  // so the diagnostic names both instead of trusting the version string.
+  const commit = typeof manifest.commit === 'string' && /^[0-9a-f]{40}$/.test(manifest.commit)
+    ? manifest.commit
+    : 'unpublished';
   const report = {
     package: manifest.package,
     serverVersion: manifest.serverVersion,
+    commit,
+    commitSource: 'engine-manifest.json, written by the release workflow from git rev-parse HEAD (the committed value is the unpublished sentinel)',
+    engineCommit: engineCommit(runtime.dir, manifest),
     platform: process.platform,
     node: process.version,
     runtimeCacheDir: runtime.dir,
