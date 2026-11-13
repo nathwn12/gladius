@@ -609,3 +609,137 @@ fn pid_record_without_an_engine_pid_deletes_nothing() {
     shutdown(b);
     let _ = std::fs::remove_dir_all(&temp);
 }
+
+/// A live process whose command line carries `token` as its own argument
+/// (`cmd /c ping ... & rem <token>`: the `rem` keeps the token out of ping's
+/// argv). The record sweep proves ownership from the command line, so the test
+/// must present a real one. The caller kills it.
+fn fake_engine(token: &str) -> Child {
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/c", "ping", "-n", "300", "127.0.0.1", "&", "rem", token])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    cmd.spawn().expect("spawn fake engine")
+}
+
+/// S2.2: the record's authority is one WHOLE `--user-data-dir=<recorded
+/// profile>` argument. A process whose command line merely starts with that
+/// path (`<profile>-suffix`) is a different profile, so neither that process
+/// nor its directory may be touched - while an exact argument match is still
+/// killed and swept.
+#[test]
+fn pid_record_matches_the_profile_argument_exactly() {
+    let temp = private_temp("arg-match");
+    // The recorded profile's name encodes a LIVE pid (this test's), so the
+    // dir-only sweep never touches it: any deletion here is the record path.
+    let own = std::process::id();
+    let suffix_dir = temp.join(format!("gladius-{own}-1-1"));
+    let exact_dir = temp.join(format!("gladius-{own}-2-1"));
+    for d in [&suffix_dir, &exact_dir] {
+        std::fs::create_dir_all(d).expect("create recorded profile dir");
+        std::fs::write(d.join("keep.txt"), "gladius-created profile").expect("create profile file");
+    }
+
+    // Same recorded dir, one character longer on the command line.
+    let mut stray = fake_engine(&format!(
+        "--user-data-dir={}-suffix",
+        suffix_dir.to_string_lossy()
+    ));
+    let stray_pid = stray.id();
+    let mut exact = fake_engine(&format!("--user-data-dir={}", exact_dir.to_string_lossy()));
+    let exact_pid = exact.id();
+    assert!(process_alive(stray_pid), "the stray-profile engine is live");
+    assert!(process_alive(exact_pid), "the exact-profile engine is live");
+
+    let rec_stray = plant_record_at(
+        &temp,
+        u32::MAX,
+        json!({
+            "pid": u32::MAX,
+            "enginePid": stray_pid,
+            "profileDir": suffix_dir.to_string_lossy(),
+            "startedAt": 1,
+        }),
+    );
+    let rec_exact = plant_record_at(
+        &temp,
+        u32::MAX - 1,
+        json!({
+            "pid": u32::MAX - 1,
+            "enginePid": exact_pid,
+            "profileDir": exact_dir.to_string_lossy(),
+            "startedAt": 1,
+        }),
+    );
+
+    let mut b = launch_once_in(&temp);
+
+    // The exact match is reaped (kill, then delete); poll for it so the stray
+    // observations below are made after the sweep has fully run.
+    let mut deadline = 30;
+    while deadline > 0 && (process_alive(exact_pid) || exact_dir.exists()) {
+        std::thread::sleep(Duration::from_millis(500));
+        deadline -= 1;
+    }
+    let stray_alive = process_alive(stray_pid);
+    let stray_dir_kept = suffix_dir.join("keep.txt").is_file();
+    let stray_rec_kept = rec_stray.exists();
+    let exact_dead = !process_alive(exact_pid);
+    let exact_dir_gone = !exact_dir.exists();
+    let exact_rec_gone = !rec_exact.exists();
+
+    // Evidence before assertions: a red run leaves nothing behind.
+    let _ = stray.kill();
+    let _ = exact.kill();
+    kill_tree(stray_pid);
+    kill_tree(exact_pid);
+    let _ = stray.wait();
+    let _ = exact.wait();
+    for p in [&rec_stray, &rec_exact] {
+        let _ = std::fs::remove_file(p);
+    }
+    for d in [&suffix_dir, &exact_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    assert!(
+        stray_alive,
+        "a process whose command line carries --user-data-dir={}-suffix is a different profile and is never killed (pid {stray_pid})",
+        suffix_dir.display()
+    );
+    assert!(
+        stray_dir_kept,
+        "that profile dir is not deleted: {}",
+        suffix_dir.display()
+    );
+    assert!(
+        stray_rec_kept,
+        "doubt leaves the record too: {}",
+        rec_stray.display()
+    );
+    assert!(
+        exact_dead,
+        "an exact --user-data-dir match is still reaped (pid {exact_pid})"
+    );
+    assert!(
+        exact_dir_gone,
+        "an exact match still has its profile swept: {}",
+        exact_dir.display()
+    );
+    assert!(
+        exact_rec_gone,
+        "an exact match still has its record removed: {}",
+        rec_exact.display()
+    );
+
+    let closed = b.call("close", json!({}));
+    assert!(closed.get("isError").is_none(), "close ok: {closed}");
+    shutdown(b);
+    let _ = std::fs::remove_dir_all(&temp);
+}

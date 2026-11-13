@@ -4150,7 +4150,7 @@ async fn sweep_stale_records() {
             .as_deref()
             .map(|dir| {
                 process_cmdline(ep)
-                    .map(|cl| cl.contains(&format!("--user-data-dir={dir}")))
+                    .map(|cl| cmdline_names_profile(&cl, dir))
                     .unwrap_or(false)
             })
             .unwrap_or(false);
@@ -4217,6 +4217,54 @@ fn process_cmdline(pid: u32) -> Option<String> {
 #[cfg(not(windows))]
 fn process_cmdline(_pid: u32) -> Option<String> {
     None
+}
+
+/// True when `cl` carries `--user-data-dir=<dir>` as an argument of its own.
+/// The record's authority is one WHOLE switch: a longer path that merely begins
+/// with `<dir>` (`<dir>-suffix`, `<dir>.bak`) names a different browser, so it
+/// is not ours and neither it nor the recorded dir is touched. A command line
+/// that cannot be split into arguments (an unterminated quote) is doubt, so
+/// nothing is ours there either.
+fn cmdline_names_profile(cl: &str, dir: &str) -> bool {
+    let want = profile_arg(dir);
+    if want.is_empty() {
+        return false;
+    }
+    let mut tokens: Vec<String> = Vec::new();
+    let mut token = String::new();
+    let mut quoted = false;
+    for c in cl.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+            }
+            c => token.push(c),
+        }
+    }
+    if quoted {
+        return false;
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    tokens
+        .iter()
+        .any(|t| match t.strip_prefix("--user-data-dir=") {
+            Some(v) => profile_arg(v) == want,
+            None => false,
+        })
+}
+
+/// One profile path reduced to the form Chromium is launched with: quotes off,
+/// separators unified, a trailing separator or whitespace dropped. Each of
+/// those still names the same directory, so none of them changes identity.
+fn profile_arg(v: &str) -> String {
+    let v = v.trim().trim_matches('"').replace('/', "\\");
+    v.trim_end_matches(|c: char| c == '\\' || c.is_whitespace())
+        .to_string()
 }
 
 /// Delete `gladius-<pid>-*` profile dirs whose owner gladius pid is dead.
