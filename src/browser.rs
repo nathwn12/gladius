@@ -563,12 +563,15 @@ impl Browser {
     /// Recovery (S2.1): a transport-dead engine is not terminal. The OWNED
     /// engine is relaunched once, lazily, inside the call that finds it dead —
     /// the same `launch()` path a cold start uses. A successful relaunch is
-    /// never a silent retry: `shared()` only hands out the fresh connection,
-    /// and the caller's own command is dispatched once against it (a command
-    /// already in flight failed typed and is not resent). A failed relaunch is
-    /// a typed `engine_dead`/`respawn_failed` whose prose names `close`. An
-    /// ATTACHED engine (`GLADIUS_CDP_URL`) is never relaunched: it is not
-    /// gladius's to restart, so the answer is `engine_dead`/`transport`.
+    /// never a silent retry: the call that found the engine dead returns the
+    /// typed error for what it was doing and is NOT executed against the
+    /// replacement (a mutation is never replayed); the following call works on
+    /// the fresh engine. A failed relaunch is a typed
+    /// `engine_dead`/`respawn_failed` whose prose names `close`, and it spends
+    /// the death's single attempt: no later call may launch again until an
+    /// explicit `close` (the recovery the prose names) re-arms it. An ATTACHED
+    /// engine (`GLADIUS_CDP_URL`) is never relaunched: it is not gladius's to
+    /// restart, so the answer is `engine_dead`/`transport`.
     async fn shared(&self) -> Result<Arc<Shared>, String> {
         // Fast path: a live engine.
         {
@@ -596,47 +599,86 @@ impl Browser {
                 .as_ref()
                 .map(|inner| matches!(&inner.engine, Engine::Owned { .. }))
         };
-        if let Some(owned) = corpse_owned {
-            // Reap the corpse exactly as `close` does (bounded), so its tree,
-            // job cover and private profile never outlive the relaunch.
-            let _ = self.close().await;
-            if !owned {
-                return Err(typed_marker(
+        match corpse_owned {
+            // An attached engine is not gladius's to restart: detach the stale
+            // connection (never kill, never relaunch) and say whose it is.
+            Some(false) => {
+                let _ = self.teardown().await;
+                Err(typed_marker(
                     ToolCode::EngineDead,
                     ToolReason::Transport,
                     "the engine attached with GLADIUS_CDP_URL closed the connection; it is not \
                      gladius's to restart - start it again, call `close` to drop the stale \
                      connection, then retry",
-                ));
+                ))
             }
-            if self.respawn_used.swap(true, Ordering::SeqCst) {
-                return Err(typed_marker(
-                    ToolCode::EngineDead,
-                    ToolReason::RespawnFailed,
-                    "the owned browser died again before it came back; call `close` and retry \
-                     (the next call launches a fresh engine)",
-                ));
-            }
-        }
-        let inner = match launch().await {
-            Ok(inner) => inner,
-            Err(e) => {
-                if corpse_owned.is_some() {
+            // An owned death: reap the corpse exactly as `close` does
+            // (bounded), so its tree, job cover and private profile never
+            // outlive the relaunch, then spend this death's single attempt.
+            Some(true) => {
+                let _ = self.teardown().await;
+                if self.respawn_used.swap(true, Ordering::SeqCst) {
                     return Err(typed_marker(
                         ToolCode::EngineDead,
                         ToolReason::RespawnFailed,
-                        &format!(
-                            "the owned browser did not come back ({e}); call `close` and retry \
-                             (the next call launches a fresh engine)"
-                        ),
+                        "the owned browser died again before it came back; call `close` and \
+                         retry (the next call launches a fresh engine)",
                     ));
                 }
-                return Err(e);
+                eprintln!("[gladius] recovery: relaunching the owned engine (once per death)");
+                let inner = match launch().await {
+                    Ok(inner) => inner,
+                    Err(e) => {
+                        // The attempt is spent: the flag stays set until a
+                        // launch succeeds (or an explicit `close`).
+                        return Err(typed_marker(
+                            ToolCode::EngineDead,
+                            ToolReason::RespawnFailed,
+                            &format!(
+                                "the owned browser did not come back ({e}); call `close` and \
+                                 retry (the next call launches a fresh engine)"
+                            ),
+                        ));
+                    }
+                };
+                // Cleared only by a successful launch: the next death gets its
+                // own single automatic attempt.
+                self.respawn_used.store(false, Ordering::SeqCst);
+                self.install(inner).await;
+                // The relaunch succeeded, and the original call is NOT run
+                // against the replacement: it returns the typed error for what
+                // it was doing. The engine is live again, so the next call
+                // needs no recovery of its own.
+                Err(typed_marker(
+                    ToolCode::EngineDead,
+                    ToolReason::Transport,
+                    "the owned engine died under this call; its single automatic relaunch \
+                     succeeded and this call was not re-sent (a mutation is never replayed) - \
+                     re-issue it against the fresh engine",
+                ))
             }
-        };
-        // Cleared only by a successful launch: the next death gets its own
-        // single automatic attempt.
-        self.respawn_used.store(false, Ordering::SeqCst);
+            // No engine at all: a cold start, or the call after a relaunch
+            // that failed - which may not attempt a second one.
+            None => {
+                if self.respawn_used.load(Ordering::SeqCst) {
+                    return Err(typed_marker(
+                        ToolCode::EngineDead,
+                        ToolReason::RespawnFailed,
+                        "the owned browser did not come back from its single automatic \
+                         relaunch; call `close` and retry (the next call launches a fresh \
+                         engine)",
+                    ));
+                }
+                let inner = launch().await?;
+                self.respawn_used.store(false, Ordering::SeqCst);
+                Ok(self.install(inner).await)
+            }
+        }
+    }
+
+    /// Make `inner` the live connection (its pid for diagnostics, its shared
+    /// handle for the fast path). Returns the handle to hand out.
+    async fn install(&self, inner: Inner) -> Arc<Shared> {
         let shared = inner.shared.clone();
         let owned_pid: Option<u32> = match &inner.engine {
             Engine::Owned { pid, .. } => Some(*pid),
@@ -644,7 +686,7 @@ impl Browser {
         };
         *self.pid.lock().unwrap() = owned_pid;
         *self.state.lock().await = Some(inner);
-        Ok(shared)
+        shared
     }
 
     /// Send a raw CDP command. If `attach` is true, ensure a page session exists
@@ -1440,7 +1482,11 @@ impl Browser {
         Ok(json!({"tabs": tabs, "ok": true}))
     }
 
-    pub async fn close(&self) -> Result<(), String> {
+    /// Tear the current engine down (reap an owned tree, detach an attached
+    /// session) and leave no live connection behind. The one-relaunch-per-death
+    /// flag is NOT touched here: `shared()`'s recovery path reaps through this
+    /// too, and that path must keep its attempt spent.
+    async fn teardown(&self) -> Result<(), String> {
         let inner = self.state.lock().await.take();
         if let Some(inner) = inner {
             let Inner {
@@ -1520,6 +1566,17 @@ impl Browser {
         }
         *self.pid.lock().unwrap() = None;
         Ok(())
+    }
+
+    /// Public close (the `close` tool, EOF, and any caller that gives up on the
+    /// engine). An explicit close ENDS the death episode: the recovery the
+    /// `respawn_failed` prose names - "call `close` and retry (the next call
+    /// launches a fresh engine)" - has to work, so this re-arms the
+    /// one-relaunch-per-death budget. Nothing automatic ever clears it.
+    pub async fn close(&self) -> Result<(), String> {
+        let r = self.teardown().await;
+        self.respawn_used.store(false, Ordering::SeqCst);
+        r
     }
 
     /// Bounded wait for the active page to report `readyState == complete`,
@@ -3948,13 +4005,83 @@ fn test_no_job() -> bool {
         .unwrap_or(false)
 }
 
+/// What an owned-launch record's `profileDir` names, once validated.
+enum RecordedProfile {
+    /// One of our own profile dirs, present: the ONLY path a record may
+    /// authorise deleting.
+    Present(std::path::PathBuf),
+    /// Provably one of our profile dirs that is already gone: nothing to
+    /// delete, so only the record itself is dropped.
+    Absent,
+    /// Anything else - a relative path, another directory, a junction pointing
+    /// out of the root, a name `ProfileDir::create` never makes. A record is
+    /// data read from a file, never a path authority, so doubt deletes nothing.
+    Doubt,
+}
+
+/// Classify a record's `profileDir` against the root gladius actually creates
+/// in: `%TEMP%/gladius-<pid>-<millis>-<n>` (`ProfileDir::create`).
+fn recorded_profile(dir: &str) -> RecordedProfile {
+    let path = std::path::Path::new(dir);
+    if !path.is_absolute() {
+        return RecordedProfile::Doubt;
+    }
+    let ours = |p: &std::path::Path| {
+        p.file_name()
+            .map(|n| {
+                let name = n.to_string_lossy();
+                let mut parts = match name.strip_prefix("gladius-") {
+                    Some(rest) => rest.split('-'),
+                    None => return false,
+                };
+                let (pid, millis, n) = match (parts.next(), parts.next(), parts.next()) {
+                    (Some(a), Some(b), Some(c)) => (a, b, c),
+                    _ => return false,
+                };
+                if parts.next().is_some() {
+                    return false;
+                }
+                let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+                digits(pid) && digits(millis) && digits(n)
+            })
+            .unwrap_or(false)
+    };
+    let root = std::env::temp_dir();
+    if std::fs::symlink_metadata(path).is_err() {
+        // Gone: the lexical test is enough because the only consequence is
+        // dropping the record (never a delete).
+        return if path.parent() == Some(root.as_path()) && ours(path) {
+            RecordedProfile::Absent
+        } else {
+            RecordedProfile::Doubt
+        };
+    }
+    // Canonicalise both sides so `..`, short names and junctions cannot walk
+    // out of the root after the check.
+    let canon = match std::fs::canonicalize(path) {
+        Ok(c) => c,
+        Err(_) => return RecordedProfile::Doubt,
+    };
+    let canon_root = match std::fs::canonicalize(&root) {
+        Ok(r) => r,
+        Err(_) => return RecordedProfile::Doubt,
+    };
+    if canon.parent() != Some(canon_root.as_path()) || !canon.is_dir() || !ours(&canon) {
+        return RecordedProfile::Doubt;
+    }
+    RecordedProfile::Present(canon)
+}
+
 /// Kill-then-sweep for owned-launch records whose owner is provably dead.
 ///
-/// For each `%TEMP%/gladius-<pid>.json` whose owner gladius pid is gone: if
-/// the recorded engine pid is alive AND its command line carries our
-/// `--user-data-dir=<recorded profile>`, terminate that tree (bounded), then
-/// delete the profile dir and the record. Any doubt - an unreadable record, an
-/// unknown command line, a live owner, a pid we cannot check - leaves both
+/// For each `%TEMP%/gladius-<pid>.json` whose owner gladius pid is gone:
+/// deletion requires the recorded engine pid to be **alive** AND its command
+/// line to carry our `--user-data-dir=<recorded profile>`, and the recorded
+/// profile to be one of our own `%TEMP%/gladius-<pid>-*` dirs. Then that tree
+/// is terminated (bounded), the profile dir is deleted and the record removed.
+/// Every other case - an unreadable or malformed record, a missing or dead
+/// `enginePid`, a profile outside the root, an unknown or foreign command
+/// line, a live owner - leaves the process, the directory and the record
 /// alone, exactly as the dir-only sweep is conservative. Runs before the
 /// dir-only sweep, which still covers profiles with no record at all.
 async fn sweep_stale_records() {
@@ -3989,42 +4116,57 @@ async fn sweep_stale_records() {
             .and_then(|v| v.as_u64())
             .filter(|p| *p > 0 && *p <= u32::MAX as u64)
             .map(|p| p as u32);
-        let profile = rec
+        let recorded = rec
             .get("profileDir")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        if let Some(ep) = engine_pid {
-            if owner_alive(ep) {
-                // Only OUR engine, proven by the command line carrying the
-                // exact profile dir we created for it. Anything else - a
-                // reused pid, an unreadable command line - keeps both.
-                let ours = process_cmdline(ep)
-                    .map(|cl| match &profile {
-                        Some(dir) => cl.contains(&format!("--user-data-dir={dir}")),
-                        None => false,
-                    })
-                    .unwrap_or(false);
-                if !ours {
-                    continue;
-                }
-                eprintln!(
-                    "[gladius] sweep: terminating job-less orphan pid {ep} recorded by dead server {owner}"
-                );
-                kill_tree_bounded(ep).await;
+        // The record may only name a profile gladius itself creates: anything
+        // else is not ours to delete, so nothing is touched at all.
+        let profile = match recorded.as_deref().map(recorded_profile) {
+            Some(RecordedProfile::Present(p)) => p,
+            // Our dir, already gone: there is nothing left to delete, so the
+            // record has no authority and goes.
+            Some(RecordedProfile::Absent) => {
+                let _ = std::fs::remove_file(e.path());
+                continue;
             }
+            _ => continue,
+        };
+        // Deletion needs a live engine; without one there is no orphan to kill
+        // and no proof that the dir is free, so both stay. The record has no
+        // authority left, though, and the dir-only sweep below owns the dir.
+        let ep = match engine_pid {
+            Some(ep) => ep,
+            None => continue,
+        };
+        if !owner_alive(ep) {
+            let _ = std::fs::remove_file(e.path());
+            continue;
         }
-        if let Some(dir) = &profile {
-            let path = std::path::Path::new(dir);
-            if std::fs::symlink_metadata(path).is_ok() {
-                eprintln!("[gladius] sweep: removing recorded profile {dir}");
-                if let Err(err) = sweep_profile_dir(path).await {
-                    // The dir survived a bounded sweep: keep the record so the
-                    // next launch can try again instead of losing the only
-                    // authority that names the engine.
-                    eprintln!("[gladius] sweep: {err}");
-                    continue;
-                }
-            }
+        // Only OUR engine, proven by the command line carrying the exact
+        // profile dir we created for it. Anything else - a reused pid, an
+        // unreadable command line - keeps both.
+        let ours = recorded
+            .as_deref()
+            .map(|dir| {
+                process_cmdline(ep)
+                    .map(|cl| cl.contains(&format!("--user-data-dir={dir}")))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !ours {
+            continue;
+        }
+        eprintln!(
+            "[gladius] sweep: terminating job-less orphan pid {ep} recorded by dead server {owner}"
+        );
+        kill_tree_bounded(ep).await;
+        if let Err(err) = sweep_profile_dir(&profile).await {
+            // The dir survived a bounded sweep: keep the record so the next
+            // launch can try again instead of losing the only authority that
+            // names the engine.
+            eprintln!("[gladius] sweep: {err}");
+            continue;
         }
         let _ = std::fs::remove_file(e.path());
     }

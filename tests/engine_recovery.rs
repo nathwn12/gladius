@@ -1,16 +1,24 @@
 //! S2.1: a dead owned engine is recoverable, and says how (SPEC.md §6).
 //!
-//! Kill the owned `chrome-headless-shell` tree under a live server and the
-//! next call must either work on a relaunched engine or fail typed
-//! (`engine_dead`/`respawn_failed`) with prose that names `close` - never a
-//! bare transport prose failure in `code:"error"`.
+//! Kill the owned `chrome-headless-shell` tree under a live server: the call
+//! that finds the engine dead relaunches the *owned* engine **once**, lazily,
+//! inside that call - and is **not** silently retried against the replacement.
+//! It returns the typed error for what it was doing (`engine_dead`, never a
+//! bare transport prose failure in `code:"error"`); the *following* call works
+//! on the fresh engine. A failed relaunch spends the death's single attempt:
+//! the next call cannot launch again, and only an explicit `close` re-arms it.
 
 use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+
+/// One line per *relaunch* attempt (never a cold start): the launch count this
+/// test asserts against.
+const RELAUNCH_LINE: &str = "relaunching the owned engine";
 
 fn fixture_url() -> String {
     let p = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fixture.html");
@@ -24,16 +32,21 @@ struct Client {
     rx: Receiver<String>,
     next_id: i64,
     child: Child,
+    /// Server STDERR (the launch counter lives there).
+    log: PathBuf,
 }
 
 impl Client {
     fn spawn() -> Self {
+        let log =
+            std::env::temp_dir().join(format!("gladius-fix-a-recovery-{}.log", std::process::id()));
+        let stderr = std::fs::File::create(&log).expect("create stderr log");
         let bin = env!("CARGO_BIN_EXE_gladius");
         let mut cmd = Command::new(bin);
         cmd.arg("mcp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(stderr));
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -62,6 +75,7 @@ impl Client {
             rx,
             next_id: 1,
             child,
+            log,
         }
     }
 
@@ -96,6 +110,16 @@ impl Client {
     fn call(&mut self, name: &str, args: Value) -> Value {
         self.result("tools/call", json!({"name": name, "arguments": args}))
     }
+
+    /// Relaunch attempts this server has logged so far. Read after each call
+    /// that could have launched, so a second attempt is caught immediately.
+    fn relaunch_attempts(&self) -> usize {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(RELAUNCH_LINE))
+            .count()
+    }
 }
 
 fn content_text(v: &Value) -> String {
@@ -104,6 +128,20 @@ fn content_text(v: &Value) -> String {
         .and_then(|c| c.get("text"))
         .and_then(|t| t.as_str())
         .unwrap_or("")
+        .to_string()
+}
+
+fn error_code(v: &Value) -> String {
+    v.pointer("/structuredContent/code")
+        .and_then(|c| c.as_str())
+        .unwrap_or("<none>")
+        .to_string()
+}
+
+fn error_reason(v: &Value) -> String {
+    v.pointer("/structuredContent/reason")
+        .and_then(|c| c.as_str())
+        .unwrap_or("<none>")
         .to_string()
 }
 
@@ -162,6 +200,12 @@ fn dead_engine_respawns_once_then_types_the_recovery() {
     a.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     let nav = a.call("navigate", json!({"url": fixture_url()}));
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
+    // A cold start is not a relaunch: the counter starts at zero.
+    assert_eq!(
+        a.relaunch_attempts(),
+        0,
+        "the first launch is a cold start, not a relaunch"
+    );
 
     // The owned engine tree under this server.
     let mut kids: Vec<u32> = engine_parentage()
@@ -188,29 +232,29 @@ fn dead_engine_respawns_once_then_types_the_recovery() {
         kill_tree(*pid);
     }
 
-    // Every call after the kill is either typed `engine_dead` (never a bare
-    // prose failure in `code:"error"`) or works on the relaunched engine.
-    let mut seen: Vec<String> = Vec::new();
-    let mut recovered = false;
-    for _ in 0..25 {
+    // The first call that FINDS the engine dead relaunches it once and returns
+    // typed for what it was doing - the replacement never executes that call.
+    // (The call that first *observes* the death in flight is the one exception
+    // the spec allows: it already failed typed and is not resent, so the
+    // relaunch lands on the next call.)
+    let mut answers: Vec<String> = Vec::new();
+    let mut attempts = 0;
+    let mut reason = String::new();
+    for _ in 0..6 {
         let s = a.call("snapshot", json!({}));
-        if s.get("isError").is_none() {
-            recovered = true;
-            break;
-        }
-        let code = s
-            .pointer("/structuredContent/code")
-            .and_then(|v| v.as_str())
-            .unwrap_or("<none>");
+        attempts = a.relaunch_attempts();
         let prose = content_text(&s);
+        assert!(
+            s.get("isError").is_some(),
+            "the call that finds the engine dead is NOT executed against the \
+             replacement (that would be a silent retry): {s}"
+        );
         assert_eq!(
-            code, "engine_dead",
+            error_code(&s),
+            "engine_dead",
             "a dead engine is typed, never prose-only: {s}"
         );
-        let reason = s
-            .pointer("/structuredContent/reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        reason = error_reason(&s);
         assert!(
             reason == "respawn_failed" || reason == "transport",
             "engine_dead reason is from the closed set: {s}"
@@ -221,24 +265,66 @@ fn dead_engine_respawns_once_then_types_the_recovery() {
                 "the respawn_failed prose names the recovery (`close`): {prose}"
             );
         }
-        seen.push(format!("{reason}: {prose}"));
+        assert!(
+            attempts <= 1,
+            "one death gets at most one relaunch attempt; got {attempts} after: {answers:?} / {prose}"
+        );
+        answers.push(format!("{reason}: {prose}"));
+        if attempts == 1 {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(250));
     }
-    assert!(
-        recovered,
-        "a call after the kill works on the relaunched engine; typed answers seen: {seen:?}"
+    assert_eq!(
+        attempts, 1,
+        "the death got exactly one relaunch attempt; typed answers seen: {answers:?}"
     );
 
-    // The relaunch is a real engine: a navigate and a snapshot work on it.
-    let nav2 = a.call("navigate", json!({"url": fixture_url()}));
-    assert!(
-        nav2.get("isError").is_none(),
-        "navigate works on the relaunched engine: {nav2}"
-    );
+    if reason == "respawn_failed" {
+        // The single attempt failed: the next call must NOT launch again.
+        let s = a.call("snapshot", json!({}));
+        assert!(
+            s.get("isError").is_some(),
+            "a failed relaunch is still typed on the next call: {s}"
+        );
+        assert_eq!(error_reason(&s), "respawn_failed", "{s}");
+        assert_eq!(
+            a.relaunch_attempts(),
+            1,
+            "no second relaunch attempt after a failed one"
+        );
+        // The prose's own recovery: `close`, then the next call launches.
+        let closed = a.call("close", json!({}));
+        assert!(closed.get("isError").is_none(), "close ok: {closed}");
+        let nav2 = a.call("navigate", json!({"url": fixture_url()}));
+        assert!(
+            nav2.get("isError").is_none(),
+            "close then retry launches a fresh engine: {nav2}"
+        );
+        assert_eq!(
+            a.relaunch_attempts(),
+            1,
+            "an explicit close re-arms recovery; the fresh launch is a cold start"
+        );
+    } else {
+        // The single attempt succeeded: the FOLLOWING call works on it.
+        let nav2 = a.call("navigate", json!({"url": fixture_url()}));
+        assert!(
+            nav2.get("isError").is_none(),
+            "the following call works on the relaunched engine: {nav2}"
+        );
+        assert_eq!(
+            a.relaunch_attempts(),
+            1,
+            "the recovered engine serves calls without another relaunch"
+        );
+    }
+
+    // The engine serving calls now is real: it renders the page.
     let snap = a.call("snapshot", json!({}));
     assert!(
         content_text(&snap).contains("GLADIUS_MARKER_hello-12345"),
-        "the relaunched engine renders the page: {}",
+        "the engine renders the page: {}",
         content_text(&snap).chars().take(200).collect::<String>()
     );
 

@@ -327,6 +327,35 @@ fn pid_record(owner_pid: u32) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("gladius-{owner_pid}.json"))
 }
 
+/// Plant an owned-launch record for an owner pid that is provably dead
+/// (`u32::MAX` is not a pid any process can have, so `OpenProcess` refuses it
+/// with `ERROR_INVALID_PARAMETER` and `owner_alive` answers dead).
+fn plant_record_at(temp: &std::path::Path, owner: u32, body: Value) -> std::path::PathBuf {
+    let p = temp.join(format!("gladius-{owner}.json"));
+    std::fs::write(&p, body.to_string()).expect("plant owned-launch record");
+    p
+}
+
+/// A directory gladius never created: a temp dir whose name is not one of its
+/// own `gladius-<pid>-<millis>-<n>` profiles, so neither the record path nor
+/// the dir-only sweep owns it.
+fn planted_victim(temp: &std::path::Path, tag: &str) -> std::path::PathBuf {
+    let dir = temp.join(format!("gladius-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create victim dir");
+    std::fs::write(dir.join("keep.txt"), "not gladius's to delete").expect("create victim file");
+    dir
+}
+
+/// A private temp root for one test: the server sweeps `std::env::temp_dir()`,
+/// so pointing `TEMP`/`TMP` at a dir of this test's own keeps its planted
+/// records invisible to every other test in this binary (and theirs invisible
+/// to it) - the sweeps cannot reap each other's fixtures.
+fn private_temp(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("gladius-fix-a-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create private temp root");
+    dir
+}
+
 /// Kill one process tree (only ever a pid this test observed as its own).
 fn kill_tree(pid: u32) {
     let mut cmd = Command::new("taskkill");
@@ -443,4 +472,140 @@ fn pid_file_reaps_a_jobless_orphan() {
         !pid_record(bpid).exists(),
         "graceful close removes B's own record"
     );
+}
+
+/// Spawn a server whose temp root is `temp` and drive one owned launch, which
+/// is what runs the kill-then-sweep over that root's records.
+fn launch_once_in(temp: &std::path::Path) -> Client {
+    let t = temp.to_string_lossy().into_owned();
+    let mut c = Client::spawn_with_env(&[("TEMP", &t), ("TMP", &t)]);
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+    let nav = c.call("navigate", json!({"url": fixture_url()}));
+    assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
+    c
+}
+
+/// S2.2: a record may only authorise deleting a profile gladius itself
+/// creates (`%TEMP%/gladius-<pid>-<millis>-<n>`). A record naming any other
+/// path - a hand-written one, a corrupted one, one from another tool - must
+/// delete nothing at all, even with a provably dead owner and engine pid.
+#[test]
+fn pid_record_outside_the_profile_root_deletes_nothing() {
+    let temp = private_temp("outside-root");
+    let victim = planted_victim(&temp, "keepme");
+    let owner = u32::MAX;
+    let rec = plant_record_at(
+        &temp,
+        owner,
+        json!({
+            "pid": owner,
+            "enginePid": u32::MAX - 1,
+            "profileDir": victim.to_string_lossy(),
+            "startedAt": 1,
+        }),
+    );
+
+    let mut b = launch_once_in(&temp);
+    let survived = victim.is_dir() && victim.join("keep.txt").is_file();
+    let rec_left = rec.exists();
+    let _ = std::fs::remove_file(&rec);
+    let _ = std::fs::remove_dir_all(&victim);
+
+    assert!(
+        survived,
+        "a record naming a path outside the profile root deletes nothing: {}",
+        victim.display()
+    );
+    assert!(
+        rec_left,
+        "an unprovable record is doubt: the record is kept too ({})",
+        rec.display()
+    );
+
+    let closed = b.call("close", json!({}));
+    assert!(closed.get("isError").is_none(), "close ok: {closed}");
+    shutdown(b);
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
+/// S2.2: a record whose profile dir is already gone has no authority left and
+/// nothing to delete, so the record itself goes - and nothing else is touched.
+/// (This is the behaviour the old dir-first sweep had; it must survive the
+/// path constraint.)
+#[test]
+fn pid_record_with_a_vanished_profile_drops_only_the_record() {
+    let temp = private_temp("vanished-profile");
+    let owner = u32::MAX - 3;
+    let gone = temp.join(format!("gladius-{owner}-1-1")); // never created
+    let rec = plant_record_at(
+        &temp,
+        owner,
+        json!({
+            "pid": owner,
+            "enginePid": u32::MAX - 4,
+            "profileDir": gone.to_string_lossy(),
+            "startedAt": 1,
+        }),
+    );
+
+    let mut b = launch_once_in(&temp);
+    let rec_gone = !rec.exists();
+    let _ = std::fs::remove_file(&rec);
+
+    assert!(
+        rec_gone,
+        "a record whose profile is already gone is dropped: {}",
+        rec.display()
+    );
+    assert!(
+        !gone.exists(),
+        "nothing was created where the record pointed: {}",
+        gone.display()
+    );
+
+    let closed = b.call("close", json!({}));
+    assert!(closed.get("isError").is_none(), "close ok: {closed}");
+    shutdown(b);
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
+/// S2.2: a record without a usable `enginePid` proves nothing, so both the
+/// recorded directory and any process stay alone - deletion needs the engine
+/// alive AND its command line carrying our `--user-data-dir=<record>`.
+#[test]
+fn pid_record_without_an_engine_pid_deletes_nothing() {
+    let temp = private_temp("no-engine-pid");
+    let victim = planted_victim(&temp, "keepme2");
+    let owner = u32::MAX - 2;
+    let rec = plant_record_at(
+        &temp,
+        owner,
+        json!({
+            "pid": owner,
+            "profileDir": victim.to_string_lossy(),
+            "startedAt": 1,
+        }),
+    );
+
+    let mut b = launch_once_in(&temp);
+    let survived = victim.is_dir() && victim.join("keep.txt").is_file();
+    let rec_left = rec.exists();
+    let _ = std::fs::remove_file(&rec);
+    let _ = std::fs::remove_dir_all(&victim);
+
+    assert!(
+        survived,
+        "a record with no engine pid deletes nothing: {}",
+        victim.display()
+    );
+    assert!(
+        rec_left,
+        "a record with no engine pid is doubt: the record is kept too ({})",
+        rec.display()
+    );
+
+    let closed = b.call("close", json!({}));
+    assert!(closed.get("isError").is_none(), "close ok: {closed}");
+    shutdown(b);
+    let _ = std::fs::remove_dir_all(&temp);
 }
