@@ -20,6 +20,13 @@ struct Client {
 
 impl Client {
     fn spawn_with_env(envs: &[(&str, &str)]) -> Self {
+        Self::spawn_full(envs, &[], None)
+    }
+
+    /// Spawn with env overrides, env removals and an optional working
+    /// directory (S2.4 needs an empty cwd and no inherited
+    /// `GLADIUS_VISUAL_DIR`).
+    fn spawn_full(envs: &[(&str, &str)], remove: &[&str], cwd: Option<&std::path::Path>) -> Self {
         let bin = env!("CARGO_BIN_EXE_gladius");
         let mut cmd = Command::new(bin);
         cmd.arg("mcp")
@@ -28,6 +35,12 @@ impl Client {
             .stderr(Stdio::inherit());
         for (k, v) in envs {
             cmd.env(k, v);
+        }
+        for k in remove {
+            cmd.env_remove(k);
+        }
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
         }
         #[cfg(windows)]
         {
@@ -748,6 +761,139 @@ fn environment_fingerprint_names_every_axis() {
         "the mismatch names the axis that differs: {edited}"
     );
 
+    std::fs::remove_dir_all(&dir).ok();
+    shutdown(c);
+}
+
+// --------------------------------------------------------------------- S2.4
+
+/// SPEC.md S2.4: baselines stop landing in the caller's repo, and the store
+/// stops growing without a bound.
+///
+/// (a) With `GLADIUS_VISUAL_DIR` unset and a scratch cwd, `visual list`
+/// reports a directory under `LOCALAPPDATA` and the cwd stays empty; the
+/// reply names the cap (500 by default).
+/// (b) At the cap a NEW save is a typed refusal naming `visual delete` and
+/// `GLADIUS_VISUAL_CAP`; overwriting an existing baseline is still allowed,
+/// because that does not grow the store. The cap is proved at a lowered
+/// value through its documented override: 501 real captures is not a test.
+#[test]
+fn baselines_do_not_default_into_the_cwd() {
+    // --- (a) the default root ---
+    let cwd = scratch("s24-cwd");
+    let mut c = Client::spawn_full(&[], &["GLADIUS_VISUAL_DIR"], Some(&cwd));
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+    let list = c.call_ok("visual", json!({"action": "list"}));
+    let dir = list
+        .get("dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let local = std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA on this host");
+    assert!(
+        dir.to_ascii_lowercase()
+            .starts_with(local.to_ascii_lowercase().as_str()),
+        "the default baseline dir lives under LOCALAPPDATA: {dir} (LOCALAPPDATA={local})"
+    );
+    assert!(
+        dir.to_ascii_lowercase().contains("gladius"),
+        "the default baseline dir is gladius's own: {dir}"
+    );
+    let left: Vec<String> = std::fs::read_dir(&cwd)
+        .expect("read scratch cwd")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "nothing is written into the caller's cwd: {left:?}"
+    );
+    assert_eq!(
+        num(&list, "cap"),
+        Some(500),
+        "the default cap is 500: {list}"
+    );
+    assert!(
+        num(&list, "count").is_some() && num(&list, "diffCount").is_some(),
+        "list reports its counts: {list}"
+    );
+    shutdown(c);
+
+    // --- (b) the cap refuses growth, typed ---
+    let dir = scratch("s24-cap");
+    let vdir = dir.join("visual");
+    std::fs::create_dir_all(&vdir).expect("visual dir");
+    let vdir_s = vdir.to_string_lossy().to_string();
+    let mut c =
+        Client::spawn_with_env(&[("GLADIUS_VISUAL_DIR", &vdir_s), ("GLADIUS_VISUAL_CAP", "2")]);
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+    let page = dir.join("page.html");
+    std::fs::write(
+        &page,
+        "<!doctype html><meta charset=utf-8><title>cap</title>\
+         <body style='margin:0;background:#fff'><p style='font:16px monospace'>cap</p></body>",
+    )
+    .expect("write page");
+    goto(&mut c, &page, 200, 120);
+    c.call_ok("visual", json!({"action": "save", "name": "one"}));
+    c.call_ok("visual", json!({"action": "save", "name": "two"}));
+    let list = c.call_ok("visual", json!({"action": "list"}));
+    assert_eq!(num(&list, "cap"), Some(2), "the cap is reported: {list}");
+    assert_eq!(num(&list, "count"), Some(2), "two baselines stored: {list}");
+
+    // A third baseline is refused, and the refusal names both levers.
+    let refused = c.call("visual", json!({"action": "save", "name": "three"}));
+    assert!(
+        refused.get("isError").is_some(),
+        "the save at the cap is a failure, never a silent eviction: {refused}"
+    );
+    let sc = refused
+        .get("structuredContent")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        sc.get("code").and_then(|v| v.as_str()),
+        Some("invalid_args"),
+        "the cap refusal is typed invalid_args: {refused}"
+    );
+    assert_eq!(
+        sc.get("reason").and_then(|v| v.as_str()),
+        Some("bad_value"),
+        "the cap refusal carries reason bad_value: {refused}"
+    );
+    let prose = content_text(&refused);
+    assert!(
+        prose.contains("visual delete") && prose.contains("GLADIUS_VISUAL_CAP"),
+        "the refusal names the lever (`visual delete` / `GLADIUS_VISUAL_CAP`): {prose}"
+    );
+    assert!(
+        !vdir.join("three.png").exists(),
+        "a refused save writes nothing"
+    );
+    // Overwriting an existing baseline does not grow the store, so it is
+    // still allowed at the cap.
+    c.call_ok("visual", json!({"action": "save", "name": "one"}));
+    let list = c.call_ok("visual", json!({"action": "list"}));
+    assert_eq!(
+        num(&list, "count"),
+        Some(2),
+        "an overwrite keeps the count: {list}"
+    );
+
+    // A compare against the overwritten baseline still works, and its reply
+    // reports the cap alongside the counts.
+    let cmp = c.call_ok("visual", json!({"action": "compare", "name": "one"}));
+    assert_eq!(
+        flag(&cmp, "pixelsIdentical"),
+        Some(true),
+        "the overwritten baseline matches: {cmp}"
+    );
+    let list = c.call_ok("visual", json!({"action": "list"}));
+    assert_eq!(
+        num(&list, "diffCount"),
+        Some(0),
+        "an identical compare writes no diff image: {list}"
+    );
     std::fs::remove_dir_all(&dir).ok();
     shutdown(c);
 }

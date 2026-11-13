@@ -85,14 +85,114 @@ const DIFF_BUDGET: Duration = Duration::from_secs(20);
 /// a local gradient rather than a flat fill.
 const AA_EDGE_CONTRAST: i64 = 32;
 
-/// Baseline root: `GLADIUS_VISUAL_DIR` when set, else `<cwd>/.gladius/visual`.
+/// Baseline root: `GLADIUS_VISUAL_DIR` when set, else `%LOCALAPPDATA%/gladius/
+/// visual` on Windows, else `<cwd>/.gladius/visual` when `LOCALAPPDATA` is
+/// unset (the same fallback discipline the Chromium cache uses).
+///
+/// The default used to be the caller's own repo, which is the bug S2.4 closes:
+/// a capture tool must not write into the tree it is testing.
 pub fn visual_dir() -> PathBuf {
     match std::env::var("GLADIUS_VISUAL_DIR") {
         Ok(v) if !v.trim().is_empty() => PathBuf::from(v.trim()),
-        _ => std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(".gladius")
-            .join("visual"),
+        _ => match std::env::var("LOCALAPPDATA") {
+            Ok(local) if !local.trim().is_empty() => {
+                PathBuf::from(local.trim()).join("gladius").join("visual")
+            }
+            _ => std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".gladius")
+                .join("visual"),
+        },
+    }
+}
+
+/// Baseline cap (S2.4): 500 stored PNGs, and 500 `.diff.png` by-products,
+/// counted separately. `GLADIUS_VISUAL_CAP` overrides both for tests and for
+/// a caller with a smaller disk budget; it never raises the refusal's
+/// meaning, it only moves the number.
+pub fn visual_cap() -> i64 {
+    std::env::var("GLADIUS_VISUAL_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(500)
+}
+
+/// `(baselines, diff by-products)` stored under `dir`. Counted from the file
+/// names, so no sidecar is required to be readable.
+fn store_counts(dir: &std::path::Path) -> (i64, i64) {
+    let mut pngs = 0;
+    let mut diffs = 0;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".diff.png") {
+                diffs += 1;
+            } else if name.ends_with(".png") {
+                pngs += 1;
+            }
+        }
+    }
+    (pngs, diffs)
+}
+
+/// Refuse a save that would grow the store past its cap.
+///
+/// Never a silent eviction: the caller is told the number and both levers
+/// (`visual delete`, `GLADIUS_VISUAL_CAP`). Overwriting a baseline that is
+/// already stored is not growth and is always allowed.
+fn cap_refusal(name: &str) -> Option<ToolErr> {
+    let dir = visual_dir();
+    let cap = visual_cap();
+    let (pngs, _) = store_counts(&dir);
+    if pngs < cap || baseline_path(name).is_file() {
+        return None;
+    }
+    Some(ToolErr::typed(
+        format!(
+            "visual: the store at {} already holds {pngs} baselines and its cap is {cap}; \
+             delete one with `visual delete` (or point GLADIUS_VISUAL_DIR somewhere else, or \
+             raise GLADIUS_VISUAL_CAP) - a save is refused rather than evicting a baseline \
+             silently",
+            dir.display()
+        ),
+        json!({"code": "invalid_args", "reason": "bad_value", "tool": "visual", "arg": "name"}),
+    ))
+}
+
+/// Age out `.diff.png` by-products (oldest first) so the next write keeps the
+/// store under its diff cap. Diff images are the only files eligible: they are
+/// by-products of a compare, never a baseline.
+fn age_out_diffs() {
+    let dir = visual_dir();
+    let cap = visual_cap();
+    let mut diffs: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".diff.png") {
+            continue;
+        }
+        let modified = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        diffs.push((modified, e.path()));
+    }
+    if (diffs.len() as i64) < cap {
+        return;
+    }
+    diffs.sort_by(|a, b| a.0.cmp(&b.0));
+    // Leave room for the write that is about to happen.
+    let excess = diffs.len() as i64 - cap + 1;
+    for (_, path) in diffs.into_iter().take(excess.max(0) as usize) {
+        eprintln!(
+            "[gladius] visual: aging out diff by-product {}",
+            path.display()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -597,8 +697,14 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 // --------------------------------------------------------------- save/list
 
 /// Capture deterministically and store the PNG plus its environment sidecar.
-pub async fn save(browser: &Browser, name: &str, full_page: bool) -> Result<Value, String> {
-    let safe = sanitise_name(name)?;
+///
+/// The cap is checked BEFORE the capture: a refused save costs no capture and
+/// writes nothing (S2.4).
+pub async fn save(browser: &Browser, name: &str, full_page: bool) -> Result<Value, ToolErr> {
+    let safe = sanitise_name(name).map_err(ToolErr::from)?;
+    if let Some(refusal) = cap_refusal(&safe) {
+        return Err(refusal);
+    }
     let cap = capture::capture(
         browser,
         &Options {
@@ -608,12 +714,13 @@ pub async fn save(browser: &Browser, name: &str, full_page: bool) -> Result<Valu
             height: None,
         },
     )
-    .await?;
+    .await
+    .map_err(ToolErr::from)?;
     let path = baseline_path(&safe);
-    write_png(&path, &cap.bytes)?;
+    write_png(&path, &cap.bytes).map_err(ToolErr::from)?;
     let env = current_environment(browser, &cap).await;
     let meta = meta_path(&safe);
-    write_json(&meta, &env.to_json())?;
+    write_json(&meta, &env.to_json()).map_err(ToolErr::from)?;
     Ok(json!({
         "ok": true, "action": "save", "name": safe,
         "path": path.to_string_lossy(),
@@ -671,8 +778,11 @@ pub fn list() -> Result<Value, String> {
             .cmp(b.get("name").and_then(|v| v.as_str()).unwrap_or(""))
     });
     let count = entries.len() as i64;
+    let (_, diff_count) = store_counts(&dir);
     Ok(
-        json!({"ok": true, "action": "list", "dir": dir.to_string_lossy(), "baselines": entries, "count": count}),
+        json!({"ok": true, "action": "list", "dir": dir.to_string_lossy(),
+        "baselines": entries, "count": count, "cap": visual_cap(),
+        "diffCount": diff_count}),
     )
 }
 
@@ -1319,6 +1429,9 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
     let mut wrote_diff: Option<String> = None;
     if let Some(b64) = &diff.diff_png_base64 {
         if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
+            // Diff images are the only by-products: age the oldest out so the
+            // store stays under its own cap (S2.4).
+            age_out_diffs();
             let p = diff_path(&safe);
             if write_png(&p, &bytes).is_ok() {
                 wrote_diff = Some(p.to_string_lossy().to_string());
