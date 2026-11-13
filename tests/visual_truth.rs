@@ -402,3 +402,135 @@ fn mask_coverage_is_reported_and_warns() {
     std::fs::remove_dir_all(&dir).ok();
     shutdown(c);
 }
+
+// --------------------------------------------------------------------- S1.4
+
+/// SPEC.md S1.4 / D3: a settle timeout is a field, not a stderr line.
+///
+/// A loopback server accepts the connection and never answers, so the `<img>`
+/// it serves can never finish. The deterministic capture must still return its
+/// PNG (the pixels are real) while saying plainly that it gave up: `settled`
+/// false and `images` named in `settleTimeouts`.
+#[test]
+fn settle_timeout_is_a_field() {
+    let dir = scratch("settle");
+    let vdir = dir.join("visual");
+    std::fs::create_dir_all(&vdir).expect("visual dir");
+    let vdir_s = vdir.to_string_lossy().to_string();
+
+    // Accept and hold: never write a byte, so the image request hangs.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in listener.incoming().flatten() {
+            held.push(s);
+        }
+    });
+
+    let page = dir.join("slowimg.html");
+    std::fs::write(
+        &page,
+        format!(
+            "<!doctype html><html><body style=\"margin:0;background:#fff\">\
+             <img src=\"http://127.0.0.1:{port}/never.png\" width=\"40\" height=\"40\">\
+             <p>SETTLE_MARKER</p></body></html>"
+        ),
+    )
+    .expect("write settle fixture");
+
+    let mut c = Client::spawn_with_env(&[("GLADIUS_VISUAL_DIR", &vdir_s)]);
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+    goto(&mut c, &page, 400, 300);
+
+    let shot = c.call("screenshot", json!({"deterministic": true}));
+    assert!(shot.get("isError").is_none(), "screenshot: {shot}");
+    let parts = shot
+        .get("content")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let image = parts
+        .iter()
+        .find(|p| p.get("type").and_then(|t| t.as_str()) == Some("image"))
+        .cloned()
+        .unwrap_or_else(|| panic!("the capture still returns its image part: {shot}"));
+    assert!(
+        image
+            .get("data")
+            .and_then(|d| d.as_str())
+            .map(|d| !d.is_empty())
+            .unwrap_or(false),
+        "a lost race does not throw the pixels away: {shot}"
+    );
+    let meta_text = parts
+        .iter()
+        .find(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .and_then(|p| p.get("text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    let meta: Value = serde_json::from_str(meta_text).expect("screenshot meta json");
+    assert_eq!(
+        flag(&meta, "settled"),
+        Some(false),
+        "the reply says the capture did not settle: {meta}"
+    );
+    let timeouts: Vec<String> = meta
+        .get("settleTimeouts")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        timeouts.iter().any(|t| t == "images"),
+        "the lost race names itself: {meta}"
+    );
+
+    // The artifact carries its own honesty: the sidecar records the settle
+    // state, and a compare against an unsettled baseline says so - as a typed
+    // failure under a strict environment gate.
+    let saved = c.call_ok("visual", json!({"action": "save", "name": "unsettled"}));
+    assert_eq!(
+        flag(&saved, "settled"),
+        Some(false),
+        "save reports the settle state it recorded: {saved}"
+    );
+    let sidecar: Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("visual").join("unsettled.meta.json")).expect("sidecar"),
+    )
+    .expect("sidecar json");
+    assert_eq!(
+        flag(&sidecar, "settled"),
+        Some(false),
+        "the sidecar itself says the baseline did not settle: {sidecar}"
+    );
+    let cmp = c.call_ok("visual", json!({"action": "compare", "name": "unsettled"}));
+    let warning = cmp.get("warning").and_then(|w| w.as_str()).unwrap_or("");
+    assert!(
+        warning.contains("baseline_unsettled"),
+        "a compare names an unsettled baseline: {cmp}"
+    );
+    let strict = c.call(
+        "visual",
+        json!({"action": "compare", "name": "unsettled", "requireEnvironmentMatch": true}),
+    );
+    assert!(
+        strict.get("isError").is_some(),
+        "a strict environment gate must not pass on an unsettled baseline: {strict}"
+    );
+    let sc = strict
+        .get("structuredContent")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        sc.get("code").and_then(|c| c.as_str()),
+        Some("baseline_environment_unsettled"),
+        "and the refusal is typed: {strict}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    shutdown(c);
+}

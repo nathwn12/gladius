@@ -74,22 +74,37 @@ fn style_restore_js() -> String {
 const CSS: &str = "*,*::before,*::after{animation:none!important;animation-delay:0s!important;animation-duration:0s!important;animation-iteration-count:1!important;transition:none!important;transition-delay:0s!important;transition-duration:0s!important;caret-color:transparent!important;scroll-behavior:auto!important;overflow-anchor:none!important;}html,body{scrollbar-gutter:auto!important;}::-webkit-scrollbar{width:0!important;height:0!important;display:none!important;}";
 
 /// Fonts + images + two animation frames, every wait bounded.
+///
+/// Each race that loses records its own name, so "the capture settled" is a
+/// fact the reply can carry instead of a stderr line the caller never sees.
+/// The closed set is `fonts`, `images`, `raf` (the outer `SETTLE_CAP` adds
+/// `settleCap` from the Rust side).
 const SETTLE_JS: &str = r#"(() => {
-  const done = (fn) => new Promise((res) => { fn(() => res(true)); });
+  const timeouts = [];
+  const race = (name, ms, wait) => new Promise((resolve) => {
+    let finished = false;
+    const end = (late) => {
+      if (finished) return;
+      finished = true;
+      if (late) timeouts.push(name);
+      resolve(true);
+    };
+    const timer = setTimeout(() => end(true), ms);
+    try { wait(() => { clearTimeout(timer); end(false); }); } catch (e) { clearTimeout(timer); end(false); }
+  });
   return (async () => {
-    try { await Promise.race([document.fonts.ready, done((r) => setTimeout(r, 3000))]); } catch (e) {}
+    await race('fonts', 3000, (ok) => { document.fonts.ready.then(() => ok(), () => ok()); });
     const imgs = Array.prototype.slice.call(document.images || []);
-    await Promise.all(imgs.map((i) => {
-      if (i.complete) return Promise.resolve(true);
-      return Promise.race([
-        done((r) => { i.addEventListener('load', r, {once: true}); i.addEventListener('error', r, {once: true}); }),
-        done((r) => setTimeout(r, 3000))
-      ]);
-    }));
-    const tick = () => Promise.race([done((r) => requestAnimationFrame(() => r(true))), done((r) => setTimeout(r, 250))]);
-    await tick();
-    await tick();
-    return true;
+    for (const i of imgs) {
+      if (i.complete) continue;
+      await race('images', 3000, (ok) => {
+        i.addEventListener('load', () => ok(), {once: true});
+        i.addEventListener('error', () => ok(), {once: true});
+      });
+    }
+    await race('raf', 250, (ok) => requestAnimationFrame(() => ok()));
+    await race('raf', 250, (ok) => requestAnimationFrame(() => ok()));
+    return {settled: timeouts.length === 0, timeouts: timeouts};
   })();
 })()"#;
 
@@ -129,6 +144,13 @@ pub struct Capture {
     /// `chrome-headless-shell`, where the preference stays the host's and only
     /// the freeze stylesheet stops motion.
     pub reduced_motion_emulated: bool,
+    /// Did every settle wait finish inside its budget? `settled ==
+    /// settle_timeouts.is_empty()` by construction: a lost race still returns
+    /// the pixels, only the claim changes.
+    pub settled: bool,
+    /// The closed set of waits that lost: `fonts`, `images`, `raf`, `settleCap`
+    /// (and, after S1.5, `waapi`, `smil`, `media`).
+    pub settle_timeouts: Vec<String>,
 }
 
 impl Capture {
@@ -154,6 +176,10 @@ impl Capture {
                 "reducedMotionEmulated".to_string(),
                 json!(self.reduced_motion_emulated),
             );
+            // The capture states whether it settled. A reply that omitted this
+            // would make "stable" and "gave up waiting" look identical.
+            m.insert("settled".to_string(), json!(self.settled));
+            m.insert("settleTimeouts".to_string(), json!(self.settle_timeouts));
         }
         Value::Object(m)
     }
@@ -348,6 +374,8 @@ fn decode(r: &Value, deterministic: bool) -> Result<Capture, String> {
         url: String::new(),
         deterministic,
         reduced_motion_emulated: false,
+        settled: true,
+        settle_timeouts: Vec::new(),
     })
 }
 
@@ -473,11 +501,33 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
     // Test-only: widen the mutation window so a cancellation test can land
     // inside it deterministically.
     maybe_test_delay().await;
-    if tokio::time::timeout(SETTLE_CAP, browser.eval(SETTLE_JS))
-        .await
-        .is_err()
-    {
-        warn("deterministic capture: settle exceeded its budget (proceeding with the shot)");
+    // Settle, and record which waits lost. The outer budget is the backstop
+    // for a genuinely stuck renderer; when IT fires the reply names
+    // `settleCap` rather than pretending the page was stable.
+    let mut settle_timeouts: Vec<String> = Vec::new();
+    match tokio::time::timeout(SETTLE_CAP, browser.eval(SETTLE_JS)).await {
+        Ok(Ok(v)) => {
+            for t in v
+                .get("timeouts")
+                .and_then(|a| a.as_array())
+                .cloned()
+                .unwrap_or_default()
+            {
+                if let Some(s) = t.as_str() {
+                    settle_timeouts.push(s.to_string());
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            warn(&format!(
+                "deterministic capture: the settle script could not run: {e} (recording settleCap)"
+            ));
+            settle_timeouts.push("settleCap".to_string());
+        }
+        Err(_) => {
+            warn("deterministic capture: settle exceeded its budget (proceeding with the shot)");
+            settle_timeouts.push("settleCap".to_string());
+        }
     }
     let live = live_metrics(browser).await;
     let shot = browser
@@ -545,6 +595,8 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
 
     let mut cap = decode(&shot?, true)?;
     cap.reduced_motion_emulated = media_emulated;
+    cap.settled = settle_timeouts.is_empty();
+    cap.settle_timeouts = settle_timeouts;
     let arr = live.as_array().cloned().unwrap_or_default();
     let num = |i: usize| arr.get(i).and_then(|v| v.as_f64());
     cap.width = num(0).map(|v| v as i64).unwrap_or(width);

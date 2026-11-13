@@ -180,19 +180,37 @@ pub struct EnvMeta {
     pub url: String,
     pub checksum: String,
     pub created_at: String,
+    /// Did the capture that produced this baseline settle? `None` means the
+    /// sidecar is from 0.7.x and records nothing - which is `unknown`, never
+    /// `true`.
+    pub settled: Option<bool>,
+    /// Which settle waits lost, when the sidecar records it.
+    pub settle_timeouts: Option<Vec<String>>,
 }
 
 impl EnvMeta {
     fn to_json(&self) -> Value {
-        json!({
-            "browser": self.browser,
-            "browserMajor": self.browser_major,
-            "viewport": {"width": self.width, "height": self.height},
-            "deviceScaleFactor": self.dsf,
-            "url": self.url,
-            "checksum": self.checksum,
-            "createdAt": self.created_at,
-        })
+        let mut m = serde_json::Map::new();
+        m.insert("browser".to_string(), json!(self.browser));
+        m.insert("browserMajor".to_string(), json!(self.browser_major));
+        m.insert(
+            "viewport".to_string(),
+            json!({"width": self.width, "height": self.height}),
+        );
+        m.insert("deviceScaleFactor".to_string(), json!(self.dsf));
+        m.insert("url".to_string(), json!(self.url));
+        m.insert("checksum".to_string(), json!(self.checksum));
+        m.insert("createdAt".to_string(), json!(self.created_at));
+        // A baseline cannot lie about its own capture: the settle state rides
+        // in the sidecar, so `compare` can report an unsettled baseline even
+        // when the current capture settled perfectly.
+        if let Some(s) = self.settled {
+            m.insert("settled".to_string(), json!(s));
+        }
+        if let Some(t) = &self.settle_timeouts {
+            m.insert("settleTimeouts".to_string(), json!(t));
+        }
+        Value::Object(m)
     }
 
     fn from_json(v: &Value) -> Option<EnvMeta> {
@@ -205,6 +223,14 @@ impl EnvMeta {
             url: v.get("url")?.as_str()?.to_string(),
             checksum: v.get("checksum")?.as_str()?.to_string(),
             created_at: v.get("createdAt")?.as_str()?.to_string(),
+            // Optional by design: a 0.7.x sidecar has neither key, and that is
+            // recorded as unknown rather than assumed settled.
+            settled: v.get("settled").and_then(|s| s.as_bool()),
+            settle_timeouts: v.get("settleTimeouts").and_then(|t| t.as_array()).map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect()
+            }),
         })
     }
 
@@ -333,6 +359,8 @@ async fn current_environment(browser: &Browser, cap: &capture::Capture) -> EnvMe
         url: cap.url.clone(),
         checksum: cap.checksum.clone(),
         created_at: iso8601_now(),
+        settled: Some(cap.settled),
+        settle_timeouts: Some(cap.settle_timeouts.clone()),
     }
 }
 
@@ -396,6 +424,8 @@ pub async fn save(browser: &Browser, name: &str, full_page: bool) -> Result<Valu
         "checksum": cap.checksum,
         "viewport": {"width": cap.width, "height": cap.height},
         "url": cap.url,
+        "settled": cap.settled,
+        "settleTimeouts": cap.settle_timeouts,
         "fullPage": full_page,
         "environment": env.to_json(),
     }))
@@ -418,11 +448,18 @@ pub fn list() -> Result<Value, String> {
                 }
                 let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
                 let name = fname.trim_end_matches(".png").to_string();
+                // The settle state travels with the baseline, so `list` can
+                // report it too; a 0.7.x sidecar has none and stays null.
+                let settled = match read_meta(&name).recorded().and_then(|m| m.settled) {
+                    Some(s) => json!(s),
+                    None => Value::Null,
+                };
                 entries.push(json!({
                     "name": name,
                     "path": p.to_string_lossy(),
                     "bytes": bytes as i64,
                     "meta": meta_path(&name).is_file(),
+                    "settled": settled,
                 }));
             }
         }
@@ -1066,6 +1103,7 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
             "ignoredPixels": 0, "ignoredClusters": 0,
             "checksum": cap.checksum, "baselineChecksum": cap.checksum,
             "viewport": {"width": cap.width, "height": cap.height}, "url": cap.url,
+            "settled": cap.settled, "settleTimeouts": cap.settle_timeouts,
             "sizeMismatch": false,
             "environment": {"match": true, "baseline": current_env.to_json(),
                             "current": current_env.to_json()},
@@ -1096,20 +1134,53 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
     let (env_known, env_match, mut notes) = match meta_state.recorded() {
         Some(b) => {
             let diffs = b.differences(&current_env);
-            if diffs.is_empty() {
-                (true, true, Vec::new())
-            } else {
-                (
-                    true,
-                    false,
-                    vec![format!(
-                        "baseline_environment_mismatch: {} (the baseline was recorded in a \
-                         different environment; re-save it with update:true after confirming \
-                         the change is expected)",
-                        diffs.join("; ")
-                    )],
-                )
+            // An unsettled baseline is not a match: the artifact carries its
+            // own honesty, so a strict gate cannot pass on pixels that were
+            // captured mid-flight. `None` is a 0.7.x sidecar: unknown, never
+            // true.
+            if b.settled == Some(false) && opts.require_environment_match {
+                return Err(ToolErr::typed(
+                    format!(
+                        "visual: baseline_environment_unsettled: the baseline was captured \
+                         unsettled (settleTimeouts: {}) and requireEnvironmentMatch:true needs a \
+                         settled baseline; re-save it with update:true",
+                        b.settle_timeouts
+                            .as_ref()
+                            .map(|t| t.join(", "))
+                            .unwrap_or_else(|| "unknown".to_string())
+                    ),
+                    json!({"code": "baseline_environment_unsettled", "reason": "unsettled",
+                           "tool": "visual", "name": safe,
+                           "settleTimeouts": b.settle_timeouts}),
+                ));
             }
+            let mut out: Vec<String> = Vec::new();
+            if !diffs.is_empty() {
+                out.push(format!(
+                    "baseline_environment_mismatch: {} (the baseline was recorded in a \
+                     different environment; re-save it with update:true after confirming \
+                     the change is expected)",
+                    diffs.join("; ")
+                ));
+            }
+            match b.settled {
+                Some(false) => out.push(format!(
+                    "baseline_unsettled: the baseline was captured before it settled \
+                     (settleTimeouts: {}), so it records a moment that may not repeat",
+                    b.settle_timeouts
+                        .as_ref()
+                        .map(|t| t.join(", "))
+                        .unwrap_or_else(|| "unknown".to_string())
+                )),
+                None => out.push(
+                    "baseline_settle_unknown: the sidecar records no settle state (0.7.x \
+                     baseline), so whether it settled cannot be established; re-save it with \
+                     update:true"
+                        .to_string(),
+                ),
+                Some(true) => {}
+            }
+            (true, diffs.is_empty(), out)
         }
         None => (
             false,
@@ -1197,6 +1268,8 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
         "checksum": cap.checksum,
         "viewport": {"width": cap.width, "height": cap.height},
         "url": cap.url,
+        "settled": cap.settled,
+        "settleTimeouts": cap.settle_timeouts,
         "environment": {
             "match": env_match,
             "known": env_known,
