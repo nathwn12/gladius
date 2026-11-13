@@ -5,8 +5,11 @@
 <title>Gladius freeze fixture</title>
 <style>
   html, body { margin: 0; padding: 0; background: #ffffff; font: 16px/20px sans-serif; }
-  /* A same-process iframe carrying its own CSS spinner: only a walk that
-     reaches into the frame can stop it. */
+  /* A same-process iframe carrying its own CSS animation: only a walk that
+     reaches into the frame can stop it. It SLIDES rather than rotates on
+     purpose - a rotating square is invariant under a quarter turn, so a
+     capture gap that happens to land on a multiple of 90 degrees would hide
+     the motion and a broken freeze would still compare equal. */
   #frame { position: absolute; left: 20px; top: 20px; width: 120px; height: 120px; border: 0; }
   #host { position: absolute; left: 160px; top: 20px; width: 160px; height: 60px; }
   #svgwrap { position: absolute; left: 160px; top: 100px; width: 80px; height: 80px; }
@@ -17,7 +20,7 @@
 </style>
 </head>
 <body>
-<iframe id="frame" srcdoc="<!doctype html><html><head><style>html,body{margin:0;background:#fff}#s{position:absolute;left:20px;top:20px;width:60px;height:60px;background:#c81e1e;animation:sp 500ms linear infinite}@keyframes sp{from{transform:rotate(0)}to{transform:rotate(360deg)}}</style></head><body><div id=s></div></body></html>"></iframe>
+<iframe id="frame" srcdoc="<!doctype html><html><head><style>html,body{margin:0;background:#fff}#s{position:absolute;left:20px;top:20px;width:60px;height:60px;background:#c81e1e;animation:sp 500ms linear infinite}@keyframes sp{from{transform:translateX(0)}to{transform:translateX(30px)}}</style></head><body><div id=s></div></body></html>"></iframe>
 <div id="host"></div>
 <div id="svgwrap">
   <svg width="80" height="80" viewBox="0 0 80 80">

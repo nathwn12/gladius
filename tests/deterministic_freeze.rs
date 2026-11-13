@@ -238,6 +238,74 @@ fn freeze_reaches_shadow_waapi_smil_and_media() {
     shutdown(c);
 }
 
+// --------------------------------------------------------------------- S3.1
+
+/// SPEC.md S3.1: the repo's headline claim - two deterministic captures are
+/// byte-identical - asserted, on a page that is actually moving.
+///
+/// `tests/concurrency.rs` claimed this in a comment and asserted geometry,
+/// DSF and restoration instead, so a freeze that stopped nothing would have
+/// gone red nowhere (L5-1). The fixture is the S1.5 one: a CSS animation in a
+/// same-process frame, a WAAPI animation inside an open shadow root, an SVG
+/// SMIL timeline and a playing `<video>`. Two captures 750 ms apart must carry
+/// the same FNV-1a checksum over the same PNG byte length.
+///
+/// This is the discriminating test the item asks for: with the walk's
+/// animation pause disabled the two checksums differ and this fails (measured;
+/// see the W3 report). The freeze STYLESHEET alone is not the load-bearing
+/// part on this engine - the walk pauses CSS animations through
+/// `getAnimations()`, so emptying the stylesheet leaves the pixels still - but
+/// the frame's animation slides rather than rotates for a related reason: a
+/// rotating square is invariant under a quarter turn, and a capture gap that
+/// lands on a multiple of 90 degrees would hide a broken freeze behind a
+/// symmetry.
+#[test]
+fn two_deterministic_captures_have_equal_checksums() {
+    let mut c = Client::spawn_with_env(&[]);
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+    let nav = c.call("navigate", json!({"url": fixture_url("freeze.html")}));
+    assert!(nav.get("isError").is_none(), "navigate: {nav}");
+    let vp = c.call("viewport", json!({"width": 400, "height": 300}));
+    assert!(vp.get("isError").is_none(), "viewport: {vp}");
+    let ready = c.call(
+        "evaluate",
+        json!({"expression": "new Promise((r) => setTimeout(() => r(window.__freezeReady === true), 300))"}),
+    );
+    assert!(ready.get("isError").is_none(), "evaluate ready: {ready}");
+
+    let first = c.call("screenshot", json!({"deterministic": true}));
+    assert!(first.get("isError").is_none(), "first capture: {first}");
+    let meta1 = shot_meta(&first);
+
+    std::thread::sleep(Duration::from_millis(750));
+
+    let second = c.call("screenshot", json!({"deterministic": true}));
+    assert!(second.get("isError").is_none(), "second capture: {second}");
+    let meta2 = shot_meta(&second);
+
+    let c1 = meta1.get("checksum").and_then(|v| v.as_str()).unwrap_or("");
+    let c2 = meta2.get("checksum").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(!c1.is_empty(), "the capture carries a checksum: {meta1}");
+    assert_eq!(
+        c1, c2,
+        "two deterministic captures 750 ms apart have the same checksum \
+         (a moving page that froze):\nfirst={meta1}\nsecond={meta2}"
+    );
+
+    let b1 = meta1.get("bytes").and_then(|v| v.as_i64());
+    let b2 = meta2.get("bytes").and_then(|v| v.as_i64());
+    assert!(
+        b1.unwrap_or(0) > 0,
+        "the capture reports its PNG byte length: {meta1}"
+    );
+    assert_eq!(
+        b1, b2,
+        "and the same PNG byte length:\nfirst={meta1}\nsecond={meta2}"
+    );
+
+    shutdown(c);
+}
+
 // --------------------------------------------------------------------- S1.6
 
 /// SPEC.md S1.6: the freeze and the measurement agree.

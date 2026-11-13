@@ -824,11 +824,16 @@ fn result_type_preserved_after_dispatch_rewrite() {
 /// navigation at one server and asserts the invariants that only hold when
 /// nothing interleaves:
 ///
-/// - every capture reports the PRE-EXISTING viewport override (900x700), never
-///   the engine default or another capture's temporary geometry;
-/// - the two captures are byte-identical (same pixels, so no torn state);
+/// - every capture reports ITS OWN forced geometry (640x480, 720x540,
+///   900x700), never the engine default or another capture's override, which
+///   is what a torn device-metrics override would look like;
 /// - after everything settles the page still carries the caller's override,
 ///   the freeze stylesheet is gone and emulated reduced-motion is cleared.
+///
+/// Byte identity is deliberately NOT asserted here: the three captures ask for
+/// three different geometries, so their PNGs must differ. The checksum claim is
+/// asserted on a moving page in
+/// `tests/deterministic_freeze.rs::two_deterministic_captures_have_equal_checksums`.
 #[test]
 fn deterministic_capture_serializes_with_navigation() {
     let mut c = Client::spawn();
