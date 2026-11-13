@@ -383,7 +383,7 @@ impl ToolErr {
     pub(crate) fn fallback(prose: String) -> Self {
         Self {
             prose,
-            sc: json!({"code": "error"}),
+            sc: json!({"code": ToolCode::Error.as_str()}),
         }
     }
 
@@ -399,9 +399,14 @@ impl ToolErr {
 /// decided where the failure is known and never re-derived from prose.
 pub(crate) const TYPED_MARKER: &str = "typed:";
 
-/// Mint a marker string for [`TYPED_MARKER`].
-pub(crate) fn typed_marker(code: &str, reason: &str, prose: &str) -> String {
-    format!("{TYPED_MARKER}{code}:{reason}: {prose}")
+/// Mint a marker string for [`TYPED_MARKER`]. The code and reason are enum
+/// variants, so the marker a deep site mints is always one this build knows.
+pub(crate) fn typed_marker(code: ToolCode, reason: ToolReason, prose: &str) -> String {
+    format!(
+        "{TYPED_MARKER}{}:{}: {prose}",
+        code.as_str(),
+        reason.as_str()
+    )
 }
 
 /// `?` on engine calls (`browser.command` / `browser.eval` / serde): those
@@ -410,22 +415,27 @@ pub(crate) fn typed_marker(code: &str, reason: &str, prose: &str) -> String {
 /// by `send_session` (the typed invalid-target the caller retries
 /// explicitly, because the session was dropped without proof of
 /// non-execution, so no silent resend happened), and the `typed:` marker
-/// minted at a deep site (`engine_dead`, the baseline cap).
+/// minted at a deep site (`engine_dead`, `js_error`, the baseline cap). A
+/// marker outside the closed set falls back instead of smuggling a string out.
 impl From<String> for ToolErr {
     fn from(prose: String) -> Self {
         if prose.starts_with("stale session: ") {
             return Self::typed(
                 prose,
-                json!({"code": "invalid_target", "reason": "stale_session"}),
+                json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::StaleSession.as_str()}),
             );
         }
         if let Some(rest) = prose.strip_prefix(TYPED_MARKER) {
             if let Some((code, rest)) = rest.split_once(':') {
                 if let Some((reason, msg)) = rest.split_once(':') {
-                    return Self::typed(
-                        msg.trim_start().to_string(),
-                        json!({"code": code, "reason": reason}),
-                    );
+                    if let (Some(code), Some(reason)) =
+                        (ToolCode::from_wire(code), ToolReason::from_wire(reason))
+                    {
+                        return Self::typed(
+                            msg.trim_start().to_string(),
+                            json!({"code": code.as_str(), "reason": reason.as_str()}),
+                        );
+                    }
                 }
             }
         }
@@ -433,28 +443,281 @@ impl From<String> for ToolErr {
     }
 }
 
-/// Closed machine-readable code set for tool errors, minted at the site:
+/// Closed machine-readable code set for tool errors (SPEC.md §4.1), minted at
+/// the error SITE where the failure is known.
 ///
-///   stale_ref        reason unknown|navigated|node_gone      (+ tool, ref)
-///   not_actionable   reason hidden|disabled|readonly|occluded|not_editable (+ tool, ref|element)
-///   invalid_target   reason not_select|not_found|not_file   (+ tool, ref|element)
-///   option_not_found reason no_match                         (+ tool, want)
-///   capability_gated reason dom_only                         (+ tool)
-///   target_changed   reason raced                             (+ tool, before, after)
-///   engine_dead      reason respawn_failed|transport          (+ tool)
-///   shadow_closed    reason unreachable                       (+ tool, element)
-///   cancelled        reason client_cancelled                  (+ tool)
-///   timeout          reason budget_exceeded                   (+ tool, budgetMs)
-///   invalid_args     reason missing_arg|bad_value|bad_index|unknown_action|unknown_tool|need_option|unknown_arg|budget_mismatch (+ tool, arg?)
-///   error            fallback, code only (cdp/js-engine failures and anything untyped)
+/// This is a type, not a convention: a code that is not a variant cannot be
+/// written, so a typo is a compile error rather than an untyped envelope that
+/// only a per-case assertion would catch (L5 §3). `Error` is the residue and
+/// is minted by [`ToolErr::fallback`] alone.
+///
+/// The wire string of each variant is the `code` a client branches on; the
+/// reason set is [`ToolReason`], and the pairing each code accepts is in
+/// `tests/envelope.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolCode {
+    /// An AX ref (`@eN`) that no longer resolves.
+    StaleRef,
+    /// The element exists but cannot be acted on.
+    NotActionable,
+    /// The target (selector, ref, tab, frame, file) does not resolve.
+    InvalidTarget,
+    /// A `select` option that does not match.
+    OptionNotFound,
+    /// The engine cannot do this under the active backend caps.
+    CapabilityGated,
+    /// The page moved between resolution and the action.
+    TargetChanged,
+    /// The owned engine died and the single automatic relaunch did not recover.
+    EngineDead,
+    /// The target lives in a CLOSED shadow root.
+    ShadowClosed,
+    /// The call was cancelled or ran past its total budget.
+    Cancelled,
+    /// The call's own wait expired inside its budget.
+    Timeout,
+    /// The caller's arguments cannot be honoured.
+    InvalidArgs,
+    /// The page's JavaScript threw, or returned no value where one was needed.
+    JsError,
+    /// A local file named by the call is missing.
+    FileNotFound,
+    /// The engine refused a cookie the caller asked to set.
+    CookieRejected,
+    /// A saved storage file belongs to another origin.
+    OriginMismatch,
+    /// The engine cannot host the diff tab in the background.
+    ScratchBackgroundUnsupported,
+    /// A baseline sidecar carries no usable environment record.
+    BaselineEnvironmentUnknown,
+    /// A baseline was captured before it settled.
+    BaselineEnvironmentUnsettled,
+    /// The residue: a failure that genuinely knows nothing.
+    Error,
+}
+
+impl ToolCode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::StaleRef => "stale_ref",
+            Self::NotActionable => "not_actionable",
+            Self::InvalidTarget => "invalid_target",
+            Self::OptionNotFound => "option_not_found",
+            Self::CapabilityGated => "capability_gated",
+            Self::TargetChanged => "target_changed",
+            Self::EngineDead => "engine_dead",
+            Self::ShadowClosed => "shadow_closed",
+            Self::Cancelled => "cancelled",
+            Self::Timeout => "timeout",
+            Self::InvalidArgs => "invalid_args",
+            Self::JsError => "js_error",
+            Self::FileNotFound => "file_not_found",
+            Self::CookieRejected => "cookie_rejected",
+            Self::OriginMismatch => "origin_mismatch",
+            Self::ScratchBackgroundUnsupported => "scratch_background_unsupported",
+            Self::BaselineEnvironmentUnknown => "baseline_environment_unknown",
+            Self::BaselineEnvironmentUnsettled => "baseline_environment_unsettled",
+            Self::Error => "error",
+        }
+    }
+
+    /// The `typed:` marker prefix this code mints, for the
+    /// `Result<_, String>` boundary.
+    pub(crate) fn marker(self) -> String {
+        format!("{TYPED_MARKER}{}:", self.as_str())
+    }
+
+    /// Every variant, so a round-trip test can prove none is unreachable.
+    pub(crate) const ALL: &'static [ToolCode] = &[
+        Self::StaleRef,
+        Self::NotActionable,
+        Self::InvalidTarget,
+        Self::OptionNotFound,
+        Self::CapabilityGated,
+        Self::TargetChanged,
+        Self::EngineDead,
+        Self::ShadowClosed,
+        Self::Cancelled,
+        Self::Timeout,
+        Self::InvalidArgs,
+        Self::JsError,
+        Self::FileNotFound,
+        Self::CookieRejected,
+        Self::OriginMismatch,
+        Self::ScratchBackgroundUnsupported,
+        Self::BaselineEnvironmentUnknown,
+        Self::BaselineEnvironmentUnsettled,
+        Self::Error,
+    ];
+
+    /// The variant whose wire string is `s`, or `None` when the marker names
+    /// something this build does not know.
+    pub(crate) fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == s)
+    }
+}
+
+/// Closed machine-readable reason set, paired with a [`ToolCode`] at the
+/// minting site. One enum rather than one per code: the wire strings are
+/// unique across the set, and a shared type is what lets
+/// [`ToolCode::marker`]'s inverse stay total.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolReason {
+    Unknown,
+    Navigated,
+    NodeGone,
+    Hidden,
+    Disabled,
+    Readonly,
+    Occluded,
+    NotEditable,
+    NotSelect,
+    NotFound,
+    NotFile,
+    NoMatch,
+    DomOnly,
+    Raced,
+    RespawnFailed,
+    Transport,
+    Unreachable,
+    ClientCancelled,
+    BudgetExceeded,
+    MissingArg,
+    BadValue,
+    BadIndex,
+    UnknownAction,
+    UnknownTool,
+    NeedOption,
+    UnknownArg,
+    BudgetMismatch,
+    Thrown,
+    UndefinedResult,
+    StaleSession,
+    MissingPath,
+    BackgroundParamRejected,
+    BadEntry,
+    Mismatch,
+    NotStored,
+    OpaqueOrigin,
+    Rejected,
+    SetFailed,
+    SnapshotExpired,
+    Unsettled,
+    Recorded,
+    Missing,
+    Malformed,
+    Unreadable,
+}
+
+impl ToolReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Navigated => "navigated",
+            Self::NodeGone => "node_gone",
+            Self::Hidden => "hidden",
+            Self::Disabled => "disabled",
+            Self::Readonly => "readonly",
+            Self::Occluded => "occluded",
+            Self::NotEditable => "not_editable",
+            Self::NotSelect => "not_select",
+            Self::NotFound => "not_found",
+            Self::NotFile => "not_file",
+            Self::NoMatch => "no_match",
+            Self::DomOnly => "dom_only",
+            Self::Raced => "raced",
+            Self::RespawnFailed => "respawn_failed",
+            Self::Transport => "transport",
+            Self::Unreachable => "unreachable",
+            Self::ClientCancelled => "client_cancelled",
+            Self::BudgetExceeded => "budget_exceeded",
+            Self::MissingArg => "missing_arg",
+            Self::BadValue => "bad_value",
+            Self::BadIndex => "bad_index",
+            Self::UnknownAction => "unknown_action",
+            Self::UnknownTool => "unknown_tool",
+            Self::NeedOption => "need_option",
+            Self::UnknownArg => "unknown_arg",
+            Self::BudgetMismatch => "budget_mismatch",
+            Self::Thrown => "thrown",
+            Self::UndefinedResult => "undefined_result",
+            Self::StaleSession => "stale_session",
+            Self::MissingPath => "missing_path",
+            Self::BackgroundParamRejected => "background_param_rejected",
+            Self::BadEntry => "bad_entry",
+            Self::Mismatch => "mismatch",
+            Self::NotStored => "not_stored",
+            Self::OpaqueOrigin => "opaque_origin",
+            Self::Rejected => "rejected",
+            Self::SetFailed => "set_failed",
+            Self::SnapshotExpired => "snapshot_expired",
+            Self::Unsettled => "unsettled",
+            Self::Recorded => "recorded",
+            Self::Missing => "missing",
+            Self::Malformed => "malformed",
+            Self::Unreadable => "unreadable",
+        }
+    }
+
+    pub(crate) const ALL: &'static [ToolReason] = &[
+        Self::Unknown,
+        Self::Navigated,
+        Self::NodeGone,
+        Self::Hidden,
+        Self::Disabled,
+        Self::Readonly,
+        Self::Occluded,
+        Self::NotEditable,
+        Self::NotSelect,
+        Self::NotFound,
+        Self::NotFile,
+        Self::NoMatch,
+        Self::DomOnly,
+        Self::Raced,
+        Self::RespawnFailed,
+        Self::Transport,
+        Self::Unreachable,
+        Self::ClientCancelled,
+        Self::BudgetExceeded,
+        Self::MissingArg,
+        Self::BadValue,
+        Self::BadIndex,
+        Self::UnknownAction,
+        Self::UnknownTool,
+        Self::NeedOption,
+        Self::UnknownArg,
+        Self::BudgetMismatch,
+        Self::Thrown,
+        Self::UndefinedResult,
+        Self::StaleSession,
+        Self::MissingPath,
+        Self::BackgroundParamRejected,
+        Self::BadEntry,
+        Self::Mismatch,
+        Self::NotStored,
+        Self::OpaqueOrigin,
+        Self::Rejected,
+        Self::SetFailed,
+        Self::SnapshotExpired,
+        Self::Unsettled,
+        Self::Recorded,
+        Self::Missing,
+        Self::Malformed,
+        Self::Unreadable,
+    ];
+
+    pub(crate) fn from_wire(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|r| r.as_str() == s)
+    }
+}
+
+/// Fail loud: every tool rejects arguments outside its own schema with
+/// `invalid_args`/`unknown_arg` (never silent acceptance) via
+/// `check_unknown` at the top of each dispatch arm.
 ///
 /// `_budgetMs` is the one argument every tool accepts without declaring it:
 /// the dispatcher strips and validates it before any tool's `check_unknown`
 /// runs, so it is a framework argument rather than a schema key.
-///
-/// Fail loud: every tool rejects arguments outside its own schema with
-/// `invalid_args`/`unknown_arg` (never silent acceptance) via
-/// `check_unknown` at the top of each dispatch arm.
 ///
 /// Dispatch a tool call. Always returns the MCP result object
 /// (`{"content": [...]}` with optional `isError`); tool failures are NOT
@@ -469,7 +732,7 @@ fn check_unknown(tool: &str, args: &Value, allowed: &[&str]) -> Result<(), ToolE
             if !allowed.contains(&k.as_str()) {
                 return Err(ToolErr::typed(
                     format!("{tool}: unknown argument '{k}' (not in this tool's schema; rejected, not ignored)"),
-                    json!({"code": "invalid_args", "reason": "unknown_arg", "tool": tool, "arg": k}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::UnknownArg.as_str(), "tool": tool, "arg": k}),
                 ));
             }
         }
@@ -487,7 +750,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                 Some(u) => u.to_string(),
                 None => return ToolErr::typed(
                     "navigate: missing required arg 'url'".to_string(),
-                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "navigate"}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "navigate"}),
                 )
                 .envelope(),
             };
@@ -506,7 +769,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     None => {
                         return ToolErr::typed(
                             "snapshot: 'offset' must be an integer >= 0".to_string(),
-                            json!({"code": "invalid_args", "reason": "bad_value", "tool": "snapshot", "arg": "offset"}),
+                            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "snapshot", "arg": "offset"}),
                         )
                         .envelope()
                     }
@@ -546,7 +809,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
             if !deterministic && (width.is_some() || height.is_some()) {
                 return ToolErr::typed(
                         "screenshot: 'width'/'height' require deterministic:true (a plain capture uses the live viewport)".to_string(),
-                        json!({"code": "invalid_args", "reason": "bad_value", "tool": "screenshot", "arg": "width"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "screenshot", "arg": "width"}),
                     )
                     .envelope();
             }
@@ -570,7 +833,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     Some(e) => e.to_string(),
                     None => return ToolErr::typed(
                         "click: missing required arg 'element'".to_string(),
-                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "click"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "click"}),
                     )
                     .envelope(),
                 };
@@ -598,7 +861,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     (Some(e), Some(t)) => (e.to_string(), t.to_string()),
                     _ => return ToolErr::typed(
                         "type: missing required args 'element'/'text'".to_string(),
-                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "type"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "type"}),
                     )
                     .envelope(),
                 };
@@ -620,7 +883,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                 Some(e) => e.to_string(),
                 None => return ToolErr::typed(
                     "evaluate: missing required arg 'expression'".to_string(),
-                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "evaluate"}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "evaluate"}),
                 )
                 .envelope(),
             };
@@ -699,7 +962,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     Some(e) => e.to_string(),
                     None => return ToolErr::typed(
                         "upload: missing required arg 'element'".to_string(),
-                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "upload"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "upload"}),
                     )
                     .envelope(),
                 };
@@ -716,7 +979,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     Some(p) => p,
                     None => return ToolErr::typed(
                         "upload: missing required arg 'paths' (array of strings)".to_string(),
-                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "upload"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "upload"}),
                     )
                     .envelope(),
                 };
@@ -736,7 +999,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                 Some(u) => u.to_string(),
                 None => return ToolErr::typed(
                     "fetch_text: missing required arg 'url'".to_string(),
-                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "fetch_text"}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "fetch_text"}),
                 )
                 .envelope(),
             };
@@ -758,7 +1021,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     Some(e) => e.to_string(),
                     None => return ToolErr::typed(
                         "hover: missing required arg 'element'".to_string(),
-                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "hover"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "hover"}),
                     )
                     .envelope(),
                 };
@@ -773,7 +1036,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     Some(e) => e.to_string(),
                     None => return ToolErr::typed(
                         "select: missing required arg 'element'".to_string(),
-                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "select"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "select"}),
                     )
                     .envelope(),
                 };
@@ -803,7 +1066,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                 None => {
                     return ToolErr::typed(
                         "key: missing required arg 'key'".to_string(),
-                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "key"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "key"}),
                     )
                     .envelope()
                 }
@@ -820,7 +1083,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     Some(a) => a.to_string(),
                     None => return ToolErr::typed(
                         "tabs: missing required arg 'action'".to_string(),
-                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "tabs"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "tabs"}),
                     )
                     .envelope(),
                 };
@@ -902,7 +1165,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                     Some(a) => a.to_string(),
                     None => return ToolErr::typed(
                         "history: missing required arg 'action'".to_string(),
-                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "history"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "history"}),
                     )
                     .envelope(),
                 };
@@ -933,7 +1196,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
                 None => {
                     return ToolErr::typed(
                         "cdp: missing required arg 'method'".to_string(),
-                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "cdp"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "cdp"}),
                     )
                     .envelope()
                 }
@@ -942,7 +1205,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
             if !params.is_object() {
                 return ToolErr::typed(
                     "cdp: 'params' must be an object".to_string(),
-                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "cdp"}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "cdp"}),
                 )
                 .envelope();
             }
@@ -955,7 +1218,7 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
         other => {
             return ToolErr::typed(
                 format!("unknown tool: {other}"),
-                json!({"code": "invalid_args", "reason": "unknown_tool", "name": other}),
+                json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::UnknownTool.as_str(), "name": other}),
             )
             .envelope()
         }
@@ -1055,7 +1318,7 @@ pub(crate) async fn guard_ref(
     if browser.ref_label(id).await.is_none() {
         return Err(ToolErr::typed(
             format!("stale ref: {tool}: unknown ref @{id} (no such ref; take a fresh snapshot)"),
-            json!({"code": "stale_ref", "reason": "unknown", "tool": tool, "ref": format!("@{id}")}),
+            json!({"code": ToolCode::StaleRef.as_str(), "reason": ToolReason::Unknown.as_str(), "tool": tool, "ref": format!("@{id}")}),
         ));
     }
     let snap = browser.snap_url().await;
@@ -1069,7 +1332,7 @@ pub(crate) async fn guard_ref(
         if !cur.is_empty() && cur != snap {
             return Err(ToolErr::typed(
                 format!("stale ref: {tool}: ref @{id} is stale (page navigated from {snap} to {cur}; take a fresh snapshot)"),
-                json!({"code": "stale_ref", "reason": "navigated", "tool": tool, "ref": format!("@{id}")}),
+                json!({"code": ToolCode::StaleRef.as_str(), "reason": ToolReason::Navigated.as_str(), "tool": tool, "ref": format!("@{id}")}),
             ));
         }
     }
@@ -1080,7 +1343,7 @@ pub(crate) fn stale_gone(tool: &str, element: &str, id: &str) -> ToolErr {
     let _ = element;
     ToolErr::typed(
         format!("stale ref: {tool}: ref @{id} is stale (node gone; take a fresh snapshot)"),
-        json!({"code": "stale_ref", "reason": "node_gone", "tool": tool, "ref": format!("@{id}")}),
+        json!({"code": ToolCode::StaleRef.as_str(), "reason": ToolReason::NodeGone.as_str(), "tool": tool, "ref": format!("@{id}")}),
     )
 }
 
@@ -1142,12 +1405,16 @@ pub(crate) async fn call_on_object(
         .await
         .map_err(ToolErr::fallback)?;
     if let Some(ex) = r.get("exceptionDetails") {
-        return Err(ToolErr::fallback(format!("js exception: {ex}")));
+        return Err(ToolErr::typed(
+            format!("js exception: {ex}"),
+            json!({"code": ToolCode::JsError.as_str(), "reason": ToolReason::Thrown.as_str()}),
+        ));
     }
     match r.get("result").and_then(|x| x.get("value")) {
         Some(v) => Ok(v.clone()),
-        None => Err(ToolErr::fallback(
+        None => Err(ToolErr::typed(
             "callFunctionOn: expression returned no value".to_string(),
+            json!({"code": ToolCode::JsError.as_str(), "reason": ToolReason::UndefinedResult.as_str()}),
         )),
     }
 }
@@ -1187,7 +1454,7 @@ fn type_reply(typed: &str, value_length: Option<u64>) -> Value {
 fn ref_in_frame(tool: &str, element: &str, frame: &str) -> ToolErr {
     ToolErr::typed(
         format!("{tool}: refs (@eN) are main-frame only; with frame= use a CSS selector (got ref '{element}' with frame '{frame}'; take a frame snapshot for names, then act with the selector)"),
-        json!({"code": "invalid_args", "reason": "bad_value", "tool": tool, "arg": "frame", "frame": frame, "element": element}),
+        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": tool, "arg": "frame", "frame": frame, "element": element}),
     )
 }
 
@@ -1198,7 +1465,7 @@ fn frame_id_ok(tool: &str, frame: Option<&str>) -> Result<Option<String>, ToolEr
         None => Ok(None),
         Some(f) if f.trim().is_empty() => Err(ToolErr::typed(
             format!("{tool}: 'frame' must be a non-empty CDP frameId (from targets)"),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": tool, "arg": "frame"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": tool, "arg": "frame"}),
         )),
         Some(f) => Ok(Some(f.to_string())),
     }
@@ -1214,7 +1481,7 @@ fn frame_lookup_err(tool: &str, fid: &str, e: String) -> ToolErr {
     if l.contains("no frame with id") || l.contains("no such frame") || l.contains("cannot find") {
         ToolErr::typed(
             format!("{tool}: no frame with id '{fid}'"),
-            json!({"code": "invalid_target", "reason": "not_found", "tool": tool, "frame": fid}),
+            json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": tool, "frame": fid}),
         )
     } else {
         ToolErr::fallback(e)
@@ -1278,7 +1545,7 @@ async fn frame_owner_hit_ok(
             format!(
                 "{tool}: element is occluded by another element (no {tool} dispatched): {element}"
             ),
-            json!({"code": "not_actionable", "reason": "occluded", "tool": tool, "element": element, "frame": fid}),
+            json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Occluded.as_str(), "tool": tool, "element": element, "frame": fid}),
         )
     }
     const ATTR: &str = "data-gladius-frame-owner";
@@ -1400,7 +1667,7 @@ async fn emit_paged_snapshot(
             format!(
                 "snapshot: offset {offset} requires snapshotId (the id the offset:0 render returned; paging slices that render and never re-renders)"
             ),
-            json!({"code": "invalid_args", "reason": "missing_arg", "tool": "snapshot",
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "snapshot",
                    "arg": "snapshotId", "offset": offset}),
         ));
     }
@@ -1448,7 +1715,7 @@ async fn emit_paged_snapshot(
             ToolErr::typed(
                 "snapshot: no cached render to page; call snapshot without offset first"
                     .to_string(),
-                json!({"code": "invalid_args", "reason": "snapshot_expired", "tool": "snapshot", "offset": offset}),
+                json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::SnapshotExpired.as_str(), "tool": "snapshot", "offset": offset}),
             )
         })?;
         if let Some(want) = snapshot_id {
@@ -1458,14 +1725,14 @@ async fn emit_paged_snapshot(
                         "snapshot: snapshotId '{want}' does not match the cached render '{}'; re-snapshot from offset 0",
                         c.id
                     ),
-                    json!({"code": "invalid_args", "reason": "snapshot_expired", "tool": "snapshot", "snapshotId": want}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::SnapshotExpired.as_str(), "tool": "snapshot", "snapshotId": want}),
                 ));
             }
         }
         if c.mode != mode || c.frame != frame.unwrap_or("") {
             return Err(ToolErr::typed(
                 "snapshot: offset paging must use the same mode/frame as the cached render; re-snapshot from offset 0".to_string(),
-                json!({"code": "invalid_args", "reason": "snapshot_expired", "tool": "snapshot", "offset": offset}),
+                json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::SnapshotExpired.as_str(), "tool": "snapshot", "offset": offset}),
             ));
         }
         c
@@ -1476,7 +1743,7 @@ async fn emit_paged_snapshot(
     if offset >= total_lines {
         return Err(ToolErr::typed(
             format!("snapshot: offset {offset} is past the end (totalLines {total_lines})"),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": "snapshot", "arg": "offset", "offset": offset, "totalLines": total_lines}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "snapshot", "arg": "offset", "offset": offset, "totalLines": total_lines}),
         ));
     }
     let mut end = offset;
@@ -1549,7 +1816,7 @@ async fn emit_paged_snapshot(
             format!(
                 "snapshot: line {offset} is {line_chars} chars and alone exceeds the {cap}-char page cap; cannot page this render (re-snapshot with mode:\"text\" for the page text)"
             ),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": "snapshot",
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "snapshot",
                    "arg": "offset", "offset": offset, "lineChars": line_chars,
                    "totalLines": total_lines, "cap": cap}),
         ));
@@ -1596,7 +1863,7 @@ async fn tool_snapshot(
             if offset > 0 {
                 return Err(ToolErr::typed(
                     "snapshot: mode 'text' is not line-paged (use the default AX mode for refs and offset paging)".to_string(),
-                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "snapshot", "arg": "offset"}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "snapshot", "arg": "offset"}),
                 ));
             }
             tool_snapshot_text_frame(browser, frame).await
@@ -1635,7 +1902,7 @@ async fn tool_snapshot(
         Some("ax") | None => return tool_snapshot_ax(browser, frame, offset, snapshot_id).await,
         Some(other) => Err(ToolErr::typed(
             format!("snapshot: unknown mode '{other}' (want 'ax'|'legacy'|'text')"),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": "snapshot", "arg": "mode", "want": other}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "snapshot", "arg": "mode", "want": other}),
         )),
     }
 }
@@ -1933,7 +2200,7 @@ async fn tool_snapshot_ax(
         if frame.is_some() && (l.contains("frame") || l.contains("no frame") || l.contains("no such")) {
             ToolErr::typed(
                 format!("snapshot: no frame with id '{}'", frame.unwrap_or("")),
-                json!({"code": "invalid_target", "reason": "not_found", "tool": "snapshot", "frame": frame.unwrap_or("")}),
+                json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "snapshot", "frame": frame.unwrap_or("")}),
             )
         } else {
             ToolErr::from(e)
@@ -2323,7 +2590,7 @@ fn write_screenshot_file(path: &str, png: &[u8]) -> Result<(), ToolErr> {
     if !dest.is_absolute() {
         return Err(ToolErr::typed(
             format!("screenshot: refusing relative path (pass an absolute path): {path}"),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": "screenshot", "arg": "path"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "screenshot", "arg": "path"}),
         ));
     }
     if let Some(parent) = dest.parent() {
@@ -2357,7 +2624,7 @@ async fn tool_screenshot(
         Ok(crate::browser::BackendCaps::DomOnly) => {
             return Err(ToolErr::typed(
                 "screenshot: unavailable with GLADIUS_BACKEND_CAPS=dom-only backend (no rendering pipeline; refusing instead of returning a fake image)".to_string(),
-                json!({"code": "capability_gated", "reason": "dom_only", "tool": "screenshot"}),
+                json!({"code": ToolCode::CapabilityGated.as_str(), "reason": ToolReason::DomOnly.as_str(), "tool": "screenshot"}),
             ));
         }
         Ok(crate::browser::BackendCaps::Render) => {}
@@ -2393,7 +2660,7 @@ async fn tool_screenshot(
                     before.as_deref().unwrap_or("none"),
                     after.as_deref().unwrap_or("none")
                 ),
-                json!({"code": "target_changed", "reason": "raced", "tool": "screenshot",
+                json!({"code": ToolCode::TargetChanged.as_str(), "reason": ToolReason::Raced.as_str(), "tool": "screenshot",
                        "before": before, "after": after}),
             ));
         }
@@ -2440,7 +2707,7 @@ async fn layout_specs(
                         None => {
                             return Err(ToolErr::typed(
                                 format!("{tool}: '{key}' array must contain strings"),
-                                json!({"code": "invalid_args", "reason": "bad_value", "tool": tool, "arg": key}),
+                                json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": tool, "arg": key}),
                             ))
                         }
                     }
@@ -2450,7 +2717,7 @@ async fn layout_specs(
             _ => {
                 return Err(ToolErr::typed(
                     format!("{tool}: '{key}' must be a string or an array of strings"),
-                    json!({"code": "invalid_args", "reason": "bad_value", "tool": tool, "arg": key}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": tool, "arg": key}),
                 ))
             }
         };
@@ -2459,7 +2726,7 @@ async fn layout_specs(
                 let Some(id) = parse_ref(&s) else {
                     return Err(ToolErr::typed(
                         format!("{tool}: ref '{s}' must look like @eN (from snapshot)"),
-                        json!({"code": "invalid_args", "reason": "bad_value", "tool": tool, "arg": "ref"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": tool, "arg": "ref"}),
                     ));
                 };
                 guard_ref(browser, tool, &s, &id).await?;
@@ -2472,7 +2739,7 @@ async fn layout_specs(
     if out.is_empty() {
         return Err(ToolErr::typed(
             format!("{tool}: need 'ref' (@eN) or 'selector'"),
-            json!({"code": "invalid_args", "reason": "missing_arg", "tool": tool}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": tool}),
         ));
     }
     Ok(out)
@@ -2484,7 +2751,7 @@ fn not_found_baseline(name: &str) -> ToolErr {
             "visual: no baseline named '{name}' in {} (save it first)",
             crate::visual::visual_dir().display()
         ),
-        json!({"code": "invalid_target", "reason": "not_found", "tool": "visual", "name": name}),
+        json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "visual", "name": name}),
     )
 }
 
@@ -2515,7 +2782,7 @@ async fn tool_assert_layout(browser: &Browser, args: &Value) -> Result<Value, To
     if shot_path.is_some() && !on_fail {
         return Err(ToolErr::typed(
             "assert_layout: 'screenshotPath' requires screenshotOnFail:true".to_string(),
-            json!({"code": "invalid_args", "reason": "need_option", "tool": "assert_layout", "arg": "screenshotPath"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::NeedOption.as_str(), "tool": "assert_layout", "arg": "screenshotPath"}),
         ));
     }
     crate::layout::assert_layout(
@@ -2571,7 +2838,7 @@ async fn tool_visual(browser: &Browser, args: &Value) -> Result<Value, ToolErr> 
             Ok(crate::browser::BackendCaps::DomOnly) => {
                 return Err(ToolErr::typed(
                     format!("visual: action '{action}' is unavailable with GLADIUS_BACKEND_CAPS=dom-only (no rendering pipeline; refusing instead of comparing nothing)"),
-                    json!({"code": "capability_gated", "reason": "dom_only", "tool": "visual"}),
+                    json!({"code": ToolCode::CapabilityGated.as_str(), "reason": ToolReason::DomOnly.as_str(), "tool": "visual"}),
                 ));
             }
             Ok(crate::browser::BackendCaps::Render) => {}
@@ -2585,7 +2852,7 @@ async fn tool_visual(browser: &Browser, args: &Value) -> Result<Value, ToolErr> 
             None => {
                 return Err(ToolErr::typed(
                     format!("visual: action '{action}' needs 'name'"),
-                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "visual", "arg": "name"}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "visual", "arg": "name"}),
                 ))
             }
         },
@@ -2594,7 +2861,7 @@ async fn tool_visual(browser: &Browser, args: &Value) -> Result<Value, ToolErr> 
         Some(n) => Some(crate::visual::sanitise_name(n).map_err(|e| {
             ToolErr::typed(
                 e,
-                json!({"code": "invalid_args", "reason": "bad_value", "tool": "visual", "arg": "name"}),
+                json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "visual", "arg": "name"}),
             )
         })?),
         None => None,
@@ -2634,7 +2901,7 @@ async fn tool_visual(browser: &Browser, args: &Value) -> Result<Value, ToolErr> 
                 if a == i {
                     return Err(ToolErr::typed(
                         "visual: 'antialias' and 'includeAA' are inverses; send one, or send both with opposite values (antialias = !includeAA)".to_string(),
-                        json!({"code": "invalid_args", "reason": "bad_value", "tool": "visual", "arg": "antialias"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "visual", "arg": "antialias"}),
                     ));
                 }
             }
@@ -2650,7 +2917,7 @@ async fn tool_visual(browser: &Browser, args: &Value) -> Result<Value, ToolErr> 
             if !(0..=1000).contains(&min_cluster) {
                 return Err(ToolErr::typed(
                     "visual: 'minDiffCluster' must be an integer in 0..=1000 (0 counts every pixel)".to_string(),
-                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "visual", "arg": "minDiffCluster"}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "visual", "arg": "minDiffCluster"}),
                 ));
             }
             let opt = crate::visual::DiffOpts {
@@ -2696,7 +2963,7 @@ async fn tool_visual(browser: &Browser, args: &Value) -> Result<Value, ToolErr> 
             if !(0.0..=1.0).contains(&opt.threshold) {
                 return Err(ToolErr::typed(
                     "visual: 'threshold' must be a fraction in 0..=1 (per-channel share of the 0-255 range)".to_string(),
-                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "visual", "arg": "threshold"}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "visual", "arg": "threshold"}),
                 ));
             }
             // `compare` carries its own typed errors (scratch refusal, unknown
@@ -2707,7 +2974,7 @@ async fn tool_visual(browser: &Browser, args: &Value) -> Result<Value, ToolErr> 
         }
         other => Err(ToolErr::typed(
             format!("visual: unknown action '{other}' (want save|compare|list|delete)"),
-            json!({"code": "invalid_args", "reason": "unknown_action", "tool": "visual", "arg": "action"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::UnknownAction.as_str(), "tool": "visual", "arg": "action"}),
         )),
     }
 }
@@ -2789,7 +3056,7 @@ pub(crate) fn shadow_closed(tool: &str, selector: &str) -> ToolErr {
              `snapshot` is the only path that can reach it (no selector syntax can pierce \
              a closed root)"
         ),
-        json!({"code": "shadow_closed", "reason": "unreachable", "tool": tool, "element": selector}),
+        json!({"code": ToolCode::ShadowClosed.as_str(), "reason": ToolReason::Unreachable.as_str(), "tool": tool, "element": selector}),
     )
 }
 
@@ -2916,15 +3183,15 @@ async fn tool_click(
             Some("GLADIUS_NOTFOUND") => Err(stale_gone("click", element, &id)),
             Some("GLADIUS_DISABLED") => Err(ToolErr::typed(
                 format!("click: {at_id} is disabled"),
-                json!({"code": "not_actionable", "reason": "disabled", "tool": "click", "ref": at_id}),
+                json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Disabled.as_str(), "tool": "click", "ref": at_id}),
             )),
             Some("GLADIUS_OCCLUDED") => Err(ToolErr::typed(
                 format!("click: {at_id} is occluded by another element (no click dispatched)"),
-                json!({"code": "not_actionable", "reason": "occluded", "tool": "click", "ref": at_id}),
+                json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Occluded.as_str(), "tool": "click", "ref": at_id}),
             )),
             _ => Err(ToolErr::typed(
                 format!("click: {at_id} not visible or not clickable"),
-                json!({"code": "not_actionable", "reason": "hidden", "tool": "click", "ref": at_id}),
+                json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Hidden.as_str(), "tool": "click", "ref": at_id}),
             )),
         };
     }
@@ -2986,22 +3253,22 @@ async fn tool_click(
             }
             Err(ToolErr::typed(
                 format!("click: element not found: {element}"),
-                json!({"code": "invalid_target", "reason": "not_found", "tool": "click", "element": element}),
+                json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "click", "element": element}),
             ))
         }
         Some("GLADIUS_DISABLED") => Err(ToolErr::typed(
             format!("click: element is disabled: {element}"),
-            json!({"code": "not_actionable", "reason": "disabled", "tool": "click", "element": element}),
+            json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Disabled.as_str(), "tool": "click", "element": element}),
         )),
         Some("GLADIUS_OCCLUDED") => Err(ToolErr::typed(
             format!(
                 "click: element is occluded by another element (no click dispatched): {element}"
             ),
-            json!({"code": "not_actionable", "reason": "occluded", "tool": "click", "element": element}),
+            json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Occluded.as_str(), "tool": "click", "element": element}),
         )),
         _ => Err(ToolErr::typed(
             format!("click: element not visible or not clickable: {element}"),
-            json!({"code": "not_actionable", "reason": "hidden", "tool": "click", "element": element}),
+            json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Hidden.as_str(), "tool": "click", "element": element}),
         )),
     }
 }
@@ -3079,21 +3346,21 @@ async fn tool_click_frame(
         }
         Some("GLADIUS_NOTFOUND") => Err(ToolErr::typed(
             format!("click: element not found: {element}"),
-            json!({"code": "invalid_target", "reason": "not_found", "tool": "click", "element": element, "frame": fid}),
+            json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "click", "element": element, "frame": fid}),
         )),
         Some("GLADIUS_DISABLED") => Err(ToolErr::typed(
             format!("click: element is disabled: {element}"),
-            json!({"code": "not_actionable", "reason": "disabled", "tool": "click", "element": element, "frame": fid}),
+            json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Disabled.as_str(), "tool": "click", "element": element, "frame": fid}),
         )),
         Some("GLADIUS_OCCLUDED") => Err(ToolErr::typed(
             format!(
                 "click: element is occluded by another element (no click dispatched): {element}"
             ),
-            json!({"code": "not_actionable", "reason": "occluded", "tool": "click", "element": element, "frame": fid}),
+            json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Occluded.as_str(), "tool": "click", "element": element, "frame": fid}),
         )),
         _ => Err(ToolErr::typed(
             format!("click: element not visible or not clickable: {element}"),
-            json!({"code": "not_actionable", "reason": "hidden", "tool": "click", "element": element, "frame": fid}),
+            json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Hidden.as_str(), "tool": "click", "element": element, "frame": fid}),
         )),
     }
 }
@@ -3244,19 +3511,19 @@ async fn tool_type(
             Some("GLADIUS_DISABLED") => {
                 return Err(ToolErr::typed(
                     format!("type: element is disabled: {element}"),
-                    json!({"code": "not_actionable", "reason": "disabled", "tool": "type", "element": element, "frame": f}),
+                    json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Disabled.as_str(), "tool": "type", "element": element, "frame": f}),
                 ));
             }
             Some("GLADIUS_READONLY") => {
                 return Err(ToolErr::typed(
                     format!("type: element is read-only: {element}"),
-                    json!({"code": "not_actionable", "reason": "readonly", "tool": "type", "element": element, "frame": f}),
+                    json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Readonly.as_str(), "tool": "type", "element": element, "frame": f}),
                 ));
             }
             Some("GLADIUS_HIDDEN") => {
                 return Err(ToolErr::typed(
                     format!("type: element not visible or not editable: {element}"),
-                    json!({"code": "not_actionable", "reason": "hidden", "tool": "type", "element": element, "frame": f}),
+                    json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Hidden.as_str(), "tool": "type", "element": element, "frame": f}),
                 ));
             }
             Some(s) if s.starts_with("GLADIUS_NOTEDIT:") => {
@@ -3270,7 +3537,7 @@ async fn tool_type(
             _ => {
                 return Err(ToolErr::typed(
                     format!("type: element not found: {element}"),
-                    json!({"code": "invalid_target", "reason": "not_found", "tool": "type", "element": element, "frame": f}),
+                    json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "type", "element": element, "frame": f}),
                 ));
             }
         }
@@ -3312,19 +3579,19 @@ async fn tool_type(
             Some("GLADIUS_DISABLED") => {
                 return Err(ToolErr::typed(
                     format!("type: {at_id} is disabled"),
-                    json!({"code": "not_actionable", "reason": "disabled", "tool": "type", "ref": at_id}),
+                    json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Disabled.as_str(), "tool": "type", "ref": at_id}),
                 ))
             }
             Some("GLADIUS_READONLY") => {
                 return Err(ToolErr::typed(
                     format!("type: {at_id} is read-only"),
-                    json!({"code": "not_actionable", "reason": "readonly", "tool": "type", "ref": at_id}),
+                    json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Readonly.as_str(), "tool": "type", "ref": at_id}),
                 ))
             }
             Some("GLADIUS_HIDDEN") => {
                 return Err(ToolErr::typed(
                     format!("type: {at_id} not visible or not editable"),
-                    json!({"code": "not_actionable", "reason": "hidden", "tool": "type", "ref": at_id}),
+                    json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Hidden.as_str(), "tool": "type", "ref": at_id}),
                 ))
             }
             Some(s) if s.starts_with("GLADIUS_NOTEDIT:") => {
@@ -3370,19 +3637,19 @@ async fn tool_type(
         Some("GLADIUS_DISABLED") => {
             return Err(ToolErr::typed(
                 format!("type: element is disabled: {element}"),
-                json!({"code": "not_actionable", "reason": "disabled", "tool": "type", "element": element}),
+                json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Disabled.as_str(), "tool": "type", "element": element}),
             ));
         }
         Some("GLADIUS_READONLY") => {
             return Err(ToolErr::typed(
                 format!("type: element is read-only: {element}"),
-                json!({"code": "not_actionable", "reason": "readonly", "tool": "type", "element": element}),
+                json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Readonly.as_str(), "tool": "type", "element": element}),
             ));
         }
         Some("GLADIUS_HIDDEN") => {
             return Err(ToolErr::typed(
                 format!("type: element not visible or not editable: {element}"),
-                json!({"code": "not_actionable", "reason": "hidden", "tool": "type", "element": element}),
+                json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Hidden.as_str(), "tool": "type", "element": element}),
             ));
         }
         Some(s) if s.starts_with("GLADIUS_NOTEDIT:") => {
@@ -3400,13 +3667,13 @@ async fn tool_type(
             }
             return Err(ToolErr::typed(
                 format!("type: element not found: {element}"),
-                json!({"code": "invalid_target", "reason": "not_found", "tool": "type", "element": element}),
+                json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "type", "element": element}),
             ));
         }
         _ => {
             return Err(ToolErr::typed(
                 format!("type: element not found: {element}"),
-                json!({"code": "invalid_target", "reason": "not_found", "tool": "type", "element": element}),
+                json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "type", "element": element}),
             ))
         }
     }
@@ -3459,7 +3726,7 @@ async fn tool_evaluate(
         return Err(ToolErr::typed(
             "evaluate: 'target' and 'frame' are mutually exclusive (one realm per call)"
                 .to_string(),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": "evaluate"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "evaluate"}),
         ));
     }
     browser.take_dialog().await;
@@ -3512,7 +3779,7 @@ async fn tool_console(
         }
         other => Err(ToolErr::typed(
             format!("console: unknown action '{other}' (get|drain|clear)"),
-            json!({"code": "invalid_args", "reason": "unknown_action", "tool": "console"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::UnknownAction.as_str(), "tool": "console"}),
         )),
     }
 }
@@ -3526,14 +3793,14 @@ async fn tool_upload(
     if paths.is_empty() {
         return Err(ToolErr::typed(
             "upload: 'paths' is empty".to_string(),
-            json!({"code": "invalid_args", "reason": "missing_arg", "tool": "upload"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "upload"}),
         ));
     }
     for p in paths {
         if !std::path::Path::new(p).is_file() {
             return Err(ToolErr::typed(
                 format!("upload: file not found: {p}"),
-                json!({"code": "file_not_found", "reason": "missing_path", "tool": "upload", "path": p}),
+                json!({"code": ToolCode::FileNotFound.as_str(), "reason": ToolReason::MissingPath.as_str(), "tool": "upload", "path": p}),
             ));
         }
     }
@@ -3557,19 +3824,19 @@ async fn tool_upload(
             Some("GLADIUS_NOTFOUND") => {
                 return Err(ToolErr::typed(
                     format!("upload: element not found: {element}"),
-                    json!({"code": "invalid_target", "reason": "not_found", "tool": "upload", "element": element, "frame": f}),
+                    json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "upload", "element": element, "frame": f}),
                 ));
             }
             Some("GLADIUS_DISABLED") => {
                 return Err(ToolErr::typed(
                     format!("upload: element is disabled: {element}"),
-                    json!({"code": "not_actionable", "reason": "disabled", "tool": "upload", "element": element, "frame": f}),
+                    json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Disabled.as_str(), "tool": "upload", "element": element, "frame": f}),
                 ));
             }
             _ => {
                 return Err(ToolErr::typed(
                     format!("upload: element is not a file input: {element}"),
-                    json!({"code": "invalid_target", "reason": "not_file", "tool": "upload", "element": element, "frame": f}),
+                    json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFile.as_str(), "tool": "upload", "element": element, "frame": f}),
                 ));
             }
         }
@@ -3585,7 +3852,7 @@ async fn tool_upload(
                 Ok(n) => Ok(ok_text(json!({"ok": true, "files": n as i64}).to_string())),
                 Err(e) if e.contains("element not found") => Err(ToolErr::typed(
                     format!("upload: element not found: {element}"),
-                    json!({"code": "invalid_target", "reason": "not_found", "tool": "upload", "element": element, "frame": f}),
+                    json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "upload", "element": element, "frame": f}),
                 )),
                 Err(e) => Err(ToolErr::fallback(e)),
             };
@@ -3608,13 +3875,13 @@ async fn tool_upload(
                     };
                     return Err(ToolErr::typed(
                         prose,
-                        json!({"code": "invalid_target", "reason": "not_found", "tool": "upload", "element": element, "frame": f}),
+                        json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "upload", "element": element, "frame": f}),
                     ));
                 }
                 if l.contains("not found in frame") {
                     return Err(ToolErr::typed(
                         format!("upload: element not found: {element}"),
-                        json!({"code": "invalid_target", "reason": "not_found", "tool": "upload", "element": element, "frame": f}),
+                        json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "upload", "element": element, "frame": f}),
                     ));
                 }
                 return Err(frame_lookup_err("upload", f, e));
@@ -3623,7 +3890,7 @@ async fn tool_upload(
         if node == 0 {
             return Err(ToolErr::typed(
                 format!("upload: element not found: {element}"),
-                json!({"code": "invalid_target", "reason": "not_found", "tool": "upload", "element": element, "frame": f}),
+                json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "upload", "element": element, "frame": f}),
             ));
         }
         browser
@@ -3659,13 +3926,13 @@ async fn tool_upload(
                 Some("GLADIUS_DISABLED") => {
                     return Err(ToolErr::typed(
                         format!("upload: element is disabled: {element}"),
-                        json!({"code": "not_actionable", "reason": "disabled", "tool": "upload", "ref": format!("@{id}")}),
+                        json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Disabled.as_str(), "tool": "upload", "ref": format!("@{id}")}),
                     ));
                 }
                 _ => {
                     return Err(ToolErr::typed(
                         format!("upload: element is not a file input: {element}"),
-                        json!({"code": "invalid_target", "reason": "not_file", "tool": "upload", "ref": format!("@{id}")}),
+                        json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFile.as_str(), "tool": "upload", "ref": format!("@{id}")}),
                     ));
                 }
             }
@@ -3703,7 +3970,7 @@ async fn tool_upload(
             None => {
                 return Err(ToolErr::typed(
                     format!("upload: element not found: {element}"),
-                    json!({"code": "invalid_target", "reason": "not_found", "tool": "upload", "element": element}),
+                    json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "upload", "element": element}),
                 ))
             }
         },
@@ -3711,11 +3978,11 @@ async fn tool_upload(
             return Err(match &rid {
                 Some(id) => ToolErr::typed(
                     format!("upload: element is disabled: {element}"),
-                    json!({"code": "not_actionable", "reason": "disabled", "tool": "upload", "ref": format!("@{id}")}),
+                    json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Disabled.as_str(), "tool": "upload", "ref": format!("@{id}")}),
                 ),
                 None => ToolErr::typed(
                     format!("upload: element is disabled: {element}"),
-                    json!({"code": "not_actionable", "reason": "disabled", "tool": "upload", "element": element}),
+                    json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Disabled.as_str(), "tool": "upload", "element": element}),
                 ),
             });
         }
@@ -3723,11 +3990,11 @@ async fn tool_upload(
             return Err(match &rid {
                 Some(id) => ToolErr::typed(
                     format!("upload: element is not a file input: {element}"),
-                    json!({"code": "invalid_target", "reason": "not_file", "tool": "upload", "ref": format!("@{id}")}),
+                    json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFile.as_str(), "tool": "upload", "ref": format!("@{id}")}),
                 ),
                 None => ToolErr::typed(
                     format!("upload: element is not a file input: {element}"),
-                    json!({"code": "invalid_target", "reason": "not_file", "tool": "upload", "element": element}),
+                    json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFile.as_str(), "tool": "upload", "element": element}),
                 ),
             });
         }
@@ -3756,7 +4023,7 @@ async fn tool_upload(
             Some(id) => Err(stale_gone("upload", element, &id)),
             None => Err(ToolErr::typed(
                 format!("upload: element not found: {element}"),
-                json!({"code": "invalid_target", "reason": "not_found", "tool": "upload", "element": element}),
+                json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "upload", "element": element}),
             )),
         };
     }
@@ -3790,7 +4057,7 @@ async fn tool_wait_for(
     if expression.is_some() && (selector.is_some() || text.is_some()) {
         return Err(ToolErr::typed(
             "wait_for: 'expression' is mutually exclusive with 'selector'/'text' (one condition per call)".to_string(),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": "wait_for"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "wait_for"}),
         ));
     }
     // ms:0 is a no-op: return immediately without any CDP round-trip. The
@@ -3949,7 +4216,7 @@ async fn tool_wait_for(
 fn wait_timeout() -> ToolErr {
     ToolErr::typed(
         "wait_for: timeout".to_string(),
-        json!({"code": "timeout", "reason": "budget_exceeded", "tool": "wait_for"}),
+        json!({"code": ToolCode::Timeout.as_str(), "reason": ToolReason::BudgetExceeded.as_str(), "tool": "wait_for"}),
     )
 }
 
@@ -3989,19 +4256,19 @@ async fn tool_hover(
         if v.as_str() == Some("GLADIUS_NOTFOUND") {
             return Err(ToolErr::typed(
                 format!("hover: element not found: {element}"),
-                json!({"code": "invalid_target", "reason": "not_found", "tool": "hover", "element": element, "frame": f}),
+                json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "hover", "element": element, "frame": f}),
             ));
         }
         if v.as_str() == Some("GLADIUS_HIDDEN") {
             return Err(ToolErr::typed(
                 format!("hover: element not visible or not hoverable: {element}"),
-                json!({"code": "not_actionable", "reason": "hidden", "tool": "hover", "element": element, "frame": f}),
+                json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Hidden.as_str(), "tool": "hover", "element": element, "frame": f}),
             ));
         }
         if v.as_str() == Some("GLADIUS_OCCLUDED") {
             return Err(ToolErr::typed(
                 format!("hover: element is occluded by another element (no hover dispatched): {element}"),
-                json!({"code": "not_actionable", "reason": "occluded", "tool": "hover", "element": element, "frame": f}),
+                json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Occluded.as_str(), "tool": "hover", "element": element, "frame": f}),
             ));
         }
         let pt: Value = serde_json::from_str(v.as_str().unwrap_or(""))
@@ -4032,13 +4299,13 @@ async fn tool_hover(
         if v.as_str() == Some("GLADIUS_HIDDEN") {
             return Err(ToolErr::typed(
                 format!("hover: {at_id} not visible or not hoverable"),
-                json!({"code": "not_actionable", "reason": "hidden", "tool": "hover", "ref": at_id}),
+                json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Hidden.as_str(), "tool": "hover", "ref": at_id}),
             ));
         }
         if v.as_str() == Some("GLADIUS_OCCLUDED") {
             return Err(ToolErr::typed(
                 format!("hover: {at_id} is occluded by another element (no hover dispatched)"),
-                json!({"code": "not_actionable", "reason": "occluded", "tool": "hover", "ref": at_id}),
+                json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Occluded.as_str(), "tool": "hover", "ref": at_id}),
             ));
         }
         return hover_move(browser, &v).await;
@@ -4055,13 +4322,13 @@ async fn tool_hover(
         }
         return Err(ToolErr::typed(
             format!("hover: element not found: {element}"),
-            json!({"code": "invalid_target", "reason": "not_found", "tool": "hover", "element": element}),
+            json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "hover", "element": element}),
         ));
     }
     if v.as_str() == Some("GLADIUS_HIDDEN") {
         return Err(ToolErr::typed(
             format!("hover: element not visible or not hoverable: {element}"),
-            json!({"code": "not_actionable", "reason": "hidden", "tool": "hover", "element": element}),
+            json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Hidden.as_str(), "tool": "hover", "element": element}),
         ));
     }
     if v.as_str() == Some("GLADIUS_OCCLUDED") {
@@ -4069,7 +4336,7 @@ async fn tool_hover(
             format!(
                 "hover: element is occluded by another element (no hover dispatched): {element}"
             ),
-            json!({"code": "not_actionable", "reason": "occluded", "tool": "hover", "element": element}),
+            json!({"code": ToolCode::NotActionable.as_str(), "reason": ToolReason::Occluded.as_str(), "tool": "hover", "element": element}),
         ));
     }
     hover_move(browser, &v).await
@@ -4094,7 +4361,7 @@ async fn tool_select(
     if value.is_none() && text.is_none() {
         return Err(ToolErr::typed(
             "select: need 'value' or 'text'".to_string(),
-            json!({"code": "invalid_args", "reason": "need_option", "tool": "select"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::NeedOption.as_str(), "tool": "select"}),
         ));
     }
     // G4b: with frame= the same JS selection runs in the frame realm via
@@ -4122,17 +4389,17 @@ async fn tool_select(
             Some("GLADIUS_OK") => Ok(ok_text(json!({"ok": true}).to_string())),
             Some("GLADIUS_NOTFOUND") => Err(ToolErr::typed(
                 format!("select: element not found: {element}"),
-                json!({"code": "invalid_target", "reason": "not_found", "tool": "select", "element": element, "frame": f}),
+                json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "select", "element": element, "frame": f}),
             )),
             Some("GLADIUS_NOTSELECT") => Err(ToolErr::typed(
                 format!("select: element is not a <select>: {element}"),
-                json!({"code": "invalid_target", "reason": "not_select", "tool": "select", "element": element, "frame": f}),
+                json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotSelect.as_str(), "tool": "select", "element": element, "frame": f}),
             )),
             _ => {
                 let want = value.or(text).unwrap_or("");
                 Err(ToolErr::typed(
                     format!("select: option not found: {want}"),
-                    json!({"code": "option_not_found", "reason": "no_match", "tool": "select", "want": want, "frame": f}),
+                    json!({"code": ToolCode::OptionNotFound.as_str(), "reason": ToolReason::NoMatch.as_str(), "tool": "select", "want": want, "frame": f}),
                 ))
             }
         };
@@ -4170,13 +4437,13 @@ async fn tool_select(
             Some("GLADIUS_NOTFOUND") => Err(stale_gone("select", element, &id)),
             Some("GLADIUS_NOTSELECT") => Err(ToolErr::typed(
                 format!("select: @{id} is not a <select>"),
-                json!({"code": "invalid_target", "reason": "not_select", "tool": "select", "ref": format!("@{id}")}),
+                json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotSelect.as_str(), "tool": "select", "ref": format!("@{id}")}),
             )),
             _ => {
                 let want = value.or(text).unwrap_or("");
                 Err(ToolErr::typed(
                     format!("select: option not found: {want}"),
-                    json!({"code": "option_not_found", "reason": "no_match", "tool": "select", "want": want}),
+                    json!({"code": ToolCode::OptionNotFound.as_str(), "reason": ToolReason::NoMatch.as_str(), "tool": "select", "want": want}),
                 ))
             }
         };
@@ -4204,18 +4471,18 @@ async fn tool_select(
             }
             Err(ToolErr::typed(
                 format!("select: element not found: {element}"),
-                json!({"code": "invalid_target", "reason": "not_found", "tool": "select", "element": element}),
+                json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "select", "element": element}),
             ))
         }
         Some("GLADIUS_NOTSELECT") => Err(ToolErr::typed(
             format!("select: element is not a <select>: {element}"),
-            json!({"code": "invalid_target", "reason": "not_select", "tool": "select", "element": element}),
+            json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotSelect.as_str(), "tool": "select", "element": element}),
         )),
         _ => {
             let want = value.or(text).unwrap_or("");
             Err(ToolErr::typed(
                 format!("select: option not found: {want}"),
-                json!({"code": "option_not_found", "reason": "no_match", "tool": "select", "want": want}),
+                json!({"code": ToolCode::OptionNotFound.as_str(), "reason": ToolReason::NoMatch.as_str(), "tool": "select", "want": want}),
             ))
         }
     }
@@ -4286,7 +4553,7 @@ async fn tool_key(browser: &Browser, key: &str) -> Result<Value, ToolErr> {
     if key.is_empty() {
         return Err(ToolErr::typed(
             "key: missing required arg 'key'".to_string(),
-            json!({"code": "invalid_args", "reason": "missing_arg", "tool": "key"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "key"}),
         ));
     }
     // G4b key combos: `Ctrl+A`, `Shift+Tab`, `Alt+...`, `Meta+...`
@@ -4299,7 +4566,7 @@ async fn tool_key(browser: &Browser, key: &str) -> Result<Value, ToolErr> {
     let Some((k, code, vk, text)) = key_map(key) else {
         return Err(ToolErr::typed(
             format!("key: unknown key '{key}' (not a recognized key name or single character)"),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": "key", "arg": "key", "want": key}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "key", "arg": "key", "want": key}),
         ));
     };
     let mut down = serde_json::Map::new();
@@ -4356,7 +4623,7 @@ async fn tool_key_combo(browser: &Browser, key: &str) -> Result<Value, ToolErr> 
             format!(
                 "key: unknown key '{k}' (not a recognized key name, modifier, or single character)"
             ),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": "key", "arg": "key", "want": k}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "key", "arg": "key", "want": k}),
         )
     }
     // Split, keeping a trailing '+' as the base key `+` (e.g. `Ctrl++`).
@@ -4565,7 +4832,7 @@ async fn tool_storage(browser: &Browser, args: &Value) -> Result<Value, ToolErr>
     if !["get", "set", "clear", "save", "load"].contains(&action) {
         return Err(ToolErr::typed(
             format!("storage: unknown action '{action}' (get|set|clear|save|load)"),
-            json!({"code": "invalid_args", "reason": "unknown_action", "tool": "storage"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::UnknownAction.as_str(), "tool": "storage"}),
         ));
     }
     let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("all");
@@ -4575,7 +4842,7 @@ async fn tool_storage(browser: &Browser, args: &Value) -> Result<Value, ToolErr>
     if !(want_cookies || want_local || want_session) {
         return Err(ToolErr::typed(
             format!("storage: unknown scope '{scope}' (cookies|localStorage|sessionStorage|all)"),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": "storage", "arg": "scope", "want": scope}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "storage", "arg": "scope", "want": scope}),
         ));
     }
     // Live page identity for every page-scoped leg (and the reply).
@@ -4634,7 +4901,7 @@ fn opaque_err() -> ToolErr {
     ToolErr::typed(
         "storage: web storage is blocked on this page (opaque origin: no origin to scope it to)"
             .to_string(),
-        json!({"code": "invalid_target", "reason": "opaque_origin", "tool": "storage"}),
+        json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::OpaqueOrigin.as_str(), "tool": "storage"}),
     )
 }
 
@@ -4812,7 +5079,7 @@ struct SetCookie {
 fn bad_cookie(what: &str) -> ToolErr {
     ToolErr::typed(
         format!("storage: bad cookie entry ({what}; need name+value strings)"),
-        json!({"code": "invalid_args", "reason": "bad_value", "tool": "storage", "arg": "cookies"}),
+        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "storage", "arg": "cookies"}),
     )
 }
 
@@ -4851,7 +5118,7 @@ fn parse_set_cookie(c: &Value) -> Result<SetCookie, ToolErr> {
             _ => {
                 return Err(ToolErr::typed(
                     format!("storage: bad cookie sameSite '{s}' (want Strict|Lax|None)"),
-                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "storage", "arg": "cookies"}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "storage", "arg": "cookies"}),
                 ));
             }
         }),
@@ -4860,7 +5127,7 @@ fn parse_set_cookie(c: &Value) -> Result<SetCookie, ToolErr> {
     if same_site.as_deref() == Some("None") && !secure {
         return Err(ToolErr::typed(
             "storage: Secure is required with SameSite=None".to_string(),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": "storage", "arg": "cookies"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "storage", "arg": "cookies"}),
         ));
     }
     let expires = match obj.get("expires") {
@@ -4954,7 +5221,7 @@ async fn apply_cookies(
             _ => failed.push(json!({
                 "cookie": c.name,
                 "domain": c.domain.clone().unwrap_or_default(),
-                "reason": "set_failed",
+                "reason": ToolReason::SetFailed.as_str(),
             })),
         }
     }
@@ -4988,7 +5255,7 @@ async fn apply_cookies(
                 failed.push(json!({
                     "cookie": c.name,
                     "domain": dom,
-                    "reason": "not_stored",
+                    "reason": ToolReason::NotStored.as_str(),
                 }));
             }
         }
@@ -5004,8 +5271,8 @@ fn cookie_rejected(first: &Value, failed: &[Value]) -> ToolErr {
             first.get("cookie").and_then(|v| v.as_str()).unwrap_or("?")
         ),
         json!({
-            "code": "cookie_rejected",
-            "reason": "rejected",
+            "code": ToolCode::CookieRejected.as_str(),
+            "reason": ToolReason::Rejected.as_str(),
             "tool": "storage",
             "cookie": first.get("cookie").cloned().unwrap_or(Value::Null),
             "domain": first.get("domain").cloned().unwrap_or(Value::Null),
@@ -5024,7 +5291,7 @@ fn parse_items(v: Option<&Value>) -> Result<std::collections::BTreeMap<String, S
     let map = obj.as_object().ok_or_else(|| {
         ToolErr::typed(
             "storage: 'items' must be an object (key->value strings)".to_string(),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": "storage", "arg": "items"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "storage", "arg": "items"}),
         )
     })?;
     let mut out = std::collections::BTreeMap::new();
@@ -5036,7 +5303,7 @@ fn parse_items(v: Option<&Value>) -> Result<std::collections::BTreeMap<String, S
             None => {
                 return Err(ToolErr::typed(
                     format!("storage: bad item value for key '{k}' (want a string)"),
-                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "storage", "arg": "items"}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "storage", "arg": "items"}),
                 ));
             }
         }
@@ -5083,7 +5350,7 @@ async fn apply_items(
         .unwrap_or_default();
     let failed: Vec<Value> = keys
         .into_iter()
-        .map(|k| json!({"scope": scope, "key": k, "reason": "not_stored"}))
+        .map(|k| json!({"scope": scope, "key": k, "reason": ToolReason::NotStored.as_str()}))
         .collect();
     Ok((items.len().saturating_sub(failed.len()), failed))
 }
@@ -5112,7 +5379,7 @@ async fn storage_set(r: &StorageReq<'_>, args: &Value) -> Result<Value, ToolErr>
             _ => {
                 return Err(ToolErr::typed(
                     "storage: 'cookies' must be an array of {name, value, ...}".to_string(),
-                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "storage", "arg": "cookies"}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "storage", "arg": "cookies"}),
                 ));
             }
         }
@@ -5123,7 +5390,7 @@ async fn storage_set(r: &StorageReq<'_>, args: &Value) -> Result<Value, ToolErr>
     if !has_cookies && !has_items {
         return Err(ToolErr::typed(
             "storage: set needs 'cookies' and/or 'items'".to_string(),
-            json!({"code": "invalid_args", "reason": "need_option", "tool": "storage"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::NeedOption.as_str(), "tool": "storage"}),
         ));
     }
     if want_local || want_session {
@@ -5189,7 +5456,7 @@ async fn storage_clear(
             if crate::browser::cdp_url_override().is_some() && !flag(args, "confirm") {
                 return Err(ToolErr::typed(
                     "storage: clear with allSites:true on an attached engine needs confirm:true (browser-wide cookie wipe)".to_string(),
-                    json!({"code": "invalid_args", "reason": "missing_arg", "tool": "storage", "arg": "confirm"}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "storage", "arg": "confirm"}),
                 ));
             }
             let before = browser
@@ -5287,7 +5554,7 @@ async fn storage_save(r: &StorageReq<'_>, args: &Value, all_sites: bool) -> Resu
         None => {
             return Err(ToolErr::typed(
                 "storage: save needs required arg 'path'".to_string(),
-                json!({"code": "invalid_args", "reason": "missing_arg", "tool": "storage"}),
+                json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "storage"}),
             ));
         }
     };
@@ -5299,14 +5566,14 @@ async fn storage_save(r: &StorageReq<'_>, args: &Value, all_sites: bool) -> Resu
                     "storage: save parent directory does not exist: {}",
                     parent.display()
                 ),
-                json!({"code": "invalid_args", "reason": "bad_value", "tool": "storage", "arg": "path"}),
+                json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "storage", "arg": "path"}),
             ));
         }
     }
     if dest.exists() && !flag(args, "overwrite") {
         return Err(ToolErr::typed(
             format!("storage: refusing to overwrite existing file (pass overwrite:true): {path}"),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": "storage", "arg": "path"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "storage", "arg": "path"}),
         ));
     }
     // Gather (storage reads gate opaque origins themselves).
@@ -5376,7 +5643,7 @@ async fn storage_load(r: &StorageReq<'_>, args: &Value) -> Result<Value, ToolErr
         None => {
             return Err(ToolErr::typed(
                 "storage: load needs required arg 'path'".to_string(),
-                json!({"code": "invalid_args", "reason": "missing_arg", "tool": "storage"}),
+                json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "storage"}),
             ));
         }
     };
@@ -5385,7 +5652,7 @@ async fn storage_load(r: &StorageReq<'_>, args: &Value) -> Result<Value, ToolErr
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(ToolErr::typed(
                 format!("storage: file not found: {path}"),
-                json!({"code": "file_not_found", "reason": "missing_path", "tool": "storage", "path": path}),
+                json!({"code": ToolCode::FileNotFound.as_str(), "reason": ToolReason::MissingPath.as_str(), "tool": "storage", "path": path}),
             ));
         }
         Err(e) => return Err(ToolErr::fallback(format!("storage: load failed: {e}"))),
@@ -5393,13 +5660,13 @@ async fn storage_load(r: &StorageReq<'_>, args: &Value) -> Result<Value, ToolErr
     let doc: Value = serde_json::from_str(&text).map_err(|_| {
         ToolErr::typed(
             "storage: not valid gladius storage JSON (want {gladiusStorage:1,...})".to_string(),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": "storage", "arg": "path"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "storage", "arg": "path"}),
         )
     })?;
     if doc.get("gladiusStorage").and_then(|v| v.as_i64()) != Some(1) {
         return Err(ToolErr::typed(
             "storage: unsupported storage version (want gladiusStorage:1)".to_string(),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": "storage", "arg": "path"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "storage", "arg": "path"}),
         ));
     }
     let file_origin = doc
@@ -5410,7 +5677,7 @@ async fn storage_load(r: &StorageReq<'_>, args: &Value) -> Result<Value, ToolErr
     if file_origin != origin && !flag(args, "force") {
         return Err(ToolErr::typed(
             format!("storage: origin mismatch (file {file_origin} vs current {origin}; pass force:true to apply anyway)"),
-            json!({"code": "origin_mismatch", "reason": "mismatch", "tool": "storage", "fileOrigin": file_origin, "origin": origin, "path": path}),
+            json!({"code": ToolCode::OriginMismatch.as_str(), "reason": ToolReason::Mismatch.as_str(), "tool": "storage", "fileOrigin": file_origin, "origin": origin, "path": path}),
         ));
     }
     // Validate everything before anything applies. Malformed rows fail
@@ -5428,7 +5695,7 @@ async fn storage_load(r: &StorageReq<'_>, args: &Value) -> Result<Value, ToolErr
                         Err(_) => failed.push(json!({
                             "cookie": c.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
                             "domain": c.get("domain").and_then(|v| v.as_str()).unwrap_or(""),
-                            "reason": "bad_entry",
+                            "reason": ToolReason::BadEntry.as_str(),
                         })),
                     }
                 }
@@ -5436,7 +5703,7 @@ async fn storage_load(r: &StorageReq<'_>, args: &Value) -> Result<Value, ToolErr
             _ => {
                 return Err(ToolErr::typed(
                     "storage: bad file cookies (want an array)".to_string(),
-                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "storage", "arg": "path"}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "storage", "arg": "path"}),
                 ));
             }
         }
@@ -5447,7 +5714,7 @@ async fn storage_load(r: &StorageReq<'_>, args: &Value) -> Result<Value, ToolErr
             Some(v) => parse_items(Some(v)).map_err(|_| {
                 ToolErr::typed(
                     format!("storage: bad file {key} (want an object)"),
-                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "storage", "arg": "path"}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "storage", "arg": "path"}),
                 )
             }),
         }
@@ -5527,7 +5794,7 @@ async fn tool_viewport(browser: &Browser, args: &Value) -> Result<Value, ToolErr
         let v = args.get(name).ok_or_else(|| {
             ToolErr::typed(
                 format!("viewport: missing required arg '{name}'"),
-                json!({"code": "invalid_args", "reason": "missing_arg", "tool": "viewport"}),
+                json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "viewport"}),
             )
         })?;
         // JSON numbers arrive as int or float depending on the client
@@ -5539,7 +5806,7 @@ async fn tool_viewport(browser: &Browser, args: &Value) -> Result<Value, ToolErr
                 _ => {
                     return Err(ToolErr::typed(
                         format!("viewport: '{name}' must be an integer, got {v}"),
-                        json!({"code": "invalid_args", "reason": "bad_value", "tool": "viewport"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "viewport"}),
                     ));
                 }
             },
@@ -5547,7 +5814,7 @@ async fn tool_viewport(browser: &Browser, args: &Value) -> Result<Value, ToolErr
         if n < 1 {
             return Err(ToolErr::typed(
                 format!("viewport: '{name}' must be >= 1, got {n}"),
-                json!({"code": "invalid_args", "reason": "bad_value", "tool": "viewport"}),
+                json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "viewport"}),
             ));
         }
         Ok(n)
@@ -5561,7 +5828,7 @@ async fn tool_viewport(browser: &Browser, args: &Value) -> Result<Value, ToolErr
             _ => {
                 return Err(ToolErr::typed(
                     format!("viewport: 'deviceScaleFactor' must be a number > 0, got {v}"),
-                    json!({"code": "invalid_args", "reason": "bad_value", "tool": "viewport"}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "viewport"}),
                 ));
             }
         },
@@ -5604,11 +5871,11 @@ async fn tool_tabs(
             Some(n) if n >= 0 => Ok(n as usize),
             Some(n) => Err(ToolErr::typed(
                 format!("tabs: bad index {n}"),
-                json!({"code": "invalid_args", "reason": "bad_index", "tool": "tabs"}),
+                json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadIndex.as_str(), "tool": "tabs"}),
             )),
             None => Err(ToolErr::typed(
                 "tabs: missing required arg 'index'".to_string(),
-                json!({"code": "invalid_args", "reason": "missing_arg", "tool": "tabs"}),
+                json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "tabs"}),
             )),
         }
     };
@@ -5626,7 +5893,7 @@ async fn tool_tabs(
         other => {
             return Err(ToolErr::typed(
                 format!("tabs: unknown action '{other}'"),
-                json!({"code": "invalid_args", "reason": "unknown_action", "tool": "tabs"}),
+                json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::UnknownAction.as_str(), "tool": "tabs"}),
             ))
         }
     };
@@ -5641,7 +5908,7 @@ fn tabs_err(e: String) -> ToolErr {
     if e.starts_with("tabs: no tab at index ") {
         ToolErr::typed(
             e,
-            json!({"code": "invalid_target", "reason": "not_found", "tool": "tabs"}),
+            json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "tabs"}),
         )
     } else {
         ToolErr::fallback(e)
@@ -5679,7 +5946,7 @@ async fn tool_targets(
                 None => {
                     return Err(ToolErr::typed(
                         "targets: missing required arg 'target' (CDP targetId)".to_string(),
-                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "targets"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "targets"}),
                     ));
                 }
             };
@@ -5688,7 +5955,7 @@ async fn tool_targets(
         }
         other => Err(ToolErr::typed(
             format!("targets: unknown action '{other}' (list|select)"),
-            json!({"code": "invalid_args", "reason": "unknown_action", "tool": "targets"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::UnknownAction.as_str(), "tool": "targets"}),
         )),
     }
 }
@@ -5702,12 +5969,12 @@ fn targets_err(e: String) -> ToolErr {
     if e.starts_with("targets: no target with id ") {
         ToolErr::typed(
             e,
-            json!({"code": "invalid_target", "reason": "not_found", "tool": "targets"}),
+            json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "targets"}),
         )
     } else if e.contains("not a page (select takes page targets") {
         ToolErr::typed(
             e,
-            json!({"code": "invalid_target", "reason": "not_select", "tool": "targets"}),
+            json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotSelect.as_str(), "tool": "targets"}),
         )
     } else {
         ToolErr::fallback(e)
@@ -5741,7 +6008,7 @@ async fn tool_dialog(
                 None => {
                     return Err(ToolErr::typed(
                         "dialog: 'policy' needs required arg 'accept' (bool)".to_string(),
-                        json!({"code": "invalid_args", "reason": "missing_arg", "tool": "dialog"}),
+                        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "dialog"}),
                     ));
                 }
             };
@@ -5755,7 +6022,7 @@ async fn tool_dialog(
         }
         other => Err(ToolErr::typed(
             format!("dialog: unknown action '{other}' (get|policy)"),
-            json!({"code": "invalid_args", "reason": "unknown_action", "tool": "dialog"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::UnknownAction.as_str(), "tool": "dialog"}),
         )),
     }
 }
@@ -5774,12 +6041,12 @@ fn history_err(e: String) -> ToolErr {
     if e.starts_with("history: unknown action ") {
         ToolErr::typed(
             e,
-            json!({"code": "invalid_args", "reason": "unknown_action", "tool": "history"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::UnknownAction.as_str(), "tool": "history"}),
         )
     } else if e.contains("(at boundary)") {
         ToolErr::typed(
             e,
-            json!({"code": "invalid_target", "reason": "not_found", "tool": "history"}),
+            json!({"code": ToolCode::InvalidTarget.as_str(), "reason": ToolReason::NotFound.as_str(), "tool": "history"}),
         )
     } else {
         ToolErr::fallback(e)
@@ -5809,7 +6076,7 @@ async fn tool_network(
         }
         other => Err(ToolErr::typed(
             format!("network: unknown action '{other}' (get|drain|clear)"),
-            json!({"code": "invalid_args", "reason": "unknown_action", "tool": "network"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::UnknownAction.as_str(), "tool": "network"}),
         )),
     }
 }
@@ -5827,12 +6094,83 @@ async fn tool_cdp(
     if method.trim().is_empty() {
         return Err(ToolErr::typed(
             "cdp: missing required arg 'method'".to_string(),
-            json!({"code": "invalid_args", "reason": "missing_arg", "tool": "cdp"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::MissingArg.as_str(), "tool": "cdp"}),
         ));
     }
     match browser.cdp_raw(method, params, session).await {
         Ok(v) => Ok(ok_text(json!({"result": v}).to_string())),
         Err(e) => Err(ToolErr::fallback(e)),
+    }
+}
+
+#[cfg(test)]
+mod error_taxonomy_tests {
+    use super::{ToolCode, ToolReason};
+
+    /// The closed sets are total: every variant survives a wire round trip, so
+    /// a `typed:` marker minted here is always readable back by
+    /// `ToolErr::from(String)`.
+    #[test]
+    fn every_variant_round_trips_through_its_wire_string() {
+        for code in ToolCode::ALL {
+            assert_eq!(
+                ToolCode::from_wire(code.as_str()),
+                Some(*code),
+                "{} does not round trip",
+                code.as_str()
+            );
+        }
+        for reason in ToolReason::ALL {
+            assert_eq!(
+                ToolReason::from_wire(reason.as_str()),
+                Some(*reason),
+                "{} does not round trip",
+                reason.as_str()
+            );
+        }
+    }
+
+    /// Two variants sharing a wire string would make `from_wire` ambiguous and
+    /// the marker lossy.
+    #[test]
+    fn wire_strings_are_unique() {
+        let mut seen: Vec<&str> = ToolCode::ALL.iter().map(|c| c.as_str()).collect();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), before, "duplicate code wire string");
+
+        let mut seen: Vec<&str> = ToolReason::ALL.iter().map(|r| r.as_str()).collect();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), before, "duplicate reason wire string");
+    }
+
+    /// The marker is the inverse of the parse: what a deep site mints is what
+    /// `From<String>` reads.
+    #[test]
+    fn marker_prefix_matches_the_minted_marker() {
+        let minted = super::typed_marker(ToolCode::JsError, ToolReason::Thrown, "boom");
+        assert!(minted.starts_with(&ToolCode::JsError.marker()), "{minted}");
+        let err: super::ToolErr = minted.into();
+        let sc = err.sc.clone();
+        assert_eq!(sc.get("code").and_then(|v| v.as_str()), Some("js_error"));
+        assert_eq!(sc.get("reason").and_then(|v| v.as_str()), Some("thrown"));
+    }
+
+    /// A marker naming a code this build does not know is not smuggled out:
+    /// it falls back to the residue.
+    #[test]
+    fn an_unknown_marker_falls_back() {
+        let err: super::ToolErr = super::typed_marker(ToolCode::JsError, ToolReason::Thrown, "x")
+            .replace("js_error", "not_a_code")
+            .into();
+        assert_eq!(
+            err.sc.get("code").and_then(|v| v.as_str()),
+            Some("error"),
+            "an unknown code is not trusted"
+        );
     }
 }
 

@@ -75,7 +75,7 @@ use serde_json::{json, Value};
 
 use crate::browser::Browser;
 use crate::capture::{self, Options};
-use crate::tools::ToolErr;
+use crate::tools::{ToolCode, ToolErr, ToolReason};
 
 /// Budget for the scratch diff target: page load + decode + pixel loop.
 const DIFF_BUDGET: Duration = Duration::from_secs(20);
@@ -156,7 +156,7 @@ fn cap_refusal(name: &str) -> Option<ToolErr> {
              silently",
             dir.display()
         ),
-        json!({"code": "invalid_args", "reason": "bad_value", "tool": "visual", "arg": "name"}),
+        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": "visual", "arg": "name"}),
     ))
 }
 
@@ -524,12 +524,12 @@ pub enum MetaState {
 
 impl MetaState {
     /// `missing` / `malformed` / `unreadable` / `recorded`.
-    fn reason(&self) -> &'static str {
+    fn reason(&self) -> ToolReason {
         match self {
-            MetaState::Recorded(_) => "recorded",
-            MetaState::Missing => "missing",
-            MetaState::Malformed(_) => "malformed",
-            MetaState::Unreadable(_) => "unreadable",
+            MetaState::Recorded(_) => ToolReason::Recorded,
+            MetaState::Missing => ToolReason::Missing,
+            MetaState::Malformed(_) => ToolReason::Malformed,
+            MetaState::Unreadable(_) => ToolReason::Unreadable,
         }
     }
 
@@ -910,8 +910,8 @@ fn scratch_background_unsupported(detail: &str) -> ToolErr {
             "visual: scratch_background_unsupported: the engine refused to create the diff \
              target in the background ({detail}); refusing to open a foreground tab"
         ),
-        serde_json::json!({"code": "scratch_background_unsupported",
-                           "reason": "background_param_rejected", "tool": "visual"}),
+        serde_json::json!({"code": ToolCode::ScratchBackgroundUnsupported.as_str(),
+                           "reason": ToolReason::BackgroundParamRejected.as_str(), "tool": "visual"}),
     )
 }
 
@@ -1373,8 +1373,8 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
                 "visual: baseline_environment_unknown: {} (requireEnvironmentMatch:true needs a recorded environment; re-save the baseline with update:true)",
                 meta_state.detail()
             ),
-            json!({"code": "baseline_environment_unknown",
-                   "reason": meta_state.reason(), "tool": "visual", "name": safe,
+            json!({"code": ToolCode::BaselineEnvironmentUnknown.as_str(),
+                   "reason": meta_state.reason().as_str(), "tool": "visual", "name": safe,
                    "metaPath": meta_path(&safe).to_string_lossy()}),
         ));
     }
@@ -1460,7 +1460,7 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
                             .map(|t| t.join(", "))
                             .unwrap_or_else(|| "unknown".to_string())
                     ),
-                    json!({"code": "baseline_environment_unsettled", "reason": "unsettled",
+                    json!({"code": ToolCode::BaselineEnvironmentUnsettled.as_str(), "reason": ToolReason::Unsettled.as_str(),
                            "tool": "visual", "name": safe,
                            "settleTimeouts": b.settle_timeouts}),
                 ));

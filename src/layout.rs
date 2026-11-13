@@ -24,7 +24,7 @@
 use serde_json::{json, Value};
 
 use crate::browser::Browser;
-use crate::tools::ToolErr;
+use crate::tools::{ToolCode, ToolErr, ToolReason};
 
 /// One requested target: an AX ref id (`eN`) or a CSS selector.
 #[derive(Clone)]
@@ -205,7 +205,7 @@ async fn resolve(browser: &Browser, tool: &str, specs: &[Spec]) -> Result<Vec<No
             .map_err(|e| {
                 ToolErr::typed(
                     format!("{tool}: invalid selector '{}' ({e})", spec.label()),
-                    json!({"code": "invalid_args", "reason": "bad_value", "tool": tool,
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": tool,
                            "arg": "selector", "selector": spec.label()}),
                 )
             })?;
@@ -475,7 +475,7 @@ fn parse_checks(tool: &str, checks: Option<&Value>) -> Result<Checks, ToolErr> {
     let Some(obj) = v.as_object() else {
         return Err(ToolErr::typed(
             format!("{tool}: 'checks' must be an object"),
-            json!({"code": "invalid_args", "reason": "bad_value", "tool": tool, "arg": "checks"}),
+            json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": tool, "arg": "checks"}),
         ));
     };
     for (k, val) in obj {
@@ -524,7 +524,7 @@ fn parse_checks(tool: &str, checks: Option<&Value>) -> Result<Checks, ToolErr> {
             other => {
                 return Err(ToolErr::typed(
                     format!("{tool}: unknown check '{other}'"),
-                    json!({"code": "invalid_args", "reason": "unknown_arg", "tool": tool, "arg": other}),
+                    json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::UnknownArg.as_str(), "tool": tool, "arg": other}),
                 ))
             }
         }
@@ -535,7 +535,7 @@ fn parse_checks(tool: &str, checks: Option<&Value>) -> Result<Checks, ToolErr> {
 fn bad_check(tool: &str, key: &str, want: &str) -> ToolErr {
     ToolErr::typed(
         format!("{tool}: check '{key}' must be {want}"),
-        json!({"code": "invalid_args", "reason": "bad_value", "tool": tool, "arg": key}),
+        json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BadValue.as_str(), "tool": tool, "arg": key}),
     )
 }
 

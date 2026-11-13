@@ -1713,3 +1713,278 @@ fn visual_compare_changed_and_size_mismatch_shapes() {
     let _ = c.call("viewport", json!({"reset": true}));
     finish(c);
 }
+
+// --------------------------------------------------------------------- S3.3
+
+/// An externally started engine the TEST owns, so "the engine died" is a fact
+/// the test controls instead of a race it hopes to win. Same resolution as
+/// production (`GLADIUS_CHROMIUM`, else the versioned cache).
+struct External {
+    child: Child,
+    port: u16,
+    profile: std::path::PathBuf,
+}
+
+fn pinned_chromium_exe() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("GLADIUS_CHROMIUM") {
+        if !p.trim().is_empty() {
+            return std::path::PathBuf::from(p.trim());
+        }
+    }
+    let root = match std::env::var("GLADIUS_CHROMIUM_CACHE") {
+        Ok(v) if !v.trim().is_empty() => std::path::PathBuf::from(v.trim()),
+        _ => std::path::PathBuf::from(
+            std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA for pinned chromium"),
+        )
+        .join("gladius")
+        .join("chromium"),
+    };
+    root.join("155.0.8059.84-5ca590a4")
+        .join("chrome-headless-shell-win64")
+        .join("chrome-headless-shell.exe")
+}
+
+/// A minimal HTTP GET on loopback: enough for `/json/version`, nothing more.
+/// The DevTools server builds `webSocketDebuggerUrl` from the Host header, so
+/// the header must carry the port, and it answers HTTP/1.1 (a read-to-end
+/// would wait for a close that never comes unless `Connection: close` is sent).
+fn http_get(port: u16, path: &str) -> Option<String> {
+    use std::io::{Read as _, Write as _};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    s.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            // A read timeout after the body arrived is still an answer.
+            Err(_) => break,
+        }
+    }
+    Some(String::from_utf8_lossy(&raw).to_string())
+}
+
+impl External {
+    fn start() -> Self {
+        let exe = pinned_chromium_exe();
+        assert!(
+            exe.is_file(),
+            "pinned chromium missing: {} (provision with scripts/fetch-chromium.ps1)",
+            exe.display()
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("free port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        let profile = std::env::temp_dir().join(format!(
+            "gladius-w3-typed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&profile).expect("external profile dir");
+        let mut cmd = Command::new(&exe);
+        cmd.args([
+            "--headless",
+            &format!("--remote-debugging-port={port}"),
+            &format!("--user-data-dir={}", profile.display()),
+            "--no-first-run",
+            "--no-default-browser-check",
+            &format!("--remote-allow-origins=http://127.0.0.1:{port}"),
+            "about:blank",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
+        let child = cmd.spawn().expect("spawn external chromium");
+        let ext = External {
+            child,
+            port,
+            profile,
+        };
+        let t0 = std::time::Instant::now();
+        while !http_get(port, "/json/version").is_some_and(|b| b.contains("webSocketDebuggerUrl")) {
+            assert!(
+                t0.elapsed() < Duration::from_secs(30),
+                "external engine never became ready on port {port}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        ext
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+impl Drop for External {
+    fn drop(&mut self) {
+        self.child.kill().ok();
+        let _ = self.child.wait();
+        std::fs::remove_dir_all(&self.profile).ok();
+    }
+}
+
+/// SPEC.md S3.3 / S2.1: transport death and JS throws stop being `error`.
+///
+/// Three calls, three codes, none of them the residue:
+/// - an engine that died under an ATTACHED server (gladius's to reap, not to
+///   relaunch) is `engine_dead`/`transport`, and the prose names `close`;
+/// - `evaluate` of `throw new Error('x')` is `js_error`/`thrown`;
+/// - `evaluate` of `undefined` is `js_error`/`undefined_result`, which is a
+///   different fact from an explicit `null` and must not read as one.
+///
+/// The attached engine is what makes the first case deterministic: the test
+/// owns the process, so the death is its decision rather than a race.
+#[test]
+fn transport_and_js_failures_are_typed() {
+    let mut ext = External::start();
+    let base = ext.base_url();
+    let mut c = Client::spawn_extra(&[("GLADIUS_CDP_URL", base.as_str())]);
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+    let nav = c.call("navigate", json!({"url": fixture_url()}));
+    assert!(
+        nav.get("isError").is_none(),
+        "navigate on the attached engine: {nav}"
+    );
+
+    // --- JS throw -----------------------------------------------------------
+    let thrown = c.call(
+        "evaluate",
+        json!({"expression": "throw new Error('deliberate')"}),
+    );
+    assert!(is_error(&thrown), "a throw is an error: {thrown}");
+    let sc = structured(&thrown);
+    assert_eq!(
+        sc.get("code").and_then(|v| v.as_str()),
+        Some("js_error"),
+        "a page JS throw is typed js_error, never the residue: {thrown}"
+    );
+    assert_eq!(
+        sc.get("reason").and_then(|v| v.as_str()),
+        Some("thrown"),
+        "and its reason is `thrown`: {thrown}"
+    );
+    assert!(
+        content_text(&thrown).contains("js exception"),
+        "the prose is unchanged from 0.7.x: {thrown}"
+    );
+
+    // --- undefined ----------------------------------------------------------
+    let undefined = c.call("evaluate", json!({"expression": "undefined"}));
+    assert!(is_error(&undefined), "undefined is an error: {undefined}");
+    let sc = structured(&undefined);
+    assert_eq!(
+        sc.get("code").and_then(|v| v.as_str()),
+        Some("js_error"),
+        "a valueless result is typed js_error: {undefined}"
+    );
+    assert_eq!(
+        sc.get("reason").and_then(|v| v.as_str()),
+        Some("undefined_result"),
+        "and its reason distinguishes it from a throw: {undefined}"
+    );
+
+    // An explicit null is still a VALUE, not an error: the distinction the
+    // code exists to keep.
+    let explicit_null = c.call("evaluate", json!({"expression": "null"}));
+    assert!(
+        !is_error(&explicit_null),
+        "an explicit null is a value, not a failure: {explicit_null}"
+    );
+
+    // --- transport death ----------------------------------------------------
+    ext.child.kill().ok();
+    let mut waited = ext.child.try_wait();
+    for _ in 0..100 {
+        if matches!(waited, Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        waited = ext.child.try_wait();
+    }
+    assert!(
+        matches!(waited, Ok(Some(_))),
+        "the external engine is gone before the call that observes it"
+    );
+
+    let dead = c.call("snapshot", json!({}));
+    assert!(is_error(&dead), "the call fails on a dead engine: {dead}");
+    let sc = structured(&dead);
+    assert_eq!(
+        sc.get("code").and_then(|v| v.as_str()),
+        Some("engine_dead"),
+        "transport death is typed engine_dead, never the residue: {dead}"
+    );
+    assert_eq!(
+        sc.get("reason").and_then(|v| v.as_str()),
+        Some("transport"),
+        "an attached engine is not gladius's to restart: {dead}"
+    );
+    assert!(
+        content_text(&dead).contains("close"),
+        "the prose names the recovery: {dead}"
+    );
+
+    // The three codes are distinct, and none of them is the residue.
+    for (name, reply) in [
+        ("throw", &thrown),
+        ("undefined", &undefined),
+        ("dead", &dead),
+    ] {
+        let code = structured(reply)
+            .get("code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        assert_ne!(
+            code, "error",
+            "{name} must not fall into the residue: {reply}"
+        );
+    }
+
+    shutdown(c);
+}
+
+/// SPEC.md S3.3: the residue is reachable from exactly one place.
+///
+/// `code:"error"` survives for failures that genuinely know nothing, and the
+/// only constructor that may mint it is `ToolErr::fallback`. A new
+/// `ToolCode::Error.as_str()` anywhere in `src/` would mean a site chose the
+/// residue over the code it knew, so this counts the minting sites.
+#[test]
+fn the_error_residue_is_minted_from_one_place() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut mints: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&src).expect("read src") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("read source");
+        for (i, line) in text.lines().enumerate() {
+            if line.contains("ToolCode::Error.as_str()") {
+                mints.push(format!("{}:{}", path.display(), i + 1));
+            }
+        }
+    }
+    assert_eq!(
+        mints.len(),
+        1,
+        "the residue is minted by `ToolErr::fallback` and nowhere else: {mints:?}"
+    );
+}

@@ -10,6 +10,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::process::Command;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
+
+use crate::tools::{typed_marker, ToolCode, ToolReason};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
@@ -599,18 +601,18 @@ impl Browser {
             // job cover and private profile never outlive the relaunch.
             let _ = self.close().await;
             if !owned {
-                return Err(crate::tools::typed_marker(
-                    "engine_dead",
-                    "transport",
+                return Err(typed_marker(
+                    ToolCode::EngineDead,
+                    ToolReason::Transport,
                     "the engine attached with GLADIUS_CDP_URL closed the connection; it is not \
                      gladius's to restart - start it again, call `close` to drop the stale \
                      connection, then retry",
                 ));
             }
             if self.respawn_used.swap(true, Ordering::SeqCst) {
-                return Err(crate::tools::typed_marker(
-                    "engine_dead",
-                    "respawn_failed",
+                return Err(typed_marker(
+                    ToolCode::EngineDead,
+                    ToolReason::RespawnFailed,
                     "the owned browser died again before it came back; call `close` and retry \
                      (the next call launches a fresh engine)",
                 ));
@@ -620,9 +622,9 @@ impl Browser {
             Ok(inner) => inner,
             Err(e) => {
                 if corpse_owned.is_some() {
-                    return Err(crate::tools::typed_marker(
-                        "engine_dead",
-                        "respawn_failed",
+                    return Err(typed_marker(
+                        ToolCode::EngineDead,
+                        ToolReason::RespawnFailed,
                         &format!(
                             "the owned browser did not come back ({e}); call `close` and retry \
                              (the next call launches a fresh engine)"
@@ -676,20 +678,14 @@ impl Browser {
             )
             .await?;
         if let Some(ex) = r.get("exceptionDetails") {
-            return Err(format!("js exception: {ex}"));
+            return Err(js_thrown(ex));
         }
         let robj = r
             .get("result")
             .ok_or("evaluate: no result in response".to_string())?;
         match robj.get("value") {
             Some(v) => Ok(v.clone()), // includes an explicit null
-            None => {
-                let t = robj
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                Err(format!("evaluate: expression returned {t} (no value)"))
-            }
+            None => Err(js_no_value(robj)),
         }
     }
 
@@ -926,20 +922,14 @@ impl Browser {
             )
             .await?;
         if let Some(ex) = r.get("exceptionDetails") {
-            return Err(format!("js exception: {ex}"));
+            return Err(js_thrown(ex));
         }
         let robj = r
             .get("result")
             .ok_or("evaluate: no result in response".to_string())?;
         match robj.get("value") {
             Some(v) => Ok(v.clone()),
-            None => {
-                let t = robj
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                Err(format!("evaluate: expression returned {t} (no value)"))
-            }
+            None => Err(js_no_value(robj)),
         }
     }
 
@@ -1231,7 +1221,7 @@ impl Browser {
             .await
             .map_err(|e| format!("targets: no frame with id {frame_id}: {e}"))?;
         if let Some(ex) = r.get("exceptionDetails") {
-            return Err(format!("js exception: {ex}"));
+            return Err(js_thrown(ex));
         }
         let oid = r
             .get("result")
@@ -1926,20 +1916,14 @@ impl Browser {
         )
         .await?;
         if let Some(ex) = r.get("exceptionDetails") {
-            return Err(format!("js exception: {ex}"));
+            return Err(js_thrown(ex));
         }
         let robj = r
             .get("result")
             .ok_or("evaluate: no result in response".to_string())?;
         match robj.get("value") {
             Some(v) => Ok(v.clone()),
-            None => {
-                let t = robj
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                Err(format!("evaluate: expression returned {t} (no value)"))
-            }
+            None => Err(js_no_value(robj)),
         }
     }
 
@@ -2008,7 +1992,10 @@ impl Browser {
                         return Ok(true);
                     }
                 }
-                Ok(Err(e)) if e.starts_with("js exception") => return Err(e),
+                // A throwing condition is not "not yet true". Matched on the
+                // typed marker, not on the prose: the marker is minted at the
+                // throw site and cannot be forged by a page's own text.
+                Ok(Err(e)) if e.starts_with(&ToolCode::JsError.marker()) => return Err(e),
                 // Session death is not "not yet true": fail fast so polling
                 // waits surface the typed stale_session instead of burning
                 // the budget on a corpse.
@@ -2210,20 +2197,14 @@ async fn eval_on_session(
     )
     .await?;
     if let Some(ex) = r.get("exceptionDetails") {
-        return Err(format!("js exception: {ex}"));
+        return Err(js_thrown(ex));
     }
     let robj = r
         .get("result")
         .ok_or("evaluate: no result in response".to_string())?;
     match robj.get("value") {
         Some(v) => Ok(v.clone()),
-        None => {
-            let t = robj
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            Err(format!("evaluate: expression returned {t} (no value)"))
-        }
+        None => Err(js_no_value(robj)),
     }
 }
 
@@ -2318,7 +2299,37 @@ fn engine_dead_transport(shared: &Arc<Shared>, what: &str) -> String {
         "the engine attached with GLADIUS_CDP_URL is not gladius's to restart: start it again, \
          call `close` to drop the stale connection, then retry"
     };
-    crate::tools::typed_marker("engine_dead", "transport", &format!("{what}; {next}"))
+    typed_marker(
+        ToolCode::EngineDead,
+        ToolReason::Transport,
+        &format!("{what}; {next}"),
+    )
+}
+
+/// The page's JavaScript threw, typed at the error site (SPEC §4.1, S3.3):
+/// `js_error`/`thrown`, never the untyped `code:"error"` residue. The prose is
+/// the same string the 0.7.x envelope carried.
+fn js_thrown(ex: &Value) -> String {
+    typed_marker(
+        ToolCode::JsError,
+        ToolReason::Thrown,
+        &format!("js exception: {ex}"),
+    )
+}
+
+/// A `Runtime.evaluate` reply that carried no value - JavaScript `undefined`
+/// or another valueless type, which stays distinguishable from an explicit
+/// `null`: `js_error`/`undefined_result` (SPEC §4.1, S3.3).
+fn js_no_value(robj: &Value) -> String {
+    let t = robj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    typed_marker(
+        ToolCode::JsError,
+        ToolReason::UndefinedResult,
+        &format!("evaluate: expression returned {t} (no value)"),
+    )
 }
 
 /// `send_raw` with an injectable response timeout (production passes 30s;

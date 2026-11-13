@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::browser::Browser;
-use crate::tools;
+use crate::tools::{self, ToolCode, ToolReason};
 
 /// G1 version matrix.
 const LEGACY_1: &str = "2025-06-18";
@@ -49,7 +49,7 @@ fn call_budget(args: &mut Value) -> Result<Duration, crate::tools::ToolErr> {
                     "_budgetMs must be an integer number of milliseconds in \
                      {MIN_TOOL_BUDGET_MS}..={MAX_TOOL_BUDGET_MS}; got {v}"
                 ),
-                json!({"code": "invalid_args", "reason": "budget_mismatch", "arg": "_budgetMs"}),
+                json!({"code": ToolCode::InvalidArgs.as_str(), "reason": ToolReason::BudgetMismatch.as_str(), "arg": "_budgetMs"}),
             )),
         };
     }
@@ -72,7 +72,7 @@ fn budget_timeout(tool: &str, budget: Duration) -> Value {
              started is retried (raise `_budgetMs` for a legitimately long call)",
             budget.as_millis()
         ),
-        json!({"code": "timeout", "reason": "budget_exceeded", "tool": tool,
+        json!({"code": ToolCode::Timeout.as_str(), "reason": ToolReason::BudgetExceeded.as_str(), "tool": tool,
                "budgetMs": budget.as_millis() as u64}),
     )
     .envelope()
@@ -87,7 +87,7 @@ fn cancelled_result(tool: &str) -> Value {
             "{tool}: cancelled by the client (notifications/cancelled); the call stopped and \
              nothing is retried"
         ),
-        json!({"code": "cancelled", "reason": "client_cancelled", "tool": tool}),
+        json!({"code": ToolCode::Cancelled.as_str(), "reason": ToolReason::ClientCancelled.as_str(), "tool": tool}),
     )
     .envelope()
 }
