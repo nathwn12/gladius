@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { verifyReceipt, requiredChecks, verifyArtifacts, validateBlobMap, releaseIdentity } from "./release-handoff.mjs";
+import { verifyReceipt, requiredChecks, verifyArtifacts, validateBlobMap, releaseIdentity, releaseEnvironment } from "./release-handoff.mjs";
 
 test("handoff accepts exact bytes and refuses corruption, stale identity and incomplete gates", () => {
   const dir = mkdtempSync(join(tmpdir(), "gladius-handoff-"));
@@ -108,4 +108,12 @@ test("backup identity ignores download counters but detects asset replacement", 
   assert.deepEqual(releaseIdentity(downloaded), releaseIdentity(release));
   downloaded.assets[0].digest = "sha256:changed";
   assert.notDeepEqual(releaseIdentity(downloaded), releaseIdentity(release));
+});
+
+test("local gate isolates the browser and cleanroom cannot inherit a warmed engine", () => {
+  const parent = { PATH: "tools", GLADIUS_CHROMIUM: "ambient.exe", GLADIUS_CDP_URL: "ws://external", GLADIUS_ENGINE_CACHE: "warm", GLADIUS_CHROMIUM_CACHE: "shared" };
+  const isolated = releaseEnvironment("owned-cache", parent);
+  assert.deepEqual(isolated, { PATH: "tools", GLADIUS_CHROMIUM_CACHE: "owned-cache" });
+  assert.deepEqual(releaseEnvironment(null, isolated), { PATH: "tools" });
+  assert.equal(parent.GLADIUS_CHROMIUM_CACHE, "shared");
 });

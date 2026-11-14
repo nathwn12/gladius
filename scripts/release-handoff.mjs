@@ -11,6 +11,12 @@ export const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex"
 export const need = (condition, message) => { if (!condition) throw new Error(message); };
 export const safeName = (name) => typeof name === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name) && name !== "." && name !== "..";
 
+export function releaseEnvironment(cache, parent = process.env) {
+  const env = Object.fromEntries(Object.entries(parent).filter(([name]) => !/^GLADIUS_/i.test(name)));
+  if (cache) env.GLADIUS_CHROMIUM_CACHE = cache;
+  return env;
+}
+
 export function validateBlobMap(text) {
   const map = JSON.parse(text);
   need(map && !Array.isArray(map) && typeof map === "object" && Object.hasOwn(map, "release-receipt.json"), "receipt blob missing");

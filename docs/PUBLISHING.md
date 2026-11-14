@@ -30,7 +30,10 @@ It does not edit tracked manifests or close the working tree's changelog.
 `release-receipt.json` records the exact commit, version, required passing checks,
 and artifact sizes and SHA-256 values. Retain its separately printed SHA-256.
 The receipt is a local assertion, not independent evidence that CI built the executable.
-The cleanroom fetches the browser from Google, never bundles it.
+The build provisions a fresh browser inside its owned work directory, never the
+shared cache. Ambient Gladius engine/browser overrides are scrubbed. The separate
+cleanroom fetches the browser from Google into its own fresh profile; it never
+inherits the build cache or bundles a browser.
 
 ## Stage once, then rehearse once
 

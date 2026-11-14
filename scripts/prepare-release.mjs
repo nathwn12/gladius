@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync, execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { need, sha256, requiredChecks, releaseNotes, verifyArtifacts } from "./release-handoff.mjs";
+import { need, sha256, requiredChecks, releaseNotes, verifyArtifacts, releaseEnvironment } from "./release-handoff.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.chdir(root);
@@ -12,7 +12,8 @@ const args = process.argv.slice(2);
 const arg = (name) => args[args.indexOf(name) + 1];
 const read = (file) => fs.readFileSync(file);
 const json = (file) => JSON.parse(read(file));
-const run = (exe, argv) => execFileSync(exe, argv, { cwd: root, windowsHide: true, stdio: "inherit", timeout: 1800000 });
+let childEnv = releaseEnvironment(null);
+const run = (exe, argv, env = childEnv) => execFileSync(exe, argv, { cwd: root, env, windowsHide: true, stdio: "inherit", timeout: 1800000 });
 const capture = (exe, argv) => execFileSync(exe, argv, { cwd: root, windowsHide: true, encoding: "utf8" }).trim();
 let work;
 let createdWork = false;
@@ -29,6 +30,7 @@ try {
   fs.mkdirSync(out, { recursive: true });
   fs.mkdirSync(work);
   createdWork = true;
+  childEnv = releaseEnvironment(path.join(work, "chromium"));
   const checks = [];
   const gate = (name, fn) => { fn(); checks.push({ name, result: "pass" }); console.log(`GATE ${name}: PASS`); };
   let version;
@@ -41,7 +43,11 @@ try {
   gate("clippy", () => run("cargo", ["clippy", "--all-targets", "--locked", "--", "-D", "warnings"]));
   gate("browser", () => run("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/fetch-chromium.ps1"]));
   gate("build", () => run("cargo", ["build", "--release", "--locked"]));
-  gate("test", () => run("cargo", ["test", "--release", "--locked"]));
+  gate("test", () => {
+    run(process.execPath, ["--test", "scripts/release-handoff.test.mjs"]);
+    run(process.execPath, ["scripts/check-release-workflow.mjs"]);
+    run("cargo", ["test", "--release", "--locked"]);
+  });
   gate("selftest", () => run(path.join(root, "target/release/gladius.exe"), ["selftest"]));
 
   const manifest = json("npm/engine-manifest.json");
@@ -49,7 +55,7 @@ try {
   need(JSON.stringify(manifest.browser) === JSON.stringify(browser), "browser manifest drift");
   const provisioner = read("scripts/fetch-chromium.ps1").toString();
   for (const value of [browser.version, browser.asset.url, browser.asset.sha256, browser.asset.size]) need(provisioner.includes(String(value)), "provisioner browser pin drift");
-  const cache = path.join(process.env.LOCALAPPDATA, "gladius/chromium", `${browser.version}-${browser.asset.sha256.slice(0, 8)}`);
+  const cache = path.join(childEnv.GLADIUS_CHROMIUM_CACHE, `${browser.version}-${browser.asset.sha256.slice(0, 8)}`);
   for (const entry of browser.files) {
     const bytes = read(path.join(cache, entry.name));
     need(bytes.length === entry.size && sha256(bytes) === entry.sha256, `browser file drift: ${entry.name}`);
@@ -85,7 +91,7 @@ try {
       cwd: root, windowsHide: true, stdio: "inherit", env: { ...process.env, RELEASE_CHECK_TARBALL: tarball },
     });
   });
-  gate("cleanroom", () => run(process.execPath, ["scripts/cleanroom-check.mjs", "--tarball", tarball, "--bundle", path.join(out, bundle)]));
+  gate("cleanroom", () => run(process.execPath, ["scripts/cleanroom-check.mjs", "--tarball", tarball, "--bundle", path.join(out, bundle)], releaseEnvironment(null)));
   fs.writeFileSync(path.join(out, "release-notes.md"), releaseNotes(version, sha256(archive)));
   need(capture("git", ["rev-parse", "HEAD"]) === commit && capture("git", ["status", "--porcelain"]) === "", "source changed during release gate");
   need(requiredChecks.every((name) => checks.some((c) => c.name === name)), "incomplete local gate");
