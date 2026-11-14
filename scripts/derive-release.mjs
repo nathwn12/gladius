@@ -137,17 +137,17 @@ function headSha(root) {
   }
 }
 
-// Highest `vX.Y.Z` tag reachable from HEAD, plus the tag sitting exactly on
+// Highest legacy `vX.Y.Z` or product tag reachable from HEAD, plus the tag on
 // HEAD (a rerun of an existing release, which must resolve to its own version
 // rather than derive a new one from an empty range).
 function readTags(root) {
   const head = headSha(root);
   let names;
   try {
-    names = git(root, ["tag", "--merged", "HEAD", "--list", "v*"])
+    names = git(root, ["tag", "--merged", "HEAD", "--list"])
       .split(/\r?\n/)
       .map((s) => s.trim())
-      .filter((s) => SEMVER.test(s.replace(/^v/, "")));
+      .filter((s) => s === "gladius" || SEMVER.test(s.replace(/^v/, "")));
   } catch {
     names = [];
   }
@@ -159,7 +159,13 @@ function readTags(root) {
       } catch {
         commit = "";
       }
-      return { name, version: name.replace(/^v/, ""), commit };
+      let version = name.replace(/^v/, "");
+      if (name === "gladius") {
+        const pkg = JSON.parse(git(root, ["show", `${name}:npm/package.json`]));
+        if (pkg.name !== "gladius-mcp" || !SEMVER.test(pkg.version)) refuse("product-tag", "gladius tag does not identify a versioned gladius-mcp package");
+        version = pkg.version;
+      }
+      return { name, version, commit };
     })
     .filter((t) => t.commit !== "");
   tags.sort((a, b) => cmpSemver(a.version, b.version));
@@ -637,6 +643,13 @@ function runCheck() {
   };
 
   try {
+    const product = makeFixture({ base: "1.0.0", manifestAt: "1.0.1", commits: [{ subject: "fix: next product release" }] });
+    fixtures.push(product);
+    git(product, ["tag", "gladius", "v1.0.0"]);
+    git(product, ["tag", "-d", "v1.0.0"]);
+    const productResult = tryDerive(product);
+    record("product-tag-base", productResult.ok && productResult.result.base === "gladius" && productResult.result.version === "1.0.1",
+      productResult.ok ? `${productResult.result.base} -> ${productResult.result.version}` : productResult.message);
     expect("patch-hop", "1.0.0", [{ subject: "fix: a real bug" }], { version: "1.0.1", level: "patch" });
     expect("minor-hop", "1.0.0", [{ subject: "feat(api): add a tool" }], { version: "1.1.0", level: "minor" });
     expect("major-hop", "1.0.0", [{ subject: "feat!: drop the old handshake" }], { version: "2.0.0", level: "major" });

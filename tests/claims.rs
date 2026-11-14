@@ -404,16 +404,18 @@ fn doctor_reports_the_commit_it_was_built_from() {
         "--doctor reports the manifest's commit"
     );
 
-    // The lane that fills it: the manifest commit comes from HEAD, and the
-    // body is asserted to carry it before anything is published.
-    let workflow =
-        read(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/release.yml"));
+    // Local preparation fills the exact-HEAD commit. The publisher validates
+    // that identity against the receipt instead of printing it in the body.
+    let prepare =
+        read(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/prepare-release.mjs"));
     assert!(
-        workflow.contains("$man.commit = $commit"),
-        "the release workflow writes the commit into the engine manifest"
+        prepare.contains("manifest.commit = commit"),
+        "local preparation writes the commit into the engine manifest"
     );
+    let handoff =
+        read(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/release-handoff.mjs"));
     assert!(
-        workflow.contains("--assert-body dist/release-notes.md"),
-        "the release workflow asserts the body names its commit"
+        handoff.contains("manifest.commit === r.commit"),
+        "the publisher asserts the packaged manifest names its receipt commit"
     );
 }

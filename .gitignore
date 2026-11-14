@@ -1,4 +1,5 @@
 /target
+/release-backups
 /bin
 /gladius-bench-refs
 /real-world

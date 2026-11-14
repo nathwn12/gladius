@@ -1,0 +1,42 @@
+name: stage release
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+      receipt_sha256:
+        required: true
+        type: string
+      blobs:
+        description: 'Safe basenames mapped to git blob IDs; uploaded by stage-release.mjs'
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  stage:
+    if: github.repository == 'nathwn12/gladius' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: verify uploaded blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ inputs.commit }}
+          VERSION: ${{ inputs.version }}
+          RECEIPT_SHA256: ${{ inputs.receipt_sha256 }}
+          BLOB_MAP: ${{ inputs.blobs }}
+        run: node scripts/stage-release.mjs --download staged
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-handoff
+          path: staged/*
+          if-no-files-found: error
+          retention-days: 1
