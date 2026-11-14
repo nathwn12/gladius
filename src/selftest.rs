@@ -1267,6 +1267,26 @@ pub async fn run() -> i32 {
                     "notifications/cancelled",
                     serde_json::json!({"requestId": 10}),
                 )?;
+                // The cancel is answered immediately (S2.3): consume that
+                // frame HERE, for its own id, and prove it is the typed
+                // `cancelled`/`client_cancelled` answer. The old code never
+                // read it, so `wait_id(20)` below deterministically read id
+                // 10 first and failed on every host.
+                let c = srv.wait_id(10)?;
+                let code = c
+                    .pointer("/result/structuredContent/code")
+                    .and_then(|v| v.as_str());
+                let reason = c
+                    .pointer("/result/structuredContent/reason")
+                    .and_then(|v| v.as_str());
+                if c.get("error").is_some()
+                    || code != Some("cancelled")
+                    || reason != Some("client_cancelled")
+                {
+                    return Err(format!(
+                        "cancel answer not typed cancelled/client_cancelled: {c}"
+                    ));
+                }
                 // Past the gate hand-over (entry 300 + hold 1500); a task that
                 // entered would hold the page overridden for 3 s.
                 std::thread::sleep(std::time::Duration::from_millis(2000));
@@ -1279,7 +1299,10 @@ pub async fn run() -> i32 {
                 if w.pointer("/result/isError").is_some() {
                     return Err(format!("cancelled capture entered the section: {w}"));
                 }
-                Ok("entry-window cancel never mutated".to_string())
+                Ok(
+                    "entry-window cancel answered cancelled/client_cancelled and never mutated"
+                        .to_string(),
+                )
             };
             run()
         }
