@@ -68,6 +68,7 @@ team. If it breaks, open an issue with the command you ran and what you saw.
 ## Links
 
 - [Guide](docs/GUIDE.md)
+- [Issues](https://github.com/nathwn12/gladius/issues)
 - [Releases](https://github.com/nathwn12/gladius/releases)
 - [MIT](LICENSE)
 
