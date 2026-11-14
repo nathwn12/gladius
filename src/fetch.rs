@@ -54,7 +54,27 @@ fn html_to_text(html: &str) -> String {
     let mut in_tag = false;
     let mut tag_buf = String::new();
     let mut skip: Option<&str> = None; // "script" | "style"
-    for c in html.chars() {
+    for (pos, c) in html.char_indices() {
+        if let Some(raw_tag) = skip {
+            if !in_tag {
+                // In raw text, '<' is ordinary data unless it starts the
+                // matching end tag. In particular, comparisons must not
+                // consume the real closing tag as part of a fake tag.
+                let rest = &html[pos..];
+                let end = 2 + raw_tag.len();
+                let matches_end = rest.starts_with("</")
+                    && rest
+                        .get(2..end)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(raw_tag))
+                    && rest
+                        .get(end..)
+                        .and_then(|tail| tail.chars().next())
+                        .is_some_and(|ch| ch.is_ascii_whitespace() || ch == '/' || ch == '>');
+                if !matches_end {
+                    continue;
+                }
+            }
+        }
         if in_tag {
             if c == '>' {
                 in_tag = false;
@@ -66,11 +86,13 @@ fn html_to_text(html: &str) -> String {
                     .next()
                     .unwrap_or("")
                     .to_lowercase();
-                if !closing && (name == "script" || name == "style") {
+                if skip.is_some() {
+                    if closing && skip == Some(name.as_str()) {
+                        skip = None;
+                    }
+                } else if !closing && (name == "script" || name == "style") {
                     skip = Some(if name == "script" { "script" } else { "style" });
-                } else if closing && (name == "script" || name == "style") {
-                    skip = None;
-                } else if skip.is_none() {
+                } else {
                     out.push(' ');
                 }
                 tag_buf.clear();
@@ -122,6 +144,34 @@ mod tests {
         assert_eq!(html_to_text("<p>&lt;tag&gt;</p>"), "<tag>");
         assert_eq!(html_to_text("<p>&amp;amp;</p>"), "&amp;");
         assert_eq!(html_to_text("<p>a&nbsp;b &quot;q&quot;</p>"), "a b \"q\"");
+    }
+
+    #[test]
+    fn script_and_style_end_only_at_their_matching_closing_tag() {
+        assert_eq!(
+            html_to_text("<script>const x = '</style>'; secret</script><p>visible</p>"),
+            "visible"
+        );
+        assert_eq!(
+            html_to_text("<style>/* </script> secret */</style><p>visible</p>"),
+            "visible"
+        );
+    }
+
+    #[test]
+    fn less_than_in_raw_text_does_not_consume_the_closing_tag() {
+        assert_eq!(
+            html_to_text("<script>if (a < b) x++;</script><p>visible</p>"),
+            "visible"
+        );
+        assert_eq!(
+            html_to_text("<style>/* a < b */</STYLE><p>visible</p>"),
+            "visible"
+        );
+        assert_eq!(
+            html_to_text("<script>ignore </scripture> secret</ScRiPt ><p>visible</p>"),
+            "visible"
+        );
     }
 
     /// F2 proof: an 8 MB loopback body must NOT be pulled in full. The server
