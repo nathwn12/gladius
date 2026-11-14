@@ -13,6 +13,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `derive-release.mjs --check` ships 26 fixture cases covering the major/minor/patch hops, the 0.x rule, every refusal, the forward-only write, the changelog close (twice), a rerun at a released tag and a hand-cut tag checked against the derivation.
 - The GitHub Release body is now the changelog section the run closed (`dist/release-notes.md`) instead of boilerplate.
 - A `v*` tag push no longer defines the version: it is checked against the derivation, so a hand-cut tag is accepted only when it names the version the history implies.
+- `visual compare` answers identity and tolerance separately: `pixelsIdentical` (checksum equality) beside `passWithinTolerance`, with `pass` kept as a documented alias; `allowIgnoredAA` now defaults to `false`, so strictness is the default and tolerance is opt-in.
+- Visual masks are metered instead of an unmetered hole: `maskRectsApplied`, `maskedPixels` and `maskCoverageRatio` on the reply, with warnings for dropped rects and coverage above 10 %.
+- A deterministic capture says whether it settled: `settled` and `settleTimeouts` on the reply and in the sidecar, and a `baseline_unsettled` warning (typed failure under strict matching) for unsettled baselines.
+- The deterministic freeze reaches frames, shadow roots and motion: same-process frames and open shadow roots are walked, WAAPI/SMIL/media timelines are pinned to their start and restored, and unreachable realms are recorded in `freeze.skipped`.
+- `assert_layout {deterministic:true}` measures the frozen state the camera sees, and deterministic captures report `freezeMode`.
+- Font readiness is a status, not a race: the settle waits for every `FontFace` to reach `loaded`/`error`, reports `fontsPending`, and names `fonts` in `settleTimeouts` on a give-up.
+- The environment fingerprint names every axis that differs (platform, full browser version, colour/contrast, fonts, scrollbar); older sidecars report `unknownAxes` instead of silently matching.
+- Every call has a budget with a typed `timeout`, and a cancel answers while the restore finishes behind it.
+- A dead engine relaunches once and answers with a typed error naming the recovery.
+- A pid file reaps the job-less orphan a hard kill leaves behind.
+- Visual baselines live outside the caller's repo and stop growing (500-entry cap).
+- A closed shadow root is a typed answer, never a misleading `not_found`.
+- The release names the commit it was built from: a provenance footer on the release body, `commit` in the engine manifest, and `--doctor` reporting both sides of a skew.
 
 ### Changed
 
@@ -47,6 +60,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   touched. A re-run of `cargo update` locks 0 packages, so this is the
   current resolve, and the highest `rust-version` in the graph stays 1.88:
   the declared MSRV is unchanged.
+
+### Fixed
+
+- A JS throw, an `undefined` result and a dead engine are distinct typed errors (`ToolCode`/`ToolReason` are closed enums, so a typo cannot compile).
+- The call that finds the owned engine dead fails typed and is never replayed against the replacement; deleting a recorded profile refuses foreign paths and unknown command lines.
+- An owned record's authority is one exact `--user-data-dir` argument, never a path prefix.
+- `fetch_text` skips raw script/style text until the matching end tag, and drops HTML comments whole through the tokenizer's comment states instead of ending at a bare `>` (quoted-attribute `>` and CDATA stay open follow-ups).
+
+### Tests
+
+- Coverage for the countable claims: the visual pass bar on both sides of every boundary, byte-identical deterministic captures, schema payloads, the TLS root pin on both transports, and a bounded-claims-client shutdown.
 
 ## [0.6.2] - 2026-11-01
 
