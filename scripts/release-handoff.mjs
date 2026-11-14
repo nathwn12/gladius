@@ -17,6 +17,15 @@ export function releaseEnvironment(cache, parent = process.env) {
   return env;
 }
 
+export function assembleRuntime(stage, destination) {
+  // The launcher intentionally rejects ZIP data descriptors. libarchive's ZIP
+  // writer emits them; retain the supported Compress-Archive format instead.
+  execFileSync("pwsh", [
+    "-NoProfile", "-Command",
+    "$ErrorActionPreference = 'Stop'; Compress-Archive -Path (Join-Path $env:RELEASE_RUNTIME_STAGE '*') -DestinationPath $env:RELEASE_RUNTIME_ZIP",
+  ], { windowsHide: true, stdio: "inherit", env: { ...process.env, RELEASE_RUNTIME_STAGE: stage, RELEASE_RUNTIME_ZIP: destination } });
+}
+
 export function validateBlobMap(text) {
   const map = JSON.parse(text);
   need(map && !Array.isArray(map) && typeof map === "object" && Object.hasOwn(map, "release-receipt.json"), "receipt blob missing");

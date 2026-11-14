@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { execFileSync, execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { need, sha256, requiredChecks, releaseNotes, verifyArtifacts, releaseEnvironment } from "./release-handoff.mjs";
+import { need, sha256, requiredChecks, releaseNotes, verifyArtifacts, releaseEnvironment, assembleRuntime } from "./release-handoff.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 process.chdir(root);
@@ -66,8 +66,7 @@ try {
   for (const file of ["LICENSE", "THIRD-PARTY-NOTICES.md", "README.md"]) fs.copyFileSync(file, path.join(stage, file));
   fs.copyFileSync("target/release/gladius.exe", path.join(stage, "gladius.exe"));
   fs.copyFileSync(path.join(cache, browser.root, "LICENSE.headless_shell"), path.join(stage, "THIRD-PARTY-LICENSES/LICENSE.headless_shell"));
-  // Native tar creates the ZIP without a shell or an interpolated command.
-  run("tar", ["-a", "-cf", path.join(out, bundle), "-C", stage, "."]);
+  assembleRuntime(stage, path.join(out, bundle));
   const archive = read(path.join(out, bundle));
   manifest.commit = commit;
   manifest.runtime.source = "https://github.com/nathwn12/gladius/releases/download/gladius";

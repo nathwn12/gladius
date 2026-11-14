@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { verifyReceipt, requiredChecks, verifyArtifacts, validateBlobMap, releaseIdentity, releaseEnvironment } from "./release-handoff.mjs";
+import { verifyReceipt, requiredChecks, verifyArtifacts, validateBlobMap, releaseIdentity, releaseEnvironment, assembleRuntime } from "./release-handoff.mjs";
+import { mkdirSync, cpSync, existsSync, readdirSync } from "node:fs";
 
 test("handoff accepts exact bytes and refuses corruption, stale identity and incomplete gates", () => {
   const dir = mkdtempSync(join(tmpdir(), "gladius-handoff-"));
@@ -116,4 +117,40 @@ test("local gate isolates the browser and cleanroom cannot inherit a warmed engi
   assert.deepEqual(isolated, { PATH: "tools", GLADIUS_CHROMIUM_CACHE: "owned-cache" });
   assert.deepEqual(releaseEnvironment(null, isolated), { PATH: "tools" });
   assert.equal(parent.GLADIUS_CHROMIUM_CACHE, "shared");
+});
+
+test("assembled ZIP provisions through the actual launcher without a browser download", { skip: process.platform !== "win32" }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "gladius-archive-"));
+  try {
+    const stage = join(dir, "runtime");
+    mkdirSync(stage);
+    writeFileSync(join(stage, "gladius.exe"), "fixture executable bytes");
+    const zip = join(dir, "runtime.zip");
+    assembleRuntime(stage, zip);
+    const pkg = join(dir, "package");
+    mkdirSync(pkg);
+    cpSync("npm/bin", join(pkg, "bin"), { recursive: true });
+    cpSync("npm/package.json", join(pkg, "package.json"));
+    const manifest = JSON.parse(readFileSync("npm/engine-manifest.json"));
+    const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
+    manifest.runtime.archive = { name: "runtime.zip", size: readFileSync(zip).length, sha256: hash(readFileSync(zip)) };
+    manifest.runtime.server.size = readFileSync(join(stage, "gladius.exe")).length;
+    manifest.runtime.server.sha256 = hash(readFileSync(join(stage, "gladius.exe")));
+    // Runtime provisioning happens before this intentional browser refusal.
+    manifest.browser.asset.sha256 = "unpublished";
+    writeFileSync(join(pkg, "engine-manifest.json"), JSON.stringify(manifest));
+    const cache = join(dir, "engine");
+    const result = spawnSync(process.execPath, [join(pkg, "bin/gladius-mcp.js")], {
+      env: { ...releaseEnvironment(null), GLADIUS_ENGINE_CACHE: cache, GLADIUS_ENGINE_BUNDLE: zip },
+      input: "", encoding: "utf8", windowsHide: true, timeout: 10000,
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /no pinned browser archive hash/);
+    const engine = join(cache, "gladius", "engine");
+    const leaf = existsSync(engine) && readdirSync(engine).find((name) => existsSync(join(engine, name, "gladius.exe")));
+    assert.ok(leaf, result.stderr);
+    assert.equal(readFileSync(join(engine, leaf, "gladius.exe"), "utf8"), "fixture executable bytes");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
