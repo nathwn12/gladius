@@ -53,6 +53,28 @@ fn html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len().min(32768));
     let mut in_tag = false;
     let mut tag_buf = String::new();
+    // A comment is its own lexical unit: nothing inside it is a tag, and the
+    // `>` rule below must never fire there. Its terminator is a state
+    // machine, not a dash count: `-->` needs both dashes, `--!>` needs the
+    // bang and only one of them, and only an empty comment closes abruptly
+    // (`<!-->`, `<!--->`). The states are the HTML tokenizer's
+    // comment-start, comment-start-dash, comment, comment-end-dash,
+    // comment-end and comment-end-bang states with everything that is not a
+    // terminator collapsed into `Data` (a comment appends its text anyway,
+    // and appended text is never emitted). `Done` is written once, then the
+    // comment is left on the next line, so it is never read back.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Comment {
+        Start,
+        StartDash,
+        Data,
+        EndDash,
+        End,
+        EndBang,
+        Done,
+    }
+    let mut comment = Comment::Start;
+    let mut in_comment = false;
     let mut skip: Option<&str> = None; // "script" | "style"
     for (pos, c) in html.char_indices() {
         if let Some(raw_tag) = skip {
@@ -74,6 +96,33 @@ fn html_to_text(html: &str) -> String {
                     continue;
                 }
             }
+        }
+        if in_comment {
+            comment = match (comment, c) {
+                (Comment::Start, '>') => Comment::Done, // abrupt close, `<!-->`
+                (Comment::Start, '-') => Comment::StartDash,
+                (Comment::Start, _) => Comment::Data,
+                (Comment::StartDash, '>') => Comment::Done, // abrupt close, `<!--->`
+                (Comment::StartDash, '-') => Comment::End,
+                (Comment::StartDash, _) => Comment::Data,
+                (Comment::Data, '-') => Comment::EndDash,
+                (Comment::Data, _) => Comment::Data,
+                (Comment::EndDash, '-') => Comment::End,
+                // A single `-` is data: reconsume it in the comment state.
+                (Comment::EndDash, _) => Comment::Data,
+                (Comment::End, '>') => Comment::Done, // `-->`
+                (Comment::End, '!') => Comment::EndBang,
+                (Comment::End, '-') => Comment::End,
+                (Comment::End, _) => Comment::Data,
+                (Comment::EndBang, '>') => Comment::Done, // `--!>`
+                (Comment::EndBang, '-') => Comment::EndDash,
+                (Comment::EndBang, _) => Comment::Data,
+                (Comment::Done, _) => Comment::Done,
+            };
+            if comment == Comment::Done {
+                in_comment = false;
+            }
+            continue;
         }
         if in_tag {
             if c == '>' {
@@ -98,6 +147,15 @@ fn html_to_text(html: &str) -> String {
                 tag_buf.clear();
             } else {
                 tag_buf.push(c);
+                // `<!--` is a comment, not a tag that a bare `>` closes.
+                // Only reached outside raw text: in script/style, `<` is data
+                // and never sets `in_tag`, so `<!--` there stays script data.
+                if tag_buf == "!--" {
+                    in_tag = false;
+                    tag_buf.clear();
+                    in_comment = true;
+                    comment = Comment::Start;
+                }
             }
             continue;
         }
@@ -172,6 +230,104 @@ mod tests {
             html_to_text("<script>ignore </scripture> secret</ScRiPt ><p>visible</p>"),
             "visible"
         );
+    }
+
+    /// A comment is one lexical unit: nothing inside it is a tag, and the
+    /// `-->` that ends it is not text. The bare `>` rule must never fire
+    /// inside one. Pre-fix the scanner re-entered data mode at the first
+    /// `>` of the body and emitted the rest of the comment.
+    #[test]
+    fn html_comments_are_dropped_whole() {
+        assert_eq!(html_to_text("<!-- secret --><p>visible</p>"), "visible");
+        assert_eq!(
+            html_to_text("<!-- secret > still hidden --><p>visible</p>"),
+            "visible"
+        );
+        assert_eq!(
+            html_to_text("<!-- <p>hidden</p> --><p>visible</p>"),
+            "visible"
+        );
+        assert_eq!(html_to_text("<div>a<!-- <p>b</p> -->c</div>"), "ac");
+    }
+
+    /// An unterminated comment swallows the rest of the input: there is no
+    /// text after an open comment, so there is nothing to emit.
+    #[test]
+    fn unclosed_html_comment_runs_to_end_of_input() {
+        assert_eq!(html_to_text("<!-- secret > still hidden"), "");
+        assert_eq!(html_to_text("<p>visible</p><!-- secret > still"), "visible");
+    }
+
+    /// `-->` and `--!>` both end a comment (HTML comment-end and
+    /// comment-end-bang states), and `<!-->` and `<!--->` are empty comments
+    /// that the `>` closes at once - neither may swallow the document.
+    #[test]
+    fn comment_terminators_match_the_html_tokenizer() {
+        assert_eq!(html_to_text("<!-- secret > --!><p>visible</p>"), "visible");
+        assert_eq!(html_to_text("<!--><p>visible</p>"), "visible");
+        assert_eq!(html_to_text("<!---><p>visible</p>"), "visible");
+        assert_eq!(html_to_text("<!----><p>visible</p>"), "visible");
+        // A dash run that is not followed by `>` keeps the comment open.
+        assert_eq!(html_to_text("<!-- a -- b --><p>visible</p>"), "visible");
+    }
+
+    /// Only an *empty* comment closes abruptly: `<!-- x ->` is comment data
+    /// (comment end dash state re-enters the comment state), so what looks
+    /// like a terminator must not end the comment early.
+    #[test]
+    fn a_single_dash_is_not_a_comment_terminator() {
+        assert_eq!(html_to_text("<!-- x -><p>visible</p> --> tail"), "tail");
+        assert_eq!(html_to_text("<!-- x - --><p>visible</p>"), "visible");
+    }
+
+    /// The bang is part of the terminator, and only one is: `--!>` closes,
+    /// `--!!>` puts the second `!` back into comment data and runs on to the
+    /// real `-->`, so the body may not leak.
+    #[test]
+    fn comment_end_bang_takes_exactly_one_bang() {
+        assert_eq!(
+            html_to_text("<!-- x --!!>hidden --><p>visible</p>"),
+            "visible"
+        );
+        assert_eq!(
+            html_to_text("<!-- x --!->hidden --><p>visible</p>"),
+            "visible"
+        );
+    }
+
+    /// Raw text wins over comment syntax: `<!--` inside script or style is
+    /// script data, not the start of a comment, and the raw text still ends
+    /// only at its matching end tag.
+    #[test]
+    fn comment_markers_in_raw_text_are_not_comments() {
+        assert_eq!(
+            html_to_text("<script>var a = \"<!--\";</script><p>visible</p>"),
+            "visible"
+        );
+        assert_eq!(
+            html_to_text("<style>/* <!-- */</style><p>visible</p>"),
+            "visible"
+        );
+        assert_eq!(
+            html_to_text("<script>if (a-->b) c();</script><p>visible</p>"),
+            "visible"
+        );
+    }
+
+    /// The converse: a script or style tag inside a comment is comment text,
+    /// so it may not put the scanner into raw-text mode and eat what follows
+    /// the comment.
+    #[test]
+    fn tags_inside_comments_are_comment_text() {
+        assert_eq!(html_to_text("<!-- <script> --><p>visible</p>"), "visible");
+        assert_eq!(html_to_text("<!-- <style> --><p>visible</p>"), "visible");
+    }
+
+    /// Regression pair: `>` as ordinary data text is not a tag end, and a
+    /// comment with no `>` in it was already dropped.
+    #[test]
+    fn comment_fix_leaves_data_text_alone() {
+        assert_eq!(html_to_text("<p>a > b</p>"), "a > b");
     }
 
     /// F2 proof: an 8 MB loopback body must NOT be pulled in full. The server
