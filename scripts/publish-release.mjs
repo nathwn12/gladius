@@ -5,6 +5,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { need, sha256, safeName, verifyReceipt, verifyArtifacts, releaseIdentity } from "./release-handoff.mjs";
+import { verifyRegistry } from "./registry-verification.mjs";
 
 const repo = "nathwn12/gladius";
 const env = process.env;
@@ -117,18 +118,12 @@ try {
       const result = spawnSync(command, { shell: true, cwd: path.resolve(dir), stdio: "inherit", windowsHide: true });
       need(result.status === 0, "npm publish did not confirm success; query registry integrity before any further attempt");
     }
-    const registryResponse = await fetch(registryUrl);
-    need(registryResponse.ok, "registry result unknown; query integrity before any further attempt");
-    const verified = await registryResponse.json();
-    need(verified.dist?.integrity === integrity, "published registry integrity mismatch");
-    const downloaded = await download(verified.dist.tarball);
-    need(`sha512-${createHash("sha512").update(downloaded).digest("base64")}` === integrity, "registry tarball bytes mismatch");
+    await verifyRegistry({
+      fetch, version: env.VERSION, integrity, download,
+      hash: (data) => `sha512-${createHash("sha512").update(data).digest("base64")}`,
+    });
     const current = api(`releases/${release.id}`, { name: `gladius ${env.VERSION}`, body: notes, make_latest: "true" }, "PATCH");
     need(current.tag_name === "gladius" && current.name === `gladius ${env.VERSION}` && current.body === notes, "published release metadata mismatch");
-    const latestResponse = await fetch("https://registry.npmjs.org/gladius-mcp/latest");
-    need(latestResponse.ok, "registry latest result unknown");
-    const latest = await latestResponse.json();
-    need(latest.version === env.VERSION && latest.dist?.integrity === integrity, "registry latest mismatch");
     console.log(`VERIFIED gladius-mcp@${env.VERSION} ${integrity}; historical releases and tags untouched.`);
   }
 } catch (err) {
