@@ -41,7 +41,7 @@ try {
   });
   gate("fmt", () => run("cargo", ["fmt", "--check"]));
   gate("clippy", () => run("cargo", ["clippy", "--all-targets", "--locked", "--", "-D", "warnings"]));
-  gate("browser", () => run("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/fetch-chromium.ps1"]));
+  gate("browser", () => run("pwsh", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/fetch-chromium.ps1"]));
   gate("build", () => run("cargo", ["build", "--release", "--locked"]));
   gate("test", () => {
     run(process.execPath, ["--test", "scripts/release-handoff.test.mjs"]);

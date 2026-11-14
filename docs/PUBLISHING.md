@@ -10,7 +10,7 @@ Do not add a token or change the publisher identity to bypass that boundary.
 
 ## Local gate
 
-Use Windows, the pinned Rust 1.88.0 toolchain, Node >= 22.14.0, npm >= 11.5.1,
+Use Windows with PowerShell 7, the pinned Rust 1.88.0 toolchain, Node >= 22.14.0, npm >= 11.5.1,
 Git, and the system libarchive `tar`. Start at a clean committed checkout with
 complete release history and the required version already in all manifests.
 
