@@ -5,7 +5,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { need, sha256, safeName, verifyReceipt, verifyArtifacts, releaseIdentity } from "./release-handoff.mjs";
-import { verifyRegistry } from "./registry-verification.mjs";
+import { publishAndVerify, verifyRegistry } from "./registry-verification.mjs";
 
 const repo = "nathwn12/gladius";
 const env = process.env;
@@ -112,15 +112,19 @@ try {
       need(sha256(await download(`https://github.com/${repo}/releases/download/gladius/${name}`)) === sha256(bytes(path.join(currentDir, name))), `published asset fetch mismatch: ${name}`);
     }
     for (const a of immutable) need(sha256(await download(`https://github.com/${repo}/releases/download/gladius/${a.name}`)) === a.sha256, `immutable asset fetch mismatch: ${a.name}`);
-    if (!published) {
-      // OIDC uses the existing release.yml publisher identity. Never repack.
-      const command = `npm publish "${npmArtifact.name}" --ignore-scripts`;
-      const result = spawnSync(command, { shell: true, cwd: path.resolve(dir), stdio: "inherit", windowsHide: true });
-      need(result.status === 0, "npm publish did not confirm success; query registry integrity before any further attempt");
-    }
-    await verifyRegistry({
+    const verify = () => verifyRegistry({
       fetch, version: env.VERSION, integrity, download,
       hash: (data) => `sha512-${createHash("sha512").update(data).digest("base64")}`,
+    });
+    if (published) await verify();
+    else await publishAndVerify({
+      // OIDC uses the existing release.yml publisher identity. Never repack.
+      publish: () => {
+        const command = `npm publish "${npmArtifact.name}" --ignore-scripts`;
+        const result = spawnSync(command, { shell: true, cwd: path.resolve(dir), stdio: "inherit", windowsHide: true });
+        need(result.status === 0, "npm publish did not confirm success; query registry integrity before any further attempt");
+      },
+      verify,
     });
     const current = api(`releases/${release.id}`, { name: `gladius ${env.VERSION}`, body: notes, make_latest: "true" }, "PATCH");
     need(current.tag_name === "gladius" && current.name === `gladius ${env.VERSION}` && current.body === notes, "published release metadata mismatch");

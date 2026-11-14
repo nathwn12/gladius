@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { verifyRegistry } from "./registry-verification.mjs";
+import { publishAndVerify, verifyRegistry } from "./registry-verification.mjs";
 
 const version = "0.8.0";
 const integrity = "sha512-fixture";
@@ -21,12 +21,12 @@ test("registry verification waits for delayed exact-version and latest visibilit
   assert.deepEqual(seen, { exact: 3, latest: 3 });
 });
 
-test("registry timeout fails closed without another publish attempt", async () => {
+test("registry timeout fails closed after exactly one publish", async () => {
   let publishes = 0;
   const fetch = async () => new Response("", { status: 404 });
-  await assert.rejects(
-    verifyRegistry({ fetch, version, integrity, attempts: 2, intervalMs: 0, download: async () => Buffer.from("unused"), hash: () => integrity, publish: () => publishes++ }),
-    /registry verification timed out/,
-  );
-  assert.equal(publishes, 0);
+  await assert.rejects(publishAndVerify({
+    publish: () => publishes++,
+    verify: () => verifyRegistry({ fetch, version, integrity, attempts: 2, intervalMs: 0, download: async () => Buffer.from("unused"), hash: () => integrity }),
+  }), /registry verification timed out/);
+  assert.equal(publishes, 1);
 });

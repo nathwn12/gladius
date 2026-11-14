@@ -1,5 +1,10 @@
 import { setTimeout as delay } from "node:timers/promises";
 
+export async function publishAndVerify({ publish, verify }) {
+  await publish();
+  return verify();
+}
+
 export async function verifyRegistry({ fetch, version, integrity, attempts = 30, intervalMs = 5000, download, hash }) {
   let lastStatus = "not found";
   let verified;
