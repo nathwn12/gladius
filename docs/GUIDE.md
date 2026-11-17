@@ -1,6 +1,6 @@
 # gladius GUIDE
 
-The manual. `README.md` has the install and the capability table; this file has
+The manual. `README.md` has the install and the capability list; this file has
 the model, every option, every tool and every failure worth knowing.
 
 - [1. How it works](#1-how-it-works)
