@@ -37,12 +37,12 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 # Pin (keep in lockstep with scripts/chromium-manifest.json).
-$PinnedVersion = '155.0.8059.84'
+$PinnedVersion = '156.0.8078.80'
 $Platform = 'win64'
 $AssetName = 'chrome-headless-shell-win64.zip'
-$AssetUrl = 'https://storage.googleapis.com/chrome-for-testing-public/155.0.8059.84/win64/chrome-headless-shell-win64.zip'
-$ExpectedZipSha256 = '5ca590a4968864e219ea25ccd134597ef8898a733a4698c07fc3e8b2c480fef4'
-$ExpectedZipSize = 123681250
+$AssetUrl = 'https://storage.googleapis.com/chrome-for-testing-public/156.0.8078.80/win64/chrome-headless-shell-win64.zip'
+$ExpectedZipSha256 = '10a77466005e7f64e00f1a75fd1ea81f4a38a60093c65fea6895843b26e60a9a'
+$ExpectedZipSize = 125772546
 $ZipShort8 = $ExpectedZipSha256.Substring(0, 8)
 $ManifestName = 'chromium-manifest.json'
 $CacheOverrideEnv = 'GLADIUS_CHROMIUM_CACHE'
