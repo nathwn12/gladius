@@ -4,7 +4,7 @@
 //! client cancel must be answered immediately (the restore keeps running
 //! behind the answer) instead of leaving the caller in silence.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -223,6 +223,226 @@ fn a_wedged_call_returns_typed_timeout_and_frees_the_lock() {
         snap.get("isError").is_none(),
         "snapshot after timeout: {snap}"
     );
+
+    let _ = c.call("close", json!({}));
+    drop(c.stdin);
+    let mut child = c.child;
+    for _ in 0..100 {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                assert!(status.success(), "server exit status: {status}");
+                return;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => panic!("try_wait: {e}"),
+        }
+    }
+    child.kill().ok();
+    panic!("server did not exit after stdin EOF");
+}
+
+/// Loopback HTTP server for the critical-wedge fixture: it answers every
+/// request with a tiny page EXCEPT the `/never*` paths, which it accepts and
+/// never answers. Those are the pending image loads that hold a deterministic
+/// capture's settle wait open (the settle race gives each image 3 s and the
+/// outer `SETTLE_CAP` bounds the phase at 5 s). The page itself is served from
+/// the same origin, so no mixed-content rule can refuse the images.
+fn start_loopback() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = listener.local_addr().expect("loopback addr").port();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut s) = conn else { break };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let mut req = Vec::new();
+                if let Ok(n) = s.read(&mut buf) {
+                    req.extend_from_slice(&buf[..n]);
+                }
+                let text = String::from_utf8_lossy(&req);
+                let path = text.split_whitespace().nth(1).unwrap_or("/").to_string();
+                if path.starts_with("/never") {
+                    // Accept and never answer: the image request stays pending.
+                    std::thread::sleep(Duration::from_secs(120));
+                    return;
+                }
+                let body = "<!doctype html><html><body><p>settle wedge</p></body></html>";
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.flush();
+            });
+        }
+    });
+    port
+}
+
+/// S2.3 (c): the budget releases the exec lock AND the semaphore permit even
+/// when the wedged call is a CRITICAL one - a deterministic capture stuck in
+/// its settle phase, which holds the section gate as well as the exec lock.
+///
+/// The wedge is deterministic: two images whose requests are accepted and never
+/// answered keep the settle wait open until `SETTLE_CAP` (5 s), and the call is
+/// given a 2 s budget, so the budget fires inside the settle wait. The
+/// assertions that follow are what the defect breaks: a read-only `snapshot`
+/// (positive control: the engine is still usable), an exec-locked `evaluate`
+/// (the lock must be free) and four concurrent calls (all four permits must be
+/// free, otherwise the fourth is refused `-32603 Server busy`).
+#[test]
+fn a_wedged_critical_call_returns_typed_timeout_and_frees_the_lock() {
+    let port = start_loopback();
+    let mut c = Client::spawn(&[]);
+    c.initialize();
+    let nav = c.call(
+        "navigate",
+        json!({"url": format!("http://127.0.0.1:{port}/page")}),
+    );
+    assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
+
+    // Two images that never finish: `document.images` holds both, neither is
+    // `complete`, so the settle wait runs to its 5 s cap.
+    let inject = format!(
+        "(() => {{ for (let i = 0; i < 2; i++) {{ const img = \
+         document.createElement('img'); img.src = 'http://127.0.0.1:{port}/never' + i + \
+         '.png'; document.body.appendChild(img); }} return document.images.length; }})()"
+    );
+    let injected = c.call("evaluate", json!({"expression": inject}));
+    assert_eq!(
+        injected.pointer("/structuredContent/value"),
+        Some(&json!(2)),
+        "both pending images are in the document: {injected}"
+    );
+
+    // Deterministic capture (exec-locked AND section-gated) with a 2 s budget:
+    // the budget lands inside the settle wait, not inside the mutation window.
+    c.call_id(
+        json!(10),
+        "screenshot",
+        json!({"deterministic": true, "_budgetMs": 2000}),
+    );
+    let t0 = Instant::now();
+    let timed_out = c.wait_id(&json!(10), Duration::from_secs(30), "wedged capture");
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "the wedged capture returned inside its budget ({elapsed:?})"
+    );
+    let result = timed_out.get("result").cloned().unwrap_or(Value::Null);
+    assert!(
+        result.get("isError").and_then(|v| v.as_bool()) == Some(true),
+        "the timeout is a tool failure, not a protocol error: {timed_out}"
+    );
+    assert_eq!(
+        code_of(&result),
+        "timeout",
+        "the budget answer is typed timeout: {timed_out}"
+    );
+    assert_eq!(
+        reason_of(&result),
+        "budget_exceeded",
+        "the reason is budget_exceeded: {timed_out}"
+    );
+    assert_eq!(
+        result
+            .pointer("/structuredContent/tool")
+            .and_then(|v| v.as_str()),
+        Some("screenshot"),
+        "the answer names the tool: {timed_out}"
+    );
+    assert_eq!(
+        result
+            .pointer("/structuredContent/budgetMs")
+            .and_then(|v| v.as_u64()),
+        Some(2000),
+        "the answer names the budget: {timed_out}"
+    );
+
+    // (1) The engine is still usable: a read-only snapshot answers promptly.
+    // (`snapshot` is lock-free by design, so on its own it does not observe the
+    // defect - it is the positive control that the wedged capture left the
+    // browser readable.)
+    let t1 = Instant::now();
+    c.call_id(json!(11), "snapshot", json!({}));
+    let snap = c.wait_id(
+        &json!(11),
+        Duration::from_secs(10),
+        "snapshot after timeout",
+    );
+    let snap_latency = t1.elapsed();
+    assert!(
+        snap.get("error").is_none(),
+        "snapshot is not a protocol error: {snap}"
+    );
+    assert!(
+        snap_latency < Duration::from_secs(2),
+        "snapshot after the budget timeout ({snap_latency:?})"
+    );
+
+    // (2) The EXEC LOCK is free: this call takes it. While the wedged capture
+    // still held it (until the 5 s settle cap plus the shot and the restore)
+    // this waited seconds behind the wedged call.
+    let t2 = Instant::now();
+    c.call_id(json!(12), "evaluate", json!({"expression": "1 + 1"}));
+    let ev = c.wait_id(
+        &json!(12),
+        Duration::from_secs(10),
+        "evaluate after timeout",
+    );
+    let ev_latency = t2.elapsed();
+    assert!(
+        ev.get("error").is_none(),
+        "the exec lock is free after a budget timeout: {ev}"
+    );
+    assert_eq!(
+        ev.pointer("/result/structuredContent/value"),
+        Some(&json!(2)),
+        "the page answers again: {ev}"
+    );
+    assert!(
+        ev_latency < Duration::from_secs(2),
+        "an exec-locked call ran immediately after the budget timeout ({ev_latency:?})"
+    );
+
+    // (3) The SEMAPHORE PERMIT is free: four concurrent calls are all admitted.
+    // A permit still held by the wedged call leaves only three slots, and the
+    // fourth is refused `-32603 Server busy`. The four answers interleave, so
+    // they are collected by id instead of one `wait_id` at a time.
+    for id in 20..24 {
+        c.call_id(
+            json!(id),
+            "wait_for",
+            json!({"expression": "false", "ms": 3000}),
+        );
+    }
+    let mut got: std::collections::HashMap<i64, Value> = std::collections::HashMap::new();
+    let end = Instant::now() + Duration::from_secs(30);
+    while got.len() < 4 {
+        let now = Instant::now();
+        assert!(
+            now < end,
+            "timeout waiting for the four permit probes; got {got:?}"
+        );
+        if let Some(v) = c.next(end - now) {
+            if let Some(id) = v.get("id").and_then(|i| i.as_i64()) {
+                got.insert(id, v);
+            }
+        }
+    }
+    for id in 20..24 {
+        let r = got.get(&id).expect("every permit probe answered");
+        assert!(
+            r.get("error").is_none(),
+            "all four permits are free after a budget timeout (id {id}): {r}"
+        );
+        assert!(
+            r.get("result").is_some(),
+            "the admitted call answered with a tool result (id {id}): {r}"
+        );
+    }
 
     let _ = c.call("close", json!({}));
     drop(c.stdin);

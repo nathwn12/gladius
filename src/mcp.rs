@@ -443,6 +443,69 @@ fn panic_response(id: &Value) -> Value {
         "error": {"code": -32603, "message": "internal error"}})
 }
 
+/// Answer a call whose total budget ran out (S2.3): the typed
+/// `timeout`/`budget_exceeded` result, committed so it is the only response
+/// for the id. The caller drops the execution lock and lets the task end
+/// (which releases the permit) immediately afterwards.
+async fn commit_budget(
+    registry: &Registry,
+    key: &str,
+    gen: u64,
+    id: &Value,
+    tool: &str,
+    budget: Duration,
+    tx: &mpsc::UnboundedSender<Value>,
+) {
+    let resp = json!({"jsonrpc": "2.0", "id": id,
+        "result": budget_timeout(tool, budget)});
+    commit_emit(registry, key, gen, resp, tx).await;
+}
+
+/// Output of one work task: the tool result, or the payload of a panic.
+type WorkOutput = Result<Value, Box<dyn std::any::Any + Send>>;
+
+/// The tool work of one call, in a task of its own.
+///
+/// The work runs separately from the dispatch task so a budget timeout can
+/// release the execution lock (owned by the dispatch task) while a
+/// section-holding call - a deterministic capture, a compare - is still
+/// finishing its restore: the dispatch task returns, the lock guard drops, and
+/// the work task keeps the section gate until the call is done. The section,
+/// not the execution lock, is what forbids a second mutation overlapping a
+/// still-running one.
+///
+/// Dropping this handle ABORTS the work, which is what the old in-task future
+/// did when the dispatch task died (cancel, supersede, shutdown). The budget
+/// path calls `detach` instead, so the restore is never dropped mid-section.
+struct CallWork(Option<JoinHandle<WorkOutput>>);
+
+impl CallWork {
+    fn spawn<F>(fut: F) -> Self
+    where
+        F: std::future::Future<Output = WorkOutput> + Send + 'static,
+    {
+        Self(Some(tokio::spawn(fut)))
+    }
+
+    fn handle(&mut self) -> &mut JoinHandle<WorkOutput> {
+        self.0.as_mut().expect("work handle already taken")
+    }
+
+    /// Let the work finish on its own (the budget was already answered and the
+    /// restore must still complete) instead of aborting it on drop.
+    fn detach(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CallWork {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort();
+        }
+    }
+}
+
 /// One stdin frame, read as bytes so a non-UTF-8 byte is a recoverable
 /// protocol error instead of a fatal reader failure.
 #[derive(Debug, PartialEq, Eq)]
@@ -932,71 +995,104 @@ async fn dispatch_call(
             remove_if_mine(&registry_task, &key_task, gen).await;
             return;
         }
-        // A tool panic is caught and converted to a `-32603` response for
-        // the id (when not cancelled) instead of a silent entry leak.
-        let body = std::panic::AssertUnwindSafe(async {
-            if lock_needed {
-                // A cancelled task waiting here aborts cleanly: the lock
-                // future is dropped, the tool never runs, nothing is sent.
-                let _guard = exec.lock().await;
-                if !is_live(&registry_task, &key_task, gen).await {
-                    return None;
+        // ONE total budget for the whole call (S2.3): the lock wait, the
+        // section wait and the tool work all share this deadline, so the
+        // budget bounds the call rather than one phase of it.
+        let deadline = tokio::time::Instant::now() + budget;
+        // Phase 1 - the execution lock. Acquired HERE, by the dispatch task,
+        // not inside the work future: a budget timeout then answers and
+        // returns, which releases the lock (and the permit) at once instead of
+        // leaving them held by the wedged call. A cancelled task waiting here
+        // aborts cleanly: the lock future is dropped, the tool never runs.
+        let exec_guard = if lock_needed {
+            match tokio::time::timeout_at(deadline, exec.clone().lock_owned()).await {
+                Ok(g) => Some(g),
+                Err(_) => {
+                    commit_budget(
+                        &registry_task,
+                        &key_task,
+                        gen,
+                        &id,
+                        &tool_name,
+                        budget,
+                        &tx_task,
+                    )
+                    .await;
+                    return;
                 }
-                // Test-only: park in the window between the liveness check and
-                // the section gate so a cancel can land exactly there.
-                if let Some(ms) = test_entry_ms() {
-                    tokio::time::sleep(Duration::from_millis(ms)).await;
-                }
-                // Section gate: held for the WHOLE call, so a cancel can only
-                // abort this task after the capture/compare has restored what
-                // it touched (see `abort_after_critical`).
-                let _section = if section_needed {
-                    Some(critical_task.lock().await)
-                } else {
-                    None
-                };
-                // DECISIVE liveness recheck, under the gate: a cancel that
-                // landed while we were waiting for the gate must stop us HERE.
-                // Without this the task could enter the mutating section just
-                // before the waiter's abort and leave the page mid-override.
-                if !is_live(&registry_task, &key_task, gen).await {
-                    return None;
-                }
-                Some(tools::call(&name, &args, &browser).await)
-            } else {
-                if !is_live(&registry_task, &key_task, gen).await {
-                    return None;
-                }
-                Some(tools::call(&name, &args, &browser).await)
             }
-        })
-        .catch_unwind();
-        // The WHOLE call - lock wait, section wait, tool work - runs inside
-        // one total budget (S2.3), so a wedged renderer can never hold the
-        // execution lock for minutes.
-        tokio::pin!(body);
-        let timer = tokio::time::sleep(budget);
-        tokio::pin!(timer);
-        let outcome = tokio::select! {
-            r = &mut body => Some(r),
-            _ = &mut timer => None,
+        } else {
+            None
         };
-        let Some(outcome) = outcome else {
-            // Budget exceeded: answer typed and immediately, then make the
-            // future safe to drop. A call that restores page state keeps
-            // running until its restore is done (the future is NOT dropped
-            // mid-section); anything else is dropped here, which releases the
-            // execution lock with it.
-            let resp = json!({"jsonrpc": "2.0", "id": id,
-                "result": budget_timeout(&tool_name, budget)});
-            commit_emit(&registry_task, &key_task, gen, resp, &tx_task).await;
-            if section_needed {
-                let _ = (&mut body).await;
-            }
+        if !is_live(&registry_task, &key_task, gen).await {
+            remove_if_mine(&registry_task, &key_task, gen).await;
             return;
+        }
+        // Test-only: park in the window between the liveness check and the
+        // section gate so a cancel can land exactly there.
+        if let Some(ms) = test_entry_ms() {
+            if tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(ms)))
+                .await
+                .is_err()
+            {
+                drop(exec_guard);
+                commit_budget(
+                    &registry_task,
+                    &key_task,
+                    gen,
+                    &id,
+                    &tool_name,
+                    budget,
+                    &tx_task,
+                )
+                .await;
+                return;
+            }
+        }
+        // Phase 2 - the section gate: held for the WHOLE call by the work task
+        // below, so a cancel can only abort after the capture/compare has
+        // restored what it touched (see `abort_after_critical`).
+        let section = if section_needed {
+            match tokio::time::timeout_at(deadline, critical_task.clone().lock_owned()).await {
+                Ok(g) => Some(g),
+                Err(_) => {
+                    drop(exec_guard);
+                    commit_budget(
+                        &registry_task,
+                        &key_task,
+                        gen,
+                        &id,
+                        &tool_name,
+                        budget,
+                        &tx_task,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        } else {
+            None
         };
+        // DECISIVE liveness recheck, under the gate: a cancel that landed while
+        // we were waiting for the gate must stop us HERE. Without this the task
+        // could enter the mutating section just before the waiter's abort and
+        // leave the page mid-override.
+        if !is_live(&registry_task, &key_task, gen).await {
+            remove_if_mine(&registry_task, &key_task, gen).await;
+            return;
+        }
+        // Phase 3 - the tool work, in its own task (see `CallWork`) so the
+        // budget can release the execution lock while a section-holding call
+        // finishes its restore. A panic is caught there and becomes `-32603`.
+        let mut work = CallWork::spawn(async move {
+            let _section = section;
+            std::panic::AssertUnwindSafe(async { tools::call(&name, &args, &browser).await })
+                .catch_unwind()
+                .await
+        });
+        let outcome = tokio::time::timeout_at(deadline, work.handle()).await;
         let resp_opt = match outcome {
-            Ok(Some(mut result)) => {
+            Ok(Ok(Ok(mut result))) => {
                 if modern {
                     if let Some(obj) = result.as_object_mut() {
                         obj.insert("resultType".to_string(), json!("complete"));
@@ -1004,8 +1100,32 @@ async fn dispatch_call(
                 }
                 Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
             }
-            Ok(None) => None, // superseded/cancelled while queued
-            Err(_) => Some(panic_response(&id)),
+            // The work task panicked (caught above) or died at the join.
+            Ok(Ok(Err(_))) | Ok(Err(_)) => Some(panic_response(&id)),
+            Err(_) => {
+                // Budget exceeded: answer typed and immediately, then release
+                // the execution lock and the permit so the next call can run
+                // instead of queueing behind a wedged one. A call that mutates
+                // page state and restores it is NOT dropped mid-section: it
+                // keeps running detached, holding only the section gate, so
+                // the page is still cleaned up. Anything else has nothing to
+                // restore and is cancelled here.
+                drop(exec_guard);
+                commit_budget(
+                    &registry_task,
+                    &key_task,
+                    gen,
+                    &id,
+                    &tool_name,
+                    budget,
+                    &tx_task,
+                )
+                .await;
+                if section_needed {
+                    work.detach();
+                }
+                return;
+            }
         };
         if let Some(resp) = resp_opt {
             commit_emit(&registry_task, &key_task, gen, resp, &tx_task).await;
