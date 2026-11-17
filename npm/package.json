@@ -21,7 +21,6 @@
     "bin/",
     "engine-manifest.json",
     "LICENSE",
-    "README.md",
-    "assets"
+    "README.md"
   ]
 }

@@ -278,10 +278,10 @@ fn countable_claims_match_the_binary() {
     // The README capability list names the tools; every name must exist.
     let readme = read(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md"));
     let capability = readme
-        .split("## What it does")
+        .split("## Use it")
         .nth(1)
         .and_then(|rest| rest.split("That is ").next())
-        .expect("README has a capability list between 'What it does' and 'That is'");
+        .expect("README has a capability list between 'Use it' and 'That is'");
     let mut mentioned: Vec<String> = Vec::new();
     for line in capability.lines() {
         for tok in backticked(&without_parentheses(line)) {
