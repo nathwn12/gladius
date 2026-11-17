@@ -2979,13 +2979,40 @@ async fn tool_visual(browser: &Browser, args: &Value) -> Result<Value, ToolErr> 
     }
 }
 
-/// Does `selector` resolve inside a CLOSED shadow root?
+/// A `shadowRootType:"closed"` root in a `DOM.getDocument {pierce:true}`
+/// tree, with the nodeId of the element that hosts it and the nodeIds of its
+/// direct children - the only elements a `>` combinator can reach across the
+/// boundary.
+struct ClosedRoot {
+    root: i64,
+    host: i64,
+    kids: Vec<i64>,
+}
+
+/// Does `selector` name a target that exists where the page realm cannot look?
 ///
 /// Ground truth from the DOM domain, never a guess: `DOM.getDocument
 /// {pierce:true}` exposes closed shadow roots (the page realm cannot see
 /// them, so `document.querySelector` can never match), and `DOM.querySelector`
 /// accepts a shadow-root nodeId. Read-only, and only run on a MISS, so a real
 /// page pays nothing.
+///
+/// Three answers, in this order:
+///
+/// 1. The **full selector** inside a closed root. Whatever lives entirely in
+///    there - `#container #inner`, `#first + #inner` - only this probe can see,
+///    and dropping it turns a real target into a miss.
+/// 2. The selector's **leading part** against the host's real ancestor chain,
+///    with the tail inside the root. A closed root's subtree is sealed off from
+///    the light DOM, so `#host #inner` can never match *as a whole* (the
+///    selector engine walks real parents, and `#inner`'s parent is the root,
+///    not `#host`): the two halves have to be proved separately.
+/// 3. Otherwise the ordinary miss.
+///
+/// Every step is engine-verified - a real `DOM.querySelectorAll` hit, real
+/// `Element.matches` on real ancestors - so nothing is pierced, no selector
+/// syntax is invented, and an ordinary miss cannot become a `shadow_closed`
+/// claim.
 ///
 /// `true` means the element EXISTS and the page realm cannot reach it - a
 /// different answer from "not found", which is the lie S2.5 removes.
@@ -3001,38 +3028,194 @@ pub(crate) async fn closed_shadow_hit(browser: &Browser, selector: &str) -> bool
         Ok(d) => d,
         Err(_) => return false, // any doubt keeps the old answer
     };
-    let mut roots: Vec<i64> = Vec::new();
+    let mut roots: Vec<ClosedRoot> = Vec::new();
     collect_closed_roots(doc.get("root"), &mut roots);
-    for node_id in roots {
-        let r = match browser
-            .command(
-                "DOM.querySelector",
-                json!({"nodeId": node_id, "selector": selector}),
-                true,
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        if r.get("nodeId").and_then(|v| v.as_i64()).unwrap_or(0) > 0 {
+    if roots.is_empty() {
+        return false;
+    }
+    // Step 1: the WHOLE selector, exactly as this probe has always run it. A
+    // selector whose parts all live inside the root (`#container #inner`,
+    // `#first + #inner`) resolves here and nowhere else.
+    for r in &roots {
+        if !query_all(browser, r.root, selector).await.is_empty() {
             return true;
+        }
+    }
+    // A selector this probe refuses to reason about keeps the ordinary miss.
+    let Some(branches) = split_selector(selector) else {
+        return false;
+    };
+    for r in &roots {
+        for (parts, combs) in &branches {
+            // One compound: step 1 already asked the root itself, and there is
+            // no light-DOM half to prove.
+            if parts.len() < 2 {
+                continue;
+            }
+            let Some(tail) = parts.last() else {
+                continue;
+            };
+            let Some(boundary) = combs.last().copied() else {
+                continue;
+            };
+            // A host is never a SIBLING of anything inside its own root, so a
+            // sibling combinator at the boundary names no target in the
+            // flattened tree either: the ordinary miss is the truthful answer.
+            if boundary == '+' || boundary == '~' {
+                continue;
+            }
+            let hits = query_all(browser, r.root, tail).await;
+            if hits.is_empty() {
+                continue;
+            }
+            // `>` crosses the boundary only when the tail really sits directly
+            // under the root: with a wrapper in between, `#host > #inner` names
+            // nothing in the flattened tree and must stay the ordinary miss.
+            if boundary == '>' && !hits.iter().any(|n| r.kids.contains(n)) {
+                continue;
+            }
+            let lead = &parts[..parts.len() - 1];
+            let inner = &combs[..combs.len() - 1];
+            if prefix_reaches_host(browser, r.host, lead, inner, boundary).await {
+                return true;
+            }
         }
     }
     false
 }
 
-/// Collect the nodeId of every `shadowRootType:"closed"` shadow root in a
-/// `DOM.getDocument {pierce:true}` tree (nested closed roots included).
-fn collect_closed_roots(node: Option<&Value>, out: &mut Vec<i64>) {
+/// `DOM.querySelectorAll` scoped to one closed root: the only probe that can
+/// see into it. Any error is an empty answer - a miss, never a claim.
+async fn query_all(browser: &Browser, root: i64, selector: &str) -> Vec<i64> {
+    match browser
+        .command(
+            "DOM.querySelectorAll",
+            json!({"nodeId": root, "selector": selector}),
+            true,
+        )
+        .await
+    {
+        Ok(v) => v
+            .get("nodeIds")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Verify the compounds ABOVE a closed root's tail against the host's real
+/// ancestor chain - the half of the selector the shadow root cannot see.
+///
+/// `boundary` is the combinator between the last leading compound and the tail.
+/// The shadow root is transparent in the flattened tree, so a child boundary
+/// (`#host > #inner`) pins that compound to the host itself, while a descendant
+/// boundary lets it sit on the host or any of its ancestors. Every test is a
+/// real `Element.matches` on a real element; a selector the engine rejects, or
+/// a host the DOM cannot resolve, is a `false` - never a guess.
+async fn prefix_reaches_host(
+    browser: &Browser,
+    host: i64,
+    lead: &[String],
+    inner: &[char],
+    boundary: char,
+) -> bool {
+    let object_id = match browser
+        .command("DOM.resolveNode", json!({"nodeId": host}), true)
+        .await
+    {
+        Ok(v) => v
+            .get("object")
+            .and_then(|o| o.get("objectId"))
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        Err(_) => None,
+    };
+    let Some(object_id) = object_id else {
+        return false;
+    };
+    let (Ok(lead_lit), Ok(inner_lit)) = (serde_json::to_string(lead), serde_json::to_string(inner))
+    else {
+        return false;
+    };
+    let func = SHADOW_PREFIX_FN
+        .replace("__PARTS__", &lead_lit)
+        .replace("__COMBS__", &inner_lit)
+        .replace("__BOUNDARY__", &format!("{boundary:?}"));
+    matches!(
+        call_on_object(browser, &object_id, &func, vec![]).await,
+        Ok(Value::Bool(true))
+    )
+}
+
+/// The light-DOM half of the closed-root probe, run ON the host element.
+///
+/// `parts`/`combs` are the selector's leading compounds and the combinators
+/// between them; `boundary` is the combinator that meets the closed root. The
+/// shadow root is transparent here, so the tail compound's real parent IS the
+/// host: a `>` boundary pins the last leading compound to the host itself, a
+/// descendant boundary allows the host or any ancestor. The walk follows
+/// `parentElement`, and crosses an OPEN shadow root via `parentNode.host`, so a
+/// host that is itself inside a shadow root is covered. `matches()` throws on a
+/// selector the engine rejects - that is a `false`, never a guess.
+const SHADOW_PREFIX_FN: &str = r#"function() {
+  const parts = __PARTS__, combs = __COMBS__, boundary = __BOUNDARY__;
+  const up = (el) => {
+    if (!el) return null;
+    if (el.parentElement) return el.parentElement;
+    const p = el.parentNode;
+    return (p && p.host) ? p.host : null;
+  };
+  const m = (el, s) => { try { return !!(el && el.matches && el.matches(s)); } catch (e) { return false; } };
+  const terms = [];
+  if (boundary === '>') { terms.push(this); }
+  else { let n = this; while (n) { terms.push(n); n = up(n); } }
+  for (const t of terms) {
+    if (!m(t, parts[parts.length - 1])) continue;
+    let cur = t, ok = true;
+    for (let i = parts.length - 2; i >= 0 && ok; i--) {
+      const c = combs[i];
+      if (c === '>') {
+        const p = up(cur);
+        if (!m(p, parts[i])) ok = false; else cur = p;
+      } else if (c === ' ') {
+        let p = up(cur), found = false;
+        while (p) { if (m(p, parts[i])) { found = true; cur = p; break; } p = up(p); }
+        if (!found) ok = false;
+      } else { ok = false; }
+    }
+    if (ok) return true;
+  }
+  return false;
+}"#;
+
+/// Collect every `shadowRootType:"closed"` shadow root in a
+/// `DOM.getDocument {pierce:true}` tree (nested closed roots included), with
+/// the nodeId of the element that hosts it (the node whose `shadowRoots` array
+/// carries the root) and the nodeIds of its direct children.
+fn collect_closed_roots(node: Option<&Value>, out: &mut Vec<ClosedRoot>) {
     let Some(n) = node else {
         return;
     };
+    let host = n.get("nodeId").and_then(|v| v.as_i64()).unwrap_or(0);
     if let Some(roots) = n.get("shadowRoots").and_then(|v| v.as_array()) {
         for r in roots {
             if r.get("shadowRootType").and_then(|t| t.as_str()) == Some("closed") {
                 if let Some(id) = r.get("nodeId").and_then(|v| v.as_i64()) {
-                    out.push(id);
+                    let kids = r
+                        .get("children")
+                        .and_then(|v| v.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|k| k.get("nodeId").and_then(|v| v.as_i64()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    out.push(ClosedRoot {
+                        root: id,
+                        host,
+                        kids,
+                    });
                 }
             }
             collect_closed_roots(Some(r), out);
@@ -3043,6 +3226,137 @@ fn collect_closed_roots(node: Option<&Value>, out: &mut Vec<i64>) {
             collect_closed_roots(Some(k), out);
         }
     }
+}
+
+/// Push the compound being accumulated, recording the combinator that precedes
+/// it (`' '` when the selector only separated it with whitespace).
+fn flush_compound(
+    cur: &mut String,
+    parts: &mut Vec<String>,
+    combs: &mut Vec<char>,
+    pending: &mut Option<char>,
+) {
+    if !cur.is_empty() {
+        parts.push(std::mem::take(cur));
+        if parts.len() > 1 {
+            combs.push(pending.take().unwrap_or(' '));
+        }
+    }
+}
+
+/// Split a selector into its top-level comma branches, each as the compound
+/// parts it is built from plus the combinator between each pair (`' '` for a
+/// descendant, `>`/`+`/`~` as written). Quoted strings, `[...]` and `(...)` stay
+/// intact, so `[data-x="a b"]` and `:is(#a, #b)` are one compound each.
+///
+/// `None` means the probe refuses to reason about this selector (unbalanced
+/// quotes or brackets, a leading or trailing combinator, the `||` column
+/// combinator), and the caller keeps the ordinary miss.
+fn split_selector(selector: &str) -> Option<Vec<(Vec<String>, Vec<char>)>> {
+    let mut branches: Vec<(Vec<String>, Vec<char>)> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    let mut combs: Vec<char> = Vec::new();
+    let mut cur = String::new();
+    let mut pending: Option<char> = None;
+    let mut paren: i32 = 0;
+    let mut bracket: i32 = 0;
+    let mut quote: Option<char> = None;
+    let mut it = selector.chars().peekable();
+    while let Some(ch) = it.next() {
+        if let Some(q) = quote {
+            cur.push(ch);
+            if ch == '\\' {
+                if let Some(n) = it.next() {
+                    cur.push(n);
+                }
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => {
+                quote = Some(ch);
+                cur.push(ch);
+            }
+            '\\' => {
+                // A CSS escape: `\` + 1-6 hex digits + one optional whitespace
+                // terminator, or `\` + any other single char. `#\68 ost` is the
+                // ONE compound `#host` - the space belongs to the escape, so it
+                // is not a descendant combinator.
+                cur.push(ch);
+                let mut hex = 0;
+                while hex < 6 {
+                    match it.peek() {
+                        Some(c) if c.is_ascii_hexdigit() => {
+                            if let Some(h) = it.next() {
+                                cur.push(h);
+                            }
+                            hex += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                if hex == 0 {
+                    // Not a hex escape: `\` plus exactly one character.
+                    if let Some(c) = it.next() {
+                        cur.push(c);
+                    }
+                } else {
+                    // A hex escape swallows the single whitespace that ends it.
+                    if matches!(it.peek(), Some(c) if c.is_whitespace()) {
+                        if let Some(w) = it.next() {
+                            cur.push(w);
+                        }
+                    }
+                }
+            }
+            '(' => {
+                paren += 1;
+                cur.push(ch);
+            }
+            ')' => {
+                paren -= 1;
+                cur.push(ch);
+            }
+            '[' => {
+                bracket += 1;
+                cur.push(ch);
+            }
+            ']' => {
+                bracket -= 1;
+                cur.push(ch);
+            }
+            '|' if paren == 0 && bracket == 0 => return None,
+            ',' if paren == 0 && bracket == 0 => {
+                flush_compound(&mut cur, &mut parts, &mut combs, &mut pending);
+                if parts.is_empty() || pending.is_some() {
+                    return None;
+                }
+                branches.push((std::mem::take(&mut parts), std::mem::take(&mut combs)));
+            }
+            '>' | '+' | '~' if paren == 0 && bracket == 0 => {
+                flush_compound(&mut cur, &mut parts, &mut combs, &mut pending);
+                if parts.is_empty() || pending.is_some() {
+                    return None;
+                }
+                pending = Some(ch);
+            }
+            c if c.is_whitespace() && paren == 0 && bracket == 0 => {
+                flush_compound(&mut cur, &mut parts, &mut combs, &mut pending);
+            }
+            c => cur.push(c),
+        }
+    }
+    if quote.is_some() || paren != 0 || bracket != 0 {
+        return None;
+    }
+    flush_compound(&mut cur, &mut parts, &mut combs, &mut pending);
+    if parts.is_empty() || pending.is_some() {
+        return None;
+    }
+    branches.push((parts, combs));
+    Some(branches)
 }
 
 /// `shadow_closed`/`unreachable` (S2.5): the element exists inside a closed
