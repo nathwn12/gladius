@@ -1,4 +1,5 @@
 # nathwn12 house CI — stack: rust (copy to .github/workflows/ci.yml)
+# Docs-only change (*.md, docs/, LICEN[CS]E) keeps the required check green in seconds and runs no build.
 name: ci
 on:
   workflow_dispatch:
@@ -26,14 +27,36 @@ jobs:
       # major the repo's other workflows already use. v4 is Node-20 and the
       # runner annotates its deprecation.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Detect a docs-only change
+        id: scope
+        shell: bash
+        run: |
+          docs='^(.*\.md|docs/.*|LICEN[CS]E(\.md)?)$'
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+            changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
+          elif [ "${{ github.event_name }}" = "push" ] && [ -n "${{ github.event.before }}" ]; then
+            changed=$(git diff --name-only "${{ github.event.before }}" HEAD || true)
+          else
+            changed=$(git ls-files)
+          fi
+          if [ -n "$changed" ] && ! printf '%s\n' "$changed" | grep -qvE "$docs"; then
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          fi
       # Pinned to the crate MSRV (1.88.0, same as rust-toolchain.toml and the
       # release workflow), with the fmt + clippy components the gates need.
       - uses: dtolnay/rust-toolchain@1.88.0
+        if: steps.scope.outputs.code == 'true'
         with:
           components: rustfmt, clippy
       # Cargo registry + build cache (keyed on the lockfile): keeps the
       # typical run inside the <5 min budget.
       - name: restore cargo cache
+        if: steps.scope.outputs.code == 'true'
         uses: actions/cache@v6
         with:
           path: |
@@ -45,5 +68,12 @@ jobs:
       # debug-profile compile so a link/codegen break still fails the merge
       # without paying for a release build.
       - run: cargo fmt --all --check
+        if: steps.scope.outputs.code == 'true'
       - run: cargo clippy --all-targets --locked -- -D warnings
+        if: steps.scope.outputs.code == 'true'
       - run: cargo build --locked
+        if: steps.scope.outputs.code == 'true'
+      - name: Scope
+        if: always()
+        run: |
+          echo "scope: ${{ steps.scope.outputs.code == 'true' && 'code changed - the full gate ran' || 'docs-only - build skipped, the check stays green' }}"
