@@ -900,3 +900,220 @@ fn baselines_do_not_default_into_the_cwd() {
     std::fs::remove_dir_all(&dir).ok();
     shutdown(c);
 }
+
+/// Backdate a file so the oldest-first age-out order is a fact and not a race
+/// against NTFS timestamp granularity.
+fn age_file(path: &std::path::Path, secs: u64) {
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("open {} to age: {e}", path.display()));
+    let when = std::time::SystemTime::now() - Duration::from_secs(secs);
+    f.set_modified(when)
+        .unwrap_or_else(|e| panic!("set mtime on {}: {e}", path.display()));
+}
+
+/// SPEC.md S2.4: a baseline is never classified as a by-product, whatever its
+/// name.
+///
+/// `<name>.png` and the `.diff.png` by-product of `<name-without-.diff>` share
+/// one path, so a baseline named `shot.diff` used to be indistinguishable from
+/// a by-product: it was excluded from the 500-entry count (`store_counts`) and
+/// it was eligible for automatic age-out (`age_out_diffs`), which the spec
+/// forbids twice over. The name is now refused with a typed
+/// `invalid_args`/`bad_value` and nothing is written.
+#[test]
+fn byproduct_shaped_baseline_name_is_refused_typed() {
+    let dir = scratch("s24-ns");
+    let vdir = dir.join("visual");
+    std::fs::create_dir_all(&vdir).expect("visual dir");
+    let vdir_s = vdir.to_string_lossy().to_string();
+    let mut c = Client::spawn_with_env(&[("GLADIUS_VISUAL_DIR", &vdir_s)]);
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+    let page = dir.join("ns.html");
+    std::fs::write(
+        &page,
+        "<!doctype html><html><head><meta charset=utf-8><style>html,body{margin:0;\
+         background:#fff}</style></head><body><p style='font:16px monospace'>NS</p></body></html>",
+    )
+    .expect("write page");
+    goto(&mut c, &page, 200, 120);
+
+    let refused = c.call("visual", json!({"action": "save", "name": "shot.diff"}));
+    assert!(
+        refused.get("isError").is_some(),
+        "a baseline name whose PNG is a by-product path is refused: {refused}"
+    );
+    let sc = refused
+        .get("structuredContent")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        sc.get("code").and_then(|v| v.as_str()),
+        Some("invalid_args"),
+        "the refusal is typed invalid_args: {refused}"
+    );
+    assert_eq!(
+        sc.get("reason").and_then(|v| v.as_str()),
+        Some("bad_value"),
+        "the refusal carries reason bad_value: {refused}"
+    );
+    let prose = content_text(&refused);
+    assert!(
+        prose.contains(".diff.png"),
+        "the refusal names the by-product namespace it collides with: {prose}"
+    );
+    assert!(
+        !vdir.join("shot.diff.png").exists(),
+        "a refused save writes nothing"
+    );
+    let list = c.call_ok("visual", json!({"action": "list"}));
+    assert_eq!(
+        num(&list, "count"),
+        Some(0),
+        "the refused name is not stored and not counted: {list}"
+    );
+    assert_eq!(
+        num(&list, "diffCount"),
+        Some(0),
+        "and it is not counted as a by-product either: {list}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    shutdown(c);
+}
+
+/// SPEC.md S2.4: a `.diff.png` that carries a baseline sidecar is a baseline -
+/// counted by `count`, excluded from `diffCount`, never eligible for the
+/// automatic age-out that deletes real by-products, and never overwritten by
+/// the by-product that shares its path.
+///
+/// The files are planted the way a build before this fix would have left them
+/// (`legacy.diff.png` + `legacy.diff.meta.json`, which is exactly what
+/// `save {name:"legacy.diff"}` wrote). Four genuine by-products are planted
+/// beside it with older timestamps so one age-out pass must delete one of
+/// them: the pass proves it is running, and proves the baseline is not in its
+/// set.
+#[test]
+fn a_baseline_in_the_byproduct_namespace_is_counted_and_never_aged_out() {
+    let dir = scratch("s24-legacy");
+    let vdir = dir.join("visual");
+    std::fs::create_dir_all(&vdir).expect("visual dir");
+    let vdir_s = vdir.to_string_lossy().to_string();
+    let mut c =
+        Client::spawn_with_env(&[("GLADIUS_VISUAL_DIR", &vdir_s), ("GLADIUS_VISUAL_CAP", "4")]);
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
+    let white = dir.join("white.html");
+    std::fs::write(
+        &white,
+        "<!doctype html><html><head><meta charset=utf-8><style>html,body{margin:0;\
+         background:#fff}</style></head><body><p style='font:16px monospace'>WHITE</p></body></html>",
+    )
+    .expect("write white page");
+    let dark = dir.join("dark.html");
+    std::fs::write(
+        &dark,
+        "<!doctype html><html><head><meta charset=utf-8><style>html,body{margin:0;\
+         background:#111}</style></head><body><p style='font:16px monospace;color:#eee'>\
+         DARK</p></body></html>",
+    )
+    .expect("write dark page");
+
+    goto(&mut c, &white, 200, 120);
+    // `legacy` is the baseline whose by-product path the legacy baseline below
+    // occupies; `a` and `b` are ordinary baselines.
+    c.call_ok("visual", json!({"action": "save", "name": "legacy"}));
+    c.call_ok("visual", json!({"action": "save", "name": "a"}));
+    c.call_ok("visual", json!({"action": "save", "name": "b"}));
+    // A baseline saved under a name that ends `.diff`, as an older build left
+    // it: the PNG and the sidecar move together, so it is a complete baseline.
+    c.call_ok("visual", json!({"action": "save", "name": "planted"}));
+    std::fs::rename(vdir.join("planted.png"), vdir.join("legacy.diff.png"))
+        .expect("plant the legacy baseline png");
+    std::fs::rename(
+        vdir.join("planted.meta.json"),
+        vdir.join("legacy.diff.meta.json"),
+    )
+    .expect("plant the legacy baseline sidecar");
+    let planted_bytes = std::fs::read(vdir.join("legacy.diff.png")).expect("planted baseline");
+
+    // Four genuine by-products: a `.diff.png` with no sidecar is what `compare`
+    // writes. Their names are the by-products of `old1`..`old4`.
+    for (i, aged) in [(1, 3 * 3600_u64), (2, 2 * 3600), (3, 3600), (4, 1800)] {
+        let p = vdir.join(format!("old{i}.diff.png"));
+        std::fs::write(&p, b"not decoded by age-out").expect("plant a by-product");
+        age_file(&p, aged);
+    }
+    // The legacy baseline is older than every by-product, so an age-out that
+    // classified it by its suffix would take it first.
+    age_file(&vdir.join("legacy.diff.png"), 5 * 3600);
+
+    let before = c.call_ok("visual", json!({"action": "list"}));
+
+    // One compare that mismatches runs the age-out pass before it writes.
+    goto(&mut c, &dark, 200, 120);
+    let cmp = c.call_ok("visual", json!({"action": "compare", "name": "a"}));
+    assert_eq!(
+        flag(&cmp, "pixelsIdentical"),
+        Some(false),
+        "the compare against a changed page really differs: {cmp}"
+    );
+
+    assert!(
+        !vdir.join("old1.diff.png").exists(),
+        "the age-out pass ran and deleted the oldest real by-product"
+    );
+    assert!(
+        vdir.join("legacy.diff.png").is_file(),
+        "a stored baseline is never aged out, whatever its name"
+    );
+    assert!(
+        vdir.join("legacy.diff.meta.json").is_file(),
+        "and its sidecar survives with it"
+    );
+    assert_eq!(
+        num(&before, "count"),
+        Some(4),
+        "the legacy baseline counts toward the cap with `legacy`, `a` and `b`: {before}"
+    );
+    assert_eq!(
+        num(&before, "diffCount"),
+        Some(4),
+        "only the four real by-products are counted as by-products: {before}"
+    );
+    let list = c.call_ok("visual", json!({"action": "list"}));
+    assert_eq!(
+        num(&list, "count"),
+        Some(4),
+        "the baseline is still stored and still counted: {list}"
+    );
+
+    // The by-product path of `legacy` is the stored baseline `legacy.diff`, so
+    // a mismatching compare of `legacy` must not write over it.
+    let guard = c.call_ok("visual", json!({"action": "compare", "name": "legacy"}));
+    assert_eq!(
+        flag(&guard, "pixelsIdentical"),
+        Some(false),
+        "the compare of the stem baseline really differs: {guard}"
+    );
+    assert!(
+        guard.get("diffPath").map(Value::is_null).unwrap_or(false),
+        "no diff image is written onto a stored baseline: {guard}"
+    );
+    assert!(
+        guard
+            .get("warning")
+            .and_then(|w| w.as_str())
+            .unwrap_or("")
+            .contains("diff_path_reserved"),
+        "the reply says why the diff was not written: {guard}"
+    );
+    assert_eq!(
+        std::fs::read(vdir.join("legacy.diff.png")).expect("legacy baseline after the guard"),
+        planted_bytes,
+        "the stored baseline's bytes are untouched"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    shutdown(c);
+}

@@ -118,22 +118,74 @@ pub fn visual_cap() -> i64 {
         .unwrap_or(500)
 }
 
+/// How one file in the store is classified. `save` writes `<name>.png` **and**
+/// its `<name>.meta.json` sidecar; `compare` writes `<name>.diff.png` and no
+/// sidecar. The sidecar is therefore the identity record: a `.diff.png` that
+/// carries one is a **baseline** whose name happens to end in `.diff` (a name
+/// `save` accepted before S2.4 closed that door), never a by-product. A suffix
+/// alone is not evidence, which is why the count and the age-out both ask here.
+enum StoreFile {
+    Baseline,
+    DiffByProduct,
+    Other,
+}
+
+fn classify(dir: &std::path::Path, fname: &str) -> StoreFile {
+    let Some(base) = fname.strip_suffix(".png") else {
+        return StoreFile::Other;
+    };
+    if base.ends_with(".diff") && !dir.join(format!("{base}.meta.json")).is_file() {
+        return StoreFile::DiffByProduct;
+    }
+    StoreFile::Baseline
+}
+
+/// Is this exact path a stored baseline? True when the sidecar that `save`
+/// writes beside the PNG is present.
+fn is_baseline_png(path: &std::path::Path) -> bool {
+    match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
+        (Some(dir), Some(fname)) => matches!(classify(dir, fname), StoreFile::Baseline),
+        _ => false,
+    }
+}
+
 /// `(baselines, diff by-products)` stored under `dir`. Counted from the file
-/// names, so no sidecar is required to be readable.
+/// names plus the sidecar that identifies a baseline, so no sidecar is required
+/// to be *readable* - only to exist.
 fn store_counts(dir: &std::path::Path) -> (i64, i64) {
     let mut pngs = 0;
     let mut diffs = 0;
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".diff.png") {
-                diffs += 1;
-            } else if name.ends_with(".png") {
-                pngs += 1;
+            match classify(dir, &name) {
+                StoreFile::Baseline => pngs += 1,
+                StoreFile::DiffByProduct => diffs += 1,
+                StoreFile::Other => {}
             }
         }
     }
     (pngs, diffs)
+}
+
+/// A baseline name whose PNG path is also the `.diff.png` by-product path of
+/// another baseline is refused. One path cannot hold two artifacts: a baseline
+/// that shared it would be excluded from the cap and eligible for the automatic
+/// age-out, which the spec forbids. `<name>.diff` is the whole colliding family
+/// (case-insensitively, because the store lives on a case-insensitive
+/// filesystem).
+fn byproduct_namespace_refusal(name: &str) -> Option<ToolErr> {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".diff")?;
+    Some(ToolErr::typed(
+        format!(
+            "visual: the baseline name '{name}' would be stored as '{name}.png', which is \
+             exactly the .diff.png by-product that `compare` writes for the baseline \
+             '{stem}'; a baseline and a by-product cannot share a path, so this name is \
+             refused - pick a name that does not end in '.diff'"
+        ),
+        json!({"code": "invalid_args", "reason": "bad_value", "tool": "visual", "arg": "name"}),
+    ))
 }
 
 /// Refuse a save that would grow the store past its cap.
@@ -162,7 +214,8 @@ fn cap_refusal(name: &str) -> Option<ToolErr> {
 
 /// Age out `.diff.png` by-products (oldest first) so the next write keeps the
 /// store under its diff cap. Diff images are the only files eligible: they are
-/// by-products of a compare, never a baseline.
+/// by-products of a compare, never a baseline - and a `.diff.png` whose own
+/// sidecar exists is a baseline, so it is not in this set at all.
 fn age_out_diffs() {
     let dir = visual_dir();
     let cap = visual_cap();
@@ -172,7 +225,7 @@ fn age_out_diffs() {
     };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if !name.ends_with(".diff.png") {
+        if !matches!(classify(&dir, &name), StoreFile::DiffByProduct) {
             continue;
         }
         let modified = e
@@ -699,9 +752,14 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// Capture deterministically and store the PNG plus its environment sidecar.
 ///
 /// The cap is checked BEFORE the capture: a refused save costs no capture and
-/// writes nothing (S2.4).
+/// writes nothing (S2.4). A name whose PNG would land in the by-product
+/// namespace is refused for the same reason - it could never be counted or
+/// protected like the baseline it is.
 pub async fn save(browser: &Browser, name: &str, full_page: bool) -> Result<Value, ToolErr> {
     let safe = sanitise_name(name).map_err(ToolErr::from)?;
+    if let Some(refusal) = byproduct_namespace_refusal(&safe) {
+        return Err(refusal);
+    }
     if let Some(refusal) = cap_refusal(&safe) {
         return Err(refusal);
     }
@@ -748,7 +806,7 @@ pub fn list() -> Result<Value, String> {
                     Some(n) => n.to_string(),
                     None => continue,
                 };
-                if !fname.ends_with(".png") || fname.ends_with(".diff.png") {
+                if !matches!(classify(&dir, &fname), StoreFile::Baseline) {
                     continue;
                 }
                 let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
@@ -1427,14 +1485,27 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
         0.0
     };
     let mut wrote_diff: Option<String> = None;
+    let mut diff_write_note: Option<String> = None;
     if let Some(b64) = &diff.diff_png_base64 {
         if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
-            // Diff images are the only by-products: age the oldest out so the
-            // store stays under its own cap (S2.4).
-            age_out_diffs();
             let p = diff_path(&safe);
-            if write_png(&p, &bytes).is_ok() {
-                wrote_diff = Some(p.to_string_lossy().to_string());
+            // `<stem>.diff.png` is also the path of a baseline literally named
+            // `<stem>.diff` (a name an older build accepted). A by-product
+            // never overwrites a stored baseline: that would be the silent
+            // eviction S2.4 forbids, and the note says why no diff was written.
+            if is_baseline_png(&p) {
+                diff_write_note = Some(format!(
+                    "diff_path_reserved: the by-product path {} is a stored baseline, so the \
+                     diff image was not written over it",
+                    p.display()
+                ));
+            } else {
+                // Diff images are the only by-products: age the oldest out so
+                // the store stays under its own cap (S2.4).
+                age_out_diffs();
+                if write_png(&p, &bytes).is_ok() {
+                    wrote_diff = Some(p.to_string_lossy().to_string());
+                }
             }
         }
     }
@@ -1514,6 +1585,9 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
             Vec::new(),
         ),
     };
+    if let Some(note) = diff_write_note {
+        notes.push(note);
+    }
     if let Some(aa) = aa_warning(diff.ignored_pixels, diff.ignored_clusters) {
         notes.push(aa);
     }
