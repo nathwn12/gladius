@@ -49,7 +49,7 @@ jobs:
           fi
       # Pinned to the crate MSRV (1.88.0, same as rust-toolchain.toml and the
       # release workflow), with the fmt + clippy components the gates need.
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.120.0
         if: steps.scope.outputs.code == 'true'
         with:
           components: rustfmt, clippy
