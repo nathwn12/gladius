@@ -9,16 +9,16 @@ see below).
 - Project: Chrome for Testing: `chrome-headless-shell` (headless-only //content wrapper)
 - Channel: Stable, resolved to an explicit version (a channel name is NOT a pin)
 - Resolved from: https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json
-- Version: `155.0.8059.84`
+- Version: `156.0.8078.80`
 - Asset: `chrome-headless-shell-win64.zip`
-- Asset URL: https://storage.googleapis.com/chrome-for-testing-public/155.0.8059.84/win64/chrome-headless-shell-win64.zip
+- Asset URL: https://storage.googleapis.com/chrome-for-testing-public/156.0.8078.80/win64/chrome-headless-shell-win64.zip
 
 ## Pin
 
-- Zip sha256: `5ca590a4968864e219ea25ccd134597ef8898a733a4698c07fc3e8b2c480fef4`
-- Zip size: `123681250` bytes
-- Zip contents: exactly `288` files under `chrome-headless-shell-win64\`, total `290511280` bytes.
-- `chrome-headless-shell.exe`: size `217146368`, sha256 `64db9686dab042ba3282f7ab6fef98de266b015fd4d056c30760244425091d39`
+- Zip sha256: `10a77466005e7f64e00f1a75fd1ea81f4a38a60093c65fea6895843b26e60a9a`
+- Zip size: `125772546` bytes
+- Zip contents: exactly `288` files under `chrome-headless-shell-win64\`, total `295451849` bytes.
+- `chrome-headless-shell.exe`: size `221050880`, sha256 `f56585149c1b55845536f963b754bf2db5a907ef8f0cc442569690e0f70c99f8`
 - Every file (names are zip-relative, forward slashes) is listed with sha256 + size in
   `scripts/chromium-manifest.json`.
 
@@ -36,7 +36,7 @@ and the pinned version in lockstep; the script refuses on any drift and writes n
 ## Cache layout and re-provision
 
 - Root: `%LOCALAPPDATA%\gladius\chromium\` (override with `GLADIUS_CHROMIUM_CACHE`).
-- Each pin lives at `<version>-<zip-sha8>\`, e.g. `155.0.8059.84-5ca590a4\`.
+- Each pin lives at `<version>-<zip-sha8>\`, e.g. `156.0.8078.80-10a77466\`.
 - Inside: the extracted `chrome-headless-shell-win64\` tree plus
   `chrome-headless-shell-win64\chrome-headless-shell.exe`.
 
@@ -55,7 +55,7 @@ It refuses on any hash/size mismatch and writes nothing.
 Force a re-provision by deleting the versioned cache dir (or re-run with `-Force`):
 
 ```powershell
-Remove-Item -Recurse -Force "$env:LOCALAPPDATA\gladius\chromium\155.0.8059.84-5ca590a4"
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\gladius\chromium\156.0.8078.80-10a77466"
 powershell -ExecutionPolicy Bypass -File scripts\fetch-chromium.ps1
 ```
 

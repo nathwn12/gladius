@@ -12,7 +12,7 @@ lives in `docs/CHROMIUM.md`; this document records how gladius runs it.
 1. `GLADIUS_CHROMIUM` set and non-blank: that path (must be a file).
 2. Otherwise the pinned build under the owned cache root:
    `GLADIUS_CHROMIUM_CACHE` when set and non-blank, otherwise
-   `%LOCALAPPDATA%\gladius\chromium\155.0.8059.84-5ca590a4\`
+   `%LOCALAPPDATA%\gladius\chromium\156.0.8078.80-10a77466\`
    (`chrome-headless-shell-win64\chrome-headless-shell.exe` inside).
 3. Otherwise a clear error naming `scripts/fetch-chromium.ps1`.
 

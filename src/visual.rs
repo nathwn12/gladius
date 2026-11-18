@@ -342,7 +342,7 @@ pub struct EnvMeta {
     // The 0.8.0 fingerprint (S1.8). Every one is `Option` because a 0.7.x
     // sidecar has none of them: a missing axis is UNKNOWN, and the compare says
     // so instead of letting the baseline match silently.
-    /// Full engine version string (`155.0.8059.84`), not just the major.
+    /// Full engine version string (`156.0.8078.80`), not just the major.
     pub full_version: Option<String>,
     /// `navigator.platform`.
     pub platform: Option<String>,

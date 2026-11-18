@@ -17,7 +17,7 @@ Or pin it in an MCP client as a stdio server with command `npx` and args
 First run provisions two things, both sha256-verified before and after
 extraction: the pinned server runtime from the tagged GitHub Release into
 `%LOCALAPPDATA%\gladius\engine\<serverVersion>-<bundleSha8>\`, and the
-pinned browser from Google's Chrome-for-Testing endpoint (~118 MB download)
+pinned browser from Google's Chrome-for-Testing endpoint (~120 MB download)
 into `%LOCALAPPDATA%\gladius\chromium\<version>-<zipSha8>\`. Both are reused
 on later runs (re-verified each time); any mismatch refuses and writes
 nothing. An explicit `GLADIUS_CHROMIUM` binary wins instead: on that path no
@@ -47,9 +47,9 @@ GitHub release exists; the one-release policy deletes older releases.
 
 ## Browser provenance
 
-The browser is Chrome-for-Testing `chrome-headless-shell` `155.0.8059.84`
+The browser is Chrome-for-Testing `chrome-headless-shell` `156.0.8078.80`
 (headless-only), fetched at provision time from
-`https://storage.googleapis.com/chrome-for-testing-public/155.0.8059.84/win64/chrome-headless-shell-win64.zip`.
+`https://storage.googleapis.com/chrome-for-testing-public/156.0.8078.80/win64/chrome-headless-shell-win64.zip`.
 It is NEVER redistributed in our release assets or this package: our own
 manifest is the integrity root (CfT publishes no hashes), and the in-package
 manifest pins the archive hash, the extracted tree's file count + total size,

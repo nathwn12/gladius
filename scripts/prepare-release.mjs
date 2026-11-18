@@ -51,8 +51,13 @@ try {
   gate("selftest", () => run(path.join(root, "target/release/gladius.exe"), ["selftest"]));
 
   const manifest = json("npm/engine-manifest.json");
-  const browser = json("scripts/chromium-manifest.json").browser;
-  need(JSON.stringify(manifest.browser) === JSON.stringify(browser), "browser manifest drift");
+  // The browser pin has ONE home: scripts/chromium-manifest.json. The published
+  // package cannot derive it at runtime (npm/ ships no scripts/), so it is
+  // derived here, at release time, into the manifest this run writes. The
+  // committed npm copy is kept in step by ci.yml, which fails at PR time when
+  // the two blocks disagree - an assertion there, a derivation here.
+  manifest.browser = json("scripts/chromium-manifest.json").browser;
+  const browser = manifest.browser;
   const provisioner = read("scripts/fetch-chromium.ps1").toString();
   for (const value of [browser.version, browser.asset.url, browser.asset.sha256, browser.asset.size]) need(provisioner.includes(String(value)), "provisioner browser pin drift");
   const cache = path.join(childEnv.GLADIUS_CHROMIUM_CACHE, `${browser.version}-${browser.asset.sha256.slice(0, 8)}`);

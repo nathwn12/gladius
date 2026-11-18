@@ -11,8 +11,8 @@ Chrome-for-Testing endpoint at provision time and never redistributed.
   cache unless `GLADIUS_CHROMIUM` points elsewhere or `GLADIUS_CDP_URL`
   attaches to an external engine instead.
 - **Upstream:** <https://developer.chrome.com/docs/automation-and-testing/chrome-for-testing>
-  (asset `chrome-headless-shell-win64.zip`, pinned `155.0.8059.84`)
-- **Release provisioned:** `155.0.8059.84`, fetched and sha256-verified by
+  (asset `chrome-headless-shell-win64.zip`, pinned `156.0.8078.80`)
+- **Release provisioned:** `156.0.8078.80`, fetched and sha256-verified by
   [`scripts/fetch-chromium.ps1`](scripts/fetch-chromium.ps1) (zip, per-file,
   and size pins live in `scripts/chromium-manifest.json`).
 - **License:** Chromium BSD-style licence. The attribution copy is carried in

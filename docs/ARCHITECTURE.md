@@ -44,7 +44,7 @@ Rules: tools are **dumb primitives** - no planner, no LLM, no judgement-retries 
 | Tier | Backend | When | Notes |
 |---|---|---|---|
 | **Tier 0 (only launch)** | owned pinned Chromium (`chrome-headless-shell`) | now | versioned cache under `%LOCALAPPDATA%\gladius\chromium\`, provisioned by
-  `scripts/fetch-chromium.ps1` (pinned 155.0.8059.84, self-hashed manifest).
+  `scripts/fetch-chromium.ps1` (pinned 156.0.8078.80, self-hashed manifest).
   Headless-only (owner decision 2026-10-17, no headed path). Launched as
   `chrome-headless-shell --headless --remote-debugging-port <free>
   --user-data-dir <private> --no-first-run --no-default-browser-check
