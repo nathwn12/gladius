@@ -12,7 +12,10 @@ permissions:
   actions: write
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel a push run: a docs-only push landing after a code push to
+  # `main` would kill the run that was testing the code, and its own run skips
+  # the suite and goes green for a `main` nobody tested. PR runs keep it.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 jobs:
   build:
     runs-on: windows-latest
@@ -136,13 +139,15 @@ jobs:
         with:
           path: ~\AppData\Local\gladius\chromium
           key: chromium-win64-156.0.8078.80-${{ hashFiles('scripts/chromium-manifest.json') }}
-      # chrome-headless-shell writes `debug.log` beside its own exe when it logs a
-      # warning, so the tree saved back into this cache is one file larger than
+      # chrome-headless-shell writes `debug.log` beside its own exe when it logs
+      # a warning, so the tree saved back into this cache is one file larger than
       # the manifest - and fetch-chromium.ps1 (correctly) refuses an inexact set:
-      # "found=289 expected=288". Drop only files the manifest does not list.
-      # Every file it does list is still size- and sha256-verified by the script
-      # below, and a scrub removes rather than adds, so nothing unverified can
-      # survive it.
+      # "found=289 expected=288". The premise (that debug.log appears) is observed
+      # on the artifact's documented behaviour; not yet reproduced in CI.
+      # The scrub deletes that one by-product by NAME, inside the browser cache
+      # dir only, and never a manifest-listed file. Anything else unexpected is
+      # left in place on purpose: the provisioner below then fails closed with its
+      # own found/expected message, instead of this step silently hiding drift.
       - name: drop browser runtime by-products from the restored cache
         if: steps.scope.outputs.code == 'true'
         shell: pwsh
@@ -154,18 +159,24 @@ jobs:
             Write-Host 'pinned browser cache absent; nothing to scrub.'
             exit 0
           }
+          $byProduct = 'debug.log'
           $listed = @{}
           foreach ($f in $m.browser.files) { $listed[$f.name] = $true }
           $dropped = 0
           foreach ($file in (Get-ChildItem -File -Recurse -LiteralPath $dir)) {
             $rel = $file.FullName.Substring($dir.Length + 1).Replace('\', '/')
-            if (-not $listed.ContainsKey($rel)) {
+            if ($file.Name -eq $byProduct -and -not $listed.ContainsKey($rel)) {
               Remove-Item -LiteralPath $file.FullName -Force
               Write-Host ("dropped runtime by-product: {0}" -f $rel)
               $dropped++
             }
           }
-          Write-Host ("scrubbed {0} file(s) not in the manifest." -f $dropped)
+          Write-Host ("scrubbed {0} file(s) named {1}." -f $dropped, $byProduct)
+          $unexpected = @(Get-ChildItem -File -Recurse -LiteralPath $dir | Where-Object { -not $listed.ContainsKey($_.FullName.Substring($dir.Length + 1).Replace('\', '/')) })
+          if ($unexpected.Count -gt 0) {
+            Write-Host ("left {0} unlisted file(s) in place; the provisioner decides." -f $unexpected.Count)
+            $unexpected | ForEach-Object { Write-Host ("  unlisted: {0}" -f $_.FullName.Substring($dir.Length + 1)) }
+          }
       # Same invocation browser-update.yml uses. Idempotent: a verified cache is
       # a no-op; a missing or mismatched one downloads and verifies the pin.
       - name: provision the pinned browser

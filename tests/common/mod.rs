@@ -62,19 +62,42 @@ fn cache_root() -> PathBuf {
 }
 
 /// The pinned browser the engine and these tests both run. An explicit
-/// `GLADIUS_CHROMIUM` exe still wins, as it did before this helper existed.
+/// `GLADIUS_CHROMIUM` exe still wins - but only when it lives inside the
+/// pinned cache directory, `<version>-<first 8 hex of the zip sha256>`.
+/// Without that check a machine could point this at the retired browser and go
+/// green while CI proved the current one, which is the exact drift this helper
+/// exists to prevent. Path-derived only: a sha256 of a 217 MB exe per test
+/// binary would cost more than it proves, and the provisioner already verifies
+/// every file it writes into that directory.
 pub fn pinned_chromium_exe() -> PathBuf {
-    if let Ok(p) = std::env::var("GLADIUS_CHROMIUM") {
-        if !p.trim().is_empty() {
-            return PathBuf::from(p.trim());
-        }
-    }
     let (version, sha256) = pin();
     let short8 = sha256.get(..8).unwrap_or_else(|| {
         panic!("chromium-manifest.json: browser.asset.sha256 shorter than 8 chars: {sha256}")
     });
+    let pinned_dir = format!("{version}-{short8}");
+    if let Ok(p) = std::env::var("GLADIUS_CHROMIUM") {
+        let given = p.trim();
+        if !given.is_empty() {
+            let path = PathBuf::from(given);
+            let from_pin = path
+                .components()
+                .any(|c| c.as_os_str().to_string_lossy() == pinned_dir);
+            if !from_pin {
+                panic!(
+                    "GLADIUS_CHROMIUM='{}' is not inside the pinned browser directory `{}` \
+                     (pinned version {}). Point it at the browser under \
+                     $GLADIUS_CHROMIUM_CACHE\\{}\\ or unset it to use the cache.",
+                    path.display(),
+                    pinned_dir,
+                    version,
+                    pinned_dir,
+                );
+            }
+            return path;
+        }
+    }
     cache_root()
-        .join(format!("{version}-{short8}"))
+        .join(&pinned_dir)
         .join("chrome-headless-shell-win64")
         .join("chrome-headless-shell.exe")
 }
