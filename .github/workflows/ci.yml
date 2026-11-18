@@ -51,6 +51,35 @@ jobs:
           else
             echo "code=true" >> "$GITHUB_OUTPUT"
           fi
+      # The npm manifest's `browser` block is derived from
+      # scripts/chromium-manifest.json at release time (prepare-release.mjs),
+      # because the published package ships no scripts/ to derive it from. This
+      # is the witness: bump the pin without regenerating the committed npm copy
+      # and the PR goes red here, before a release can ship two pins.
+      - name: browser pin matches the committed npm manifest
+        if: steps.scope.outputs.code == 'true'
+        shell: bash
+        run: |
+          node -e '
+          const fs = require("node:fs");
+          const chromium = JSON.parse(fs.readFileSync("scripts/chromium-manifest.json", "utf8")).browser;
+          const engine = JSON.parse(fs.readFileSync("npm/engine-manifest.json", "utf8")).browser;
+          if (JSON.stringify(engine) !== JSON.stringify(chromium)) {
+            const known = new Map(engine.files.map((f) => [f.name, f]));
+            const diffs = chromium.files.filter((f) => {
+              const other = known.get(f.name);
+              return !other || JSON.stringify(other) !== JSON.stringify(f);
+            }).map((f) => f.name);
+            console.error("browser pin drift: npm/engine-manifest.json != scripts/chromium-manifest.json");
+            console.error(`  chromium-manifest: ${chromium.version}, ${chromium.files.length} files, zip sha256 ${chromium.asset.sha256.slice(0, 8)}`);
+            console.error(`  npm manifest:      ${engine.version}, ${engine.files.length} files, zip sha256 ${engine.asset.sha256.slice(0, 8)}`);
+            console.error(`  ${diffs.length} of ${chromium.files.length} file entries differ or are missing`);
+            for (const name of diffs.slice(0, 5)) console.error(`    ${name}`);
+            console.error("regenerate npm/engine-manifest.json from scripts/chromium-manifest.json");
+            process.exit(1);
+          }
+          console.log(`browser pin matches: ${chromium.version}, ${chromium.files.length} files, zip sha256 ${chromium.asset.sha256.slice(0, 8)}`);
+          '
       # Pinned to the crate MSRV (1.88.0, same as rust-toolchain.toml and the
       # release workflow), with the fmt + clippy components the gates need.
       - uses: dtolnay/rust-toolchain@1.88.0
