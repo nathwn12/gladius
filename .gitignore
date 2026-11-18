@@ -17,3 +17,5 @@ __pycache__/
 *.p12
 credentials*
 *.secret
+.seed/
+.opencode/skills/*-seed/
