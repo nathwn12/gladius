@@ -33,6 +33,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
+mod common;
+
+use common::pinned_chromium_exe;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------- helpers
@@ -296,25 +299,6 @@ fn json_version(port: u16) -> Option<Value> {
     let start = body.find('{')?;
     let end = body.rfind('}')?;
     serde_json::from_str(&body[start..=end]).ok()
-}
-
-fn pinned_chromium_exe() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("GLADIUS_CHROMIUM") {
-        if !p.trim().is_empty() {
-            return std::path::PathBuf::from(p.trim());
-        }
-    }
-    let root = match std::env::var("GLADIUS_CHROMIUM_CACHE") {
-        Ok(v) if !v.trim().is_empty() => std::path::PathBuf::from(v.trim()),
-        _ => std::path::PathBuf::from(
-            std::env::var("LOCALAPPDATA").expect("LOCALAPPDATA for pinned chromium"),
-        )
-        .join("gladius")
-        .join("chromium"),
-    };
-    root.join("155.0.8059.84-5ca590a4")
-        .join("chrome-headless-shell-win64")
-        .join("chrome-headless-shell.exe")
 }
 
 fn free_port() -> u16 {
