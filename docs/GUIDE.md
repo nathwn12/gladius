@@ -30,7 +30,7 @@ refuses and writes nothing.
 | Artifact | Source | Cache location |
 |---|---|---|
 | Server runtime bundle | the tagged GitHub Release for this version | `%LOCALAPPDATA%\gladius\engine\<serverVersion>-<bundleSha8>\` |
-| `chrome-headless-shell` `155.0.8059.84` | Google's Chrome-for-Testing endpoint (~118 MB) | `%LOCALAPPDATA%\gladius\chromium\<version>-<zipSha8>\` |
+| `chrome-headless-shell` `156.0.8078.80` | Google's Chrome-for-Testing endpoint (~120 MB) | `%LOCALAPPDATA%\gladius\chromium\<version>-<zipSha8>\` |
 
 Both are reused on later runs and re-verified each time. `--doctor` and
 `--print-manifest` only print the resolved paths and exit 0 - they perform no
