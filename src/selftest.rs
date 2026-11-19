@@ -375,7 +375,6 @@ pub async fn run() -> i32 {
     );
     srv.abort();
 
-    // ---------------------------------------------------------------- layout
     // Geometry without pixels, deterministic pixels, and baselines. The
     // fixture is a local file (tests/fixtures/layout.html): no network.
     let fixture = std::path::PathBuf::from(concat!(
@@ -835,7 +834,6 @@ pub async fn run() -> i32 {
         &truncate(&vd.to_string(), 160),
     );
 
-    // ------------------------------------------------ anti-aliasing tolerance
     // The rule (documented in src/visual.rs): a candidate pixel is ignored
     // only when its 3x3 luminance neighbourhood is high-contrast in BOTH
     // images, it is antialias-eligible, and its 4-connected component is no
@@ -969,7 +967,6 @@ pub async fn run() -> i32 {
         &truncate(&block.to_string(), 160),
     );
 
-    // ---------------------------------------------- baseline environment meta
     // The sidecar records what rendered the baseline; a mismatch is a warning
     // by default and a failure only when the caller requires a match.
     let _ = crate::tools::call("navigate", &serde_json::json!({"url": curl.clone()}), &b).await;
@@ -1091,7 +1088,6 @@ pub async fn run() -> i32 {
         &truncate(&format!("{eupdate} meta={meta_after}"), 220),
     );
 
-    // ------------------------------------------ scratch target stays in back
     // The diff tab is created with background:true (never activates) and is
     // closed before the reply, so the page-target count is unchanged.
     let pages_before = page_targets(&b).await;
@@ -1116,7 +1112,6 @@ pub async fn run() -> i32 {
         ),
     );
 
-    // ------------------------------------------------------- unknown metadata
     // A sidecar that is missing, malformed or unreadable is NOT a match: the
     // strict gate must not pass without evidence.
     let meta_file = vdir.join("env_probe.meta.json");
@@ -1214,7 +1209,6 @@ pub async fn run() -> i32 {
     )
     .await;
 
-    // ------------------------------------------------- scratch refusal (typed)
     // An engine that cannot create the diff tab in the background must be
     // refused, never retried in the foreground (that would activate a tab).
     std::env::set_var("GLADIUS_TEST_SCRATCH_REJECT_BACKGROUND", "1");
@@ -1239,7 +1233,6 @@ pub async fn run() -> i32 {
         ),
     );
 
-    // ----------------------------------------------- cancel entry-window race
     // The dispatch/registry/cancel path only exists in a real server, so this
     // check drives one as a child process. The hooks park the call in the
     // entry window and skip the abort, so the liveness recheck under the
@@ -1313,7 +1306,6 @@ pub async fn run() -> i32 {
         Err(detail) => check("cancel-entry-window", false, &detail),
     }
 
-    // ------------------------------------------- restore is confirmed by the page
     // A CDP ACK is not proof: the release gate failed exactly here, with
     // `matchMedia('(prefers-reduced-motion: reduce)')` still true after the
     // call returned. The hook drops the media clear; the capture must notice
@@ -1365,7 +1357,6 @@ pub async fn run() -> i32 {
         ),
     );
 
-    // ------------------------------------------------- background rendering
     // A tab that is NOT the active page must still render, still screenshot
     // and still run its timers (the launch flags exist for exactly this).
     let back = crate::tools::call("navigate", &serde_json::json!({"url": url}), &b).await;

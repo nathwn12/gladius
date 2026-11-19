@@ -214,7 +214,6 @@ fn shutdown(c: Client) {
 
 #[test]
 fn hard_kill_reaps_owned_browser_tree_and_sweeps_stale_profile() {
-    // --- server A: launch the owned browser via one navigate ---
     let mut a = Client::spawn();
     let apid = a.child.id();
     a.result("initialize", json!({"protocolVersion": "2025-06-18"}));
@@ -250,7 +249,6 @@ fn hard_kill_reaps_owned_browser_tree_and_sweeps_stale_profile() {
         "owned browser running under server A (pid {apid}) before kill"
     );
 
-    // --- hard kill ONLY server A: TerminateProcess, no /T, no Drop ---
     // Then release EVERY handle to A (including the process handle
     // itself): the job object reaps the tree once the last handle closes.
     // Graceful profile cleanup never runs here, so A's profile dir survives
@@ -259,7 +257,6 @@ fn hard_kill_reaps_owned_browser_tree_and_sweeps_stale_profile() {
     let _ = a.child.wait();
     drop(a);
 
-    // --- the job object reaps the tree: A's browser pids die ---
     let mut deadline = 30;
     while deadline > 0 && kids.iter().any(|p| process_alive(*p)) {
         std::thread::sleep(Duration::from_millis(500));
@@ -377,7 +374,6 @@ fn kill_tree(pid: u32) {
 /// live browser holding its profile - and only the pid file can reap it.
 #[test]
 fn pid_file_reaps_a_jobless_orphan() {
-    // --- server A: a launch with NO job cover ---
     let mut a = Client::spawn_with_env(&[("GLADIUS_TEST_NO_JOB", "1")]);
     let apid = a.child.id();
     a.result("initialize", json!({"protocolVersion": "2025-06-18"}));
@@ -413,7 +409,6 @@ fn pid_file_reaps_a_jobless_orphan() {
         "the recorded engine pid is alive before the kill"
     );
 
-    // --- hard kill ONLY server A: no Drop, no job cover ---
     a.child.kill().expect("hard-kill server A");
     let _ = a.child.wait();
     drop(a);
@@ -427,7 +422,6 @@ fn pid_file_reaps_a_jobless_orphan() {
         "the orphan still holds its profile dir"
     );
 
-    // --- server B: its launch kills the provable orphan, then sweeps ---
     let mut b = Client::spawn();
     b.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     let navb = b.call("navigate", json!({"url": fixture_url()}));

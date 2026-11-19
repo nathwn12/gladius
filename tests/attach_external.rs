@@ -20,7 +20,6 @@ mod common;
 use common::pinned_chromium_exe;
 use serde_json::{json, Value};
 
-// ---------------------------------------------------------------- helpers
 
 struct Client {
     stdin: ChildStdin,

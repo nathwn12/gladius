@@ -1717,7 +1717,6 @@ fn visual_compare_changed_and_size_mismatch_shapes() {
     finish(c);
 }
 
-// --------------------------------------------------------------------- S3.3
 
 /// An externally started engine the TEST owns, so "the engine died" is a fact
 /// the test controls instead of a race it hopes to win. Same resolution as
@@ -1846,7 +1845,6 @@ fn transport_and_js_failures_are_typed() {
         "navigate on the attached engine: {nav}"
     );
 
-    // --- JS throw -----------------------------------------------------------
     let thrown = c.call(
         "evaluate",
         json!({"expression": "throw new Error('deliberate')"}),
@@ -1868,7 +1866,6 @@ fn transport_and_js_failures_are_typed() {
         "the prose is unchanged from 0.7.x: {thrown}"
     );
 
-    // --- undefined ----------------------------------------------------------
     let undefined = c.call("evaluate", json!({"expression": "undefined"}));
     assert!(is_error(&undefined), "undefined is an error: {undefined}");
     let sc = structured(&undefined);
@@ -1891,7 +1888,6 @@ fn transport_and_js_failures_are_typed() {
         "an explicit null is a value, not a failure: {explicit_null}"
     );
 
-    // --- transport death ----------------------------------------------------
     ext.child.kill().ok();
     let mut waited = ext.child.try_wait();
     for _ in 0..100 {

@@ -88,7 +88,6 @@ fn docs_scope_the_determinism_claim() {
     );
 }
 
-// --------------------------------------------------------------- S3.5 tools
 
 /// A minimal MCP client: `claims.rs` needs the LIVE `tools/list`, and that is
 /// answered without launching an engine, so no browser is involved here.
@@ -329,7 +328,6 @@ fn countable_claims_match_the_binary() {
     );
 }
 
-// --------------------------------------------------------------- S3.4 commit
 
 /// Run the shipped launcher's diagnostic and parse its JSON report.
 fn doctor_report() -> serde_json::Value {

@@ -38,7 +38,6 @@ mod common;
 use common::pinned_chromium_exe;
 use serde_json::{json, Value};
 
-// ---------------------------------------------------------------- helpers
 
 fn fixture(name: &str) -> String {
     let p = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -308,7 +307,6 @@ fn free_port() -> u16 {
     p
 }
 
-// ---------------------------------------------------------------- tests
 
 #[test]
 fn headless_owned_e2e_navigate_snapshot_screenshot() {

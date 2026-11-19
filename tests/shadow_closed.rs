@@ -153,7 +153,6 @@ fn closed_shadow_target_is_typed_not_not_found() {
     let nav = c.call("navigate", json!({"url": fixture_url()}));
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // --- 1. the selector path cannot reach it: typed, never `not_found` ---
     let by_selector = c.call("click", json!({"element": "#inner"}));
     assert!(
         by_selector.get("isError").is_some(),
@@ -190,7 +189,6 @@ fn closed_shadow_target_is_typed_not_not_found() {
         );
     }
 
-    // --- 1b. a selector that names the HOST ancestor is still shadow_closed ---
     // `#host` lives in the light DOM and is invisible from inside the closed
     // root, so no selector engine can match `#host #inner`: the whole selector
     // handed to the root is a guaranteed miss. The target still exists, so the
@@ -236,7 +234,6 @@ fn closed_shadow_target_is_typed_not_not_found() {
         );
     }
 
-    // --- 1c. the FULL selector inside the closed root is a match, not a miss ---
     // `#container #inner` and `#first + #inner` live entirely inside the closed
     // root, so the DOM domain resolves the whole selector there - a tail-only
     // probe cannot see them, and reporting `not_found` would be the same lie.
@@ -261,7 +258,6 @@ fn closed_shadow_target_is_typed_not_not_found() {
         assert_eq!(reason_of(&r), "unreachable", "{label}: {r}");
     }
 
-    // --- 1d. a `>` that crosses a WRAPPER names nothing: the ordinary miss ---
     // `#inner` is not a direct child of the root, so `#host > #inner` would not
     // match even in the flattened tree. Claiming `shadow_closed` here would be
     // a false positive: the selector genuinely matches nothing.
@@ -273,7 +269,6 @@ fn closed_shadow_target_is_typed_not_not_found() {
     );
     assert_eq!(reason_of(&not_child), "not_found", "{not_child}");
 
-    // --- 2. a genuine miss is still not_found (the probe is precise) ---
     let missing = c.call("click", json!({"element": "#definitely-not-here"}));
     assert_eq!(
         code_of(&missing),
@@ -293,7 +288,6 @@ fn closed_shadow_target_is_typed_not_not_found() {
     );
     assert_eq!(reason_of(&wrong_path), "not_found", "{wrong_path}");
 
-    // --- 3. the AX `@eN` ref is the supported path ---
     let snap = c.call("snapshot", json!({}));
     let snap_text = content_text(&snap);
     let reference = ref_for(&snap_text, "CLOSED_INNER_OK");

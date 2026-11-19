@@ -196,7 +196,6 @@ fn shot_meta(reply: &Value) -> Value {
     serde_json::from_str(text).unwrap_or_else(|_| panic!("screenshot meta is not json: {text}"))
 }
 
-// --------------------------------------------------------------------- S1.1
 
 /// SPEC.md S1.1: identity and tolerance are two questions with two booleans.
 ///
@@ -337,7 +336,6 @@ fn aa_suppression_is_opt_in() {
     shutdown(c);
 }
 
-// --------------------------------------------------------------------- S1.3
 
 /// SPEC.md S1.3: a mask is metered, not an invisible hole.
 ///
@@ -432,7 +430,6 @@ fn mask_coverage_is_reported_and_warns() {
     shutdown(c);
 }
 
-// --------------------------------------------------------------------- S1.4
 
 /// SPEC.md S1.4 / D3: a settle timeout is a field, not a stderr line.
 ///
@@ -564,7 +561,6 @@ fn settle_timeout_is_a_field() {
     shutdown(c);
 }
 
-// --------------------------------------------------------------------- S1.7
 
 /// SPEC.md S1.7: font readiness is a status, not a race.
 ///
@@ -678,7 +674,6 @@ fn fonts_report_pending_not_silent() {
     shutdown(c);
 }
 
-// --------------------------------------------------------------------- S1.8
 
 /// SPEC.md S1.8: the environment fingerprint covers the axes that differ.
 ///
@@ -765,7 +760,6 @@ fn environment_fingerprint_names_every_axis() {
     shutdown(c);
 }
 
-// --------------------------------------------------------------------- S2.4
 
 /// SPEC.md S2.4: baselines stop landing in the caller's repo, and the store
 /// stops growing without a bound.
@@ -779,7 +773,6 @@ fn environment_fingerprint_names_every_axis() {
 /// value through its documented override: 501 real captures is not a test.
 #[test]
 fn baselines_do_not_default_into_the_cwd() {
-    // --- (a) the default root ---
     let cwd = scratch("s24-cwd");
     let mut c = Client::spawn_full(&[], &["GLADIUS_VISUAL_DIR"], Some(&cwd));
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
@@ -822,7 +815,6 @@ fn baselines_do_not_default_into_the_cwd() {
     // while it is a live process's working directory.
     std::fs::remove_dir_all(&cwd).ok();
 
-    // --- (b) the cap refuses growth, typed ---
     let dir = scratch("s24-cap");
     let vdir = dir.join("visual");
     std::fs::create_dir_all(&vdir).expect("visual dir");
