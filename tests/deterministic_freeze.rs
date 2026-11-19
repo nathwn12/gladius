@@ -164,7 +164,6 @@ fn freeze_reaches_shadow_waapi_smil_and_media() {
     assert!(nav.get("isError").is_none(), "navigate: {nav}");
     let vp = c.call("viewport", json!({"width": 400, "height": 300}));
     assert!(vp.get("isError").is_none(), "viewport: {vp}");
-    // Let the fixture's script run (shadow root, WAAPI, video.play()).
     let ready = c.call(
         "evaluate",
         json!({"expression": "new Promise((r) => setTimeout(() => r(window.__freezeReady === true), 300))"}),
@@ -212,7 +211,6 @@ fn freeze_reaches_shadow_waapi_smil_and_media() {
         "the same-process iframe was walked: {freeze}"
     );
 
-    // Restoration: the walk is undone, so the page is left playing, not frozen.
     let resumed = c.call(
         "evaluate",
         json!({"expression": "(() => { const v = document.getElementById('vid'); const a = document.getAnimations().length; return {paused: v.paused, animations: a, style: document.getElementById('__gladius_deterministic') !== null}; })()"}),

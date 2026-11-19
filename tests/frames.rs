@@ -268,7 +268,6 @@ fn launch_on_frames() -> (Client, String) {
         json!({"url": format!("http://127.0.0.1:{port}/frames.html")}),
     );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
-    // Settle the subframe: its document must be complete before actions run.
     for _ in 0..100 {
         let listed = c.call("targets", json!({}));
         if content_text(&listed).contains("frames_child.html") {
@@ -290,7 +289,6 @@ fn launch_on_frames() -> (Client, String) {
 #[test]
 fn frame_click_lands_with_offset_chain() {
     let (mut c, fid) = launch_on_frames();
-    // Reset the in-frame recorder (a prior run must not leak).
     fev_ignored(
         &mut c,
         &fid,
@@ -318,7 +316,6 @@ fn frame_click_lands_with_offset_chain() {
         Some(&json!("FRAME_CLICKED_OK")),
         "frame click landed inside the iframe: {landed}"
     );
-    // Trusted pointer order: pointerdown -> mousedown -> pointerup -> mouseup -> click.
     let order = fev(
         &mut c,
         &fid,
@@ -340,7 +337,6 @@ fn frame_click_lands_with_offset_chain() {
         }
     }
     assert!(ok_order, "trusted pointer order in frame, got: {ot}");
-    // Exactly one of each: five comma-joined events.
     assert_eq!(ot.split(',').count(), 5, "one of each event, got: {ot}");
     let trusted = fev(
         &mut c,
@@ -352,7 +348,6 @@ fn frame_click_lands_with_offset_chain() {
         Some(&json!("[true,true,true,true,true]")),
         "all five frame events isTrusted:true: {trusted}"
     );
-    // The main page is untouched (no silent main-frame click).
     let top = mev(&mut c, "document.getElementById('top-note').textContent");
     assert_eq!(
         top.get("value"),
@@ -478,7 +473,6 @@ fn frame_upload_sets_files() {
 #[test]
 fn frame_ref_is_typed_invalid_args() {
     let (mut c, fid) = launch_on_frames();
-    // A main-frame ref (the combo input's live value names it on the top page).
     let snap = content_text(&c.call("snapshot", json!({})));
     let rinput = snap
         .lines()
@@ -599,7 +593,6 @@ fn cross_site_frame_click_lands_not_main() {
         json!({"url": format!("http://127.0.0.1:{port}/frames.html")}),
     );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
-    // Genuinely cross-site child: different hostname (localhost vs 127.0.0.1).
     let inj = c.call(
         "evaluate",
         json!({"expression": format!(
@@ -629,9 +622,6 @@ fn cross_site_frame_click_lands_not_main() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    // Probe result, asserted: this engine creates no separate iframe target
-    // for the cross-site child (single page target), i.e. no OOPIF session
-    // exists to route into - the page-session path below is the honest one.
     let listed = c.call("targets", json!({}));
     let obj = content_obj(&listed);
     let targets = obj
@@ -650,7 +640,6 @@ fn cross_site_frame_click_lands_not_main() {
         !oop,
         "probe: engine created a separate iframe target for the cross-site child: {obj}"
     );
-    // The cross-site click lands inside the child frame, never the main page.
     let r = c.call("click", json!({"element": "#f-btn", "frame": xid}));
     assert!(!is_error(&r), "cross-site frame click ok: {r}");
     let res = fev(
@@ -761,9 +750,6 @@ fn oopif_mapped_session_click_lands() {
 #[test]
 fn frame_parent_overlay_is_occluded() {
     let (mut c, fid) = launch_on_frames();
-    // Cover the whole viewport from the PARENT side: the frame-local
-    // preflight still passes (the inner button is unobstructed in-frame),
-    // but the parent-side owner hit-test must refuse.
     let cov = mev(
         &mut c,
         "(( ) => { const d = document.createElement('div'); d.id='parent-cover'; d.style.cssText='position:fixed;left:0;top:0;width:100vw;height:100vh;background:rgba(0,0,0,0.5);z-index:999999;'; document.body.appendChild(d); return 'covered'; })()",
@@ -796,8 +782,6 @@ fn frame_parent_overlay_is_occluded() {
         Some(&json!("FRAME_NOT_CLICKED")),
         "covered click landed nowhere: {landed}"
     );
-    // Hover takes the same parent-side owner check (it previously dispatched
-    // with no main-frame hit-test at all).
     let h = c.call("hover", json!({"element": "#f-hover", "frame": fid}));
     assert!(is_error(&h), "covered frame hover isError: {h}");
     let hsc = structured(&h);
@@ -811,8 +795,6 @@ fn frame_parent_overlay_is_occluded() {
         Some(&json!("occluded")),
         "hover reason: {h}"
     );
-    // Removing the overlay restores actionability (the verdict was the
-    // overlay, not a broken mapping).
     let unc = mev(
         &mut c,
         "(( ) => { const d = document.getElementById('parent-cover'); if (d) d.remove(); return 'uncovered'; })()",
@@ -895,7 +877,6 @@ fn stamp_count_frame(c: &mut Client, frame: &str) -> i64 {
 #[test]
 fn nested_mid_overlay_click_hover_occluded_then_lands() {
     let (mut c, mid, leaf) = launch_on_nested();
-    // Overlay inside the MID document, covering the leaf iframe.
     let cov = fev(
         &mut c,
         &mid,
@@ -906,7 +887,6 @@ fn nested_mid_overlay_click_hover_occluded_then_lands() {
         Some(&json!("covered")),
         "mid overlay injected: {cov}"
     );
-    // Covered nested click: typed occluded at the mid level, no landing.
     let r = c.call("click", json!({"element": "#n-btn", "frame": leaf}));
     assert!(is_error(&r), "covered nested click isError: {r}");
     let sc = structured(&r);
@@ -930,7 +910,6 @@ fn nested_mid_overlay_click_hover_occluded_then_lands() {
         Some(&json!("NEST_NOT_CLICKED")),
         "covered nested click landed nowhere: {landed}"
     );
-    // Covered nested hover: same per-level verdict.
     let h = c.call("hover", json!({"element": "#n-hover", "frame": leaf}));
     assert!(is_error(&h), "covered nested hover isError: {h}");
     let hsc = structured(&h);
@@ -944,7 +923,6 @@ fn nested_mid_overlay_click_hover_occluded_then_lands() {
         Some(&json!("occluded")),
         "hover reason: {h}"
     );
-    // Remove the overlay: the nested click lands with trusted events.
     let unc = fev(
         &mut c,
         &mid,
@@ -983,7 +961,6 @@ fn nested_mid_overlay_click_hover_occluded_then_lands() {
         Some(&json!("NEST_TOP")),
         "top page untouched: {top}"
     );
-    // Post-success: no owner stamps remain in ANY document.
     assert_eq!(stamp_count_main(&mut c), 0, "no stamps in main doc");
     assert_eq!(stamp_count_frame(&mut c, &mid), 0, "no stamps in mid doc");
     assert_eq!(stamp_count_frame(&mut c, &leaf), 0, "no stamps in leaf doc");
@@ -1024,7 +1001,6 @@ fn reset_combo(c: &mut Client) {
 #[test]
 fn combo_ctrl_a_selects_without_input() {
     let (mut c, _fid) = launch_on_frames();
-    // Focus the input with a trusted main-frame click first.
     let ok = c.call("click", json!({"element": "#combo-input"}));
     assert!(!is_error(&ok), "focus click ok: {ok}");
     reset_combo(&mut c);
@@ -1041,7 +1017,6 @@ fn combo_ctrl_a_selects_without_input() {
         0,
         "Ctrl+A inserts no text (rawKeyDown, no input event)"
     );
-    // Select-all default action: the whole seed is selected, value untouched.
     let sel = mev(&mut c, "[document.getElementById('combo-input').selectionStart, document.getElementById('combo-input').selectionEnd, document.getElementById('combo-input').value.length, document.getElementById('combo-input').value]");
     assert_eq!(
         sel.get("value"),
@@ -1075,7 +1050,6 @@ fn combo_modifiers_case_insensitive_and_alt_meta() {
     let ok = c.call("click", json!({"element": "#combo-input"}));
     assert!(!is_error(&ok), "focus click ok: {ok}");
     reset_combo(&mut c);
-    // Case-insensitive modifier spelling still holds Ctrl with no input.
     let r = c.call("key", json!({"key": "cTrL+a"}));
     assert!(!is_error(&r), "cTrL+a ok: {r}");
     let last = last_combo(&mut c);
@@ -1085,7 +1059,6 @@ fn combo_modifiers_case_insensitive_and_alt_meta() {
         "ctrlKey held (mixed case): {last}"
     );
     assert_eq!(combo_count(&mut c), 0, "mixed-case Ctrl+A inserts no text");
-    // Alt base is rawKeyDown with altKey and no text.
     let r = c.call("key", json!({"key": "Alt+a"}));
     assert!(!is_error(&r), "Alt+a ok: {r}");
     let last = last_combo(&mut c);
@@ -1095,7 +1068,6 @@ fn combo_modifiers_case_insensitive_and_alt_meta() {
         "altKey held: {last}"
     );
     assert_eq!(combo_count(&mut c), 0, "Alt+a inserts no text");
-    // Meta modifier bit.
     let r = c.call("key", json!({"key": "Meta+m"}));
     assert!(!is_error(&r), "Meta+m ok: {r}");
     let last = last_combo(&mut c);
@@ -1126,7 +1098,6 @@ fn combo_unknown_is_typed() {
             "key {bad} reason: {r}"
         );
     }
-    // Single-key behavior is unchanged (unknown names still typed, known keys work).
     let r = c.call("key", json!({"key": "BogusKey"}));
     assert!(is_error(&r), "single unknown isError: {r}");
     let ok = c.call("click", json!({"element": "#combo-input"}));

@@ -136,7 +136,6 @@ test("assembled ZIP provisions through the actual launcher without a browser dow
     manifest.runtime.archive = { name: "runtime.zip", size: readFileSync(zip).length, sha256: hash(readFileSync(zip)) };
     manifest.runtime.server.size = readFileSync(join(stage, "gladius.exe")).length;
     manifest.runtime.server.sha256 = hash(readFileSync(join(stage, "gladius.exe")));
-    // Runtime provisioning happens before this intentional browser refusal.
     manifest.browser.asset.sha256 = "unpublished";
     writeFileSync(join(pkg, "engine-manifest.json"), JSON.stringify(manifest));
     const cache = join(dir, "engine");

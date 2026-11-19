@@ -137,8 +137,6 @@ fn launch_on_ax() -> Client {
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     let nav = c.call("navigate", json!({"url": fixture_url("ax.html")}));
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
-    // The child iframe commits after the main load; wait for the element,
-    // then for its frameId to appear in the frame tree (commit race).
     let w = c.call("wait_for", json!({"selector": "#ax-frame", "ms": 10000}));
     assert!(!is_error(&w), "frame element settled: {w}");
     for _ in 0..100 {
@@ -200,10 +198,6 @@ fn line_for_ref(snap: &str, rid: &str) -> String {
 
 #[test]
 fn ax_legacy_name_parity_unlabeled_inputs() {
-    // P2 parity: an unlabeled control's fallback name must match legacy
-    // naming exactly - full raw value (not the 60-char display cut),
-    // whitespace-normalized, capped at 80, legacy order, sensitive values
-    // never used as names.
     let mut c = launch_on_ax();
     let long75 = format!("LONG_{}", "x".repeat(70));
     assert_eq!(long75.len(), 75);
@@ -222,7 +216,6 @@ fn ax_legacy_name_parity_unlabeled_inputs() {
     let def = content_text(&c.call("snapshot", json!({})));
     let leg = content_text(&c.call("snapshot", json!({"mode": "legacy"})));
 
-    // 75-char value: fallback name is the FULL value, not the 60-char cut.
     let (dlong, llong) = (
         line_name(&probe_line(&def, "LONG_")),
         line_name(&probe_line(&leg, "LONG_")),
@@ -233,7 +226,6 @@ fn ax_legacy_name_parity_unlabeled_inputs() {
         "default matches legacy on 75-char value:\n{def}"
     );
 
-    // Whitespace value: normalized exactly like legacy.
     let (dws, lws) = (
         line_name(&probe_line(&def, "alpha   beta")),
         line_name(&probe_line(&leg, "alpha   beta")),
@@ -244,7 +236,6 @@ fn ax_legacy_name_parity_unlabeled_inputs() {
         "default normalizes whitespace like legacy:\n{def}"
     );
 
-    // Placeholder / id / name fallbacks.
     for (needle, want) in [
         ("Enter name here", "Enter name here"),
         ("par-idonly", "par-idonly"),
@@ -258,7 +249,6 @@ fn ax_legacy_name_parity_unlabeled_inputs() {
         assert_eq!(d, l, "default matches legacy for {needle}:\n{def}");
     }
 
-    // Sensitive value: masked display, id as name, secret nowhere.
     let (ds, ls) = (
         line_name(&probe_line(&def, "par-sens")),
         line_name(&probe_line(&leg, "par-sens")),
@@ -279,10 +269,6 @@ fn ax_legacy_name_parity_unlabeled_inputs() {
 
 #[test]
 fn ax_legacy_name_parity_whitespace_prefix() {
-    // Truncation-before-normalization probe: 79 spaces + TOKEN in id,
-    // name, placeholder, and selected-option text. Legacy normalizes the
-    // FULL candidate then caps at 80, so the trailing token survives on
-    // both paths; all-whitespace stays empty; passwords never name.
     let mut c = launch_on_ax();
     let pad = " ".repeat(79);
     c.call(
@@ -298,7 +284,6 @@ fn ax_legacy_name_parity_whitespace_prefix() {
         )}),
     );
     let def = content_text(&c.call("snapshot", json!({})));
-    // Refs are table-local: read them from this snapshot's own node lines.
     let ref_before = |snap: &str, needle: &str| -> String {
         let lines: Vec<&str> = snap.lines().filter(|l| l.starts_with("- ")).collect();
         let idx = lines
@@ -343,7 +328,6 @@ fn ax_legacy_name_parity_whitespace_prefix() {
         .trim_start_matches('@')
         .to_string();
 
-    // Trailing token survives normalization on both paths.
     for (d, l, want) in [
         (d_id, l_id, "ID_END"),
         (d_nm, l_nm, "NAME_END"),
@@ -361,8 +345,6 @@ fn ax_legacy_name_parity_whitespace_prefix() {
         );
     }
 
-    // All-whitespace value: empty name (whitespace-only is truthy in the
-    // legacy chain, so it blocks the id fallback and normalizes to "").
     let (dw, lw) = (
         line_name(&line_for_ref(&def, &d_we)),
         line_name(&line_for_ref(&leg, &l_we)),
@@ -370,7 +352,6 @@ fn ax_legacy_name_parity_whitespace_prefix() {
     assert_eq!(lw, "", "legacy all-whitespace name is empty");
     assert_eq!(dw, lw, "default all-whitespace name is empty:\n{def}");
 
-    // Password with a leading-space secret: id names it, secret nowhere.
     let (dp, lp) = (
         line_name(&line_for_ref(&def, &d_pw)),
         line_name(&line_for_ref(&leg, &l_pw)),
@@ -393,7 +374,6 @@ fn ax_real_roles_names_states() {
     assert!(t.contains("[@e"), "AX refs present, got:\n{t}");
     assert!(t.contains("[snapshot:"), "node-count footer, got tail");
     assert!(t.contains("AX_FIXTURE_MARKER_ax-67890"), "marker kept");
-    // Real AX roles/names (not tag-derived guesses).
     assert!(
         t.contains("button") && t.contains("AX Real Button"),
         "button role+name:\n{t}"
@@ -414,7 +394,6 @@ fn ax_real_roles_names_states() {
         t.contains("combobox") && t.contains("AX Choice"),
         "select role+name:\n{t}"
     );
-    // Disabled state surfaces on the line.
     let dis_line = t
         .lines()
         .find(|l| l.contains("AX_DISABLED_BTN"))
@@ -434,22 +413,18 @@ fn ax_hidden_excluded_password_redacted_shadow() {
     let snap = c.call("snapshot", json!({"mode": "ax"}));
     assert!(!is_error(&snap), "ax snapshot ok: {snap}");
     let t = content_text(&snap);
-    // Hidden subtree is ignored by the AX tree: excluded from lines.
     assert!(
         !t.contains("AX_HIDDEN_SHOULD_NOT_APPEAR"),
         "hidden node excluded, got:\n{t}"
     );
-    // Password value never leaks: literal mask, raw secret absent.
     assert!(t.contains("••••"), "password mask present, got:\n{t}");
     assert!(!t.contains("supersecret123"), "raw password absent");
-    // Open shadow root pierced: shadow button appears with a usable ref.
     assert!(
         t.contains("SHADOW_BTN_LABEL_inner-abc"),
         "shadow button present, got:\n{t}"
     );
     let r = find_ref(&t, "SHADOW_BTN_LABEL_inner-abc");
     assert!(r.starts_with("@e"), "shadow ref shape: {r}");
-    // Structured block carries the same node with role/name/value/tag.
     let blocks = snap
         .get("content")
         .and_then(|cc| cc.as_array())
@@ -517,9 +492,6 @@ fn ax_frame_snapshot_works() {
 
 #[test]
 fn ax_default_is_ax_legacy_differs() {
-    // G3b: the DEFAULT snapshot is the real AX tree. `mode:"ax"` is
-    // identical; explicit `mode:"legacy"` keeps the old DOM heuristic
-    // (no shadow piercing, hidden nodes stamped); `mode:"text"` is text-only.
     let mut c = launch_on_ax();
     let def = content_text(&c.call("snapshot", json!({})));
     assert!(
@@ -558,12 +530,8 @@ fn ax_default_is_ax_legacy_differs() {
 
 #[test]
 fn default_ax_full_semantics() {
-    // New default-AX proof on one ARIA fixture: roles/names from the AX
-    // tree, hidden subtree absent, open shadow root present with a usable
-    // ref, password masked, same-process iframe scoped via frame=.
     let mut c = launch_on_ax();
     let def = content_text(&c.call("snapshot", json!({})));
-    // ARIA roles/names (not tag-derived guesses).
     assert!(
         def.contains("button") && def.contains("AX Real Button"),
         "button role+name:\n{def}"
@@ -584,27 +552,23 @@ fn default_ax_full_semantics() {
         def.contains("combobox") && def.contains("AX Choice"),
         "combobox role+name:\n{def}"
     );
-    // Disabled state still surfaces on the line.
     let dis = def
         .lines()
         .find(|l| l.contains("AX_DISABLED_BTN"))
         .unwrap_or_else(|| panic!("disabled button line missing:\n{def}"))
         .to_string();
     assert!(dis.contains("[disabled]"), "disabled state: {dis}");
-    // Hidden subtree: no node line (legacy is the only path that stamps it).
     assert!(
         !def.lines()
             .any(|l| l.starts_with("- ") && l.contains("AX_HIDDEN_SHOULD_NOT_APPEAR")),
         "hidden node absent from default node lines:\n{def}"
     );
-    // Shadow button present with a usable ref - the marker legacy cannot produce.
     assert!(
         def.contains("SHADOW_BTN_LABEL_inner-abc"),
         "shadow present:\n{def}"
     );
     let r = find_ref(&def, "SHADOW_BTN_LABEL_inner-abc");
     assert!(r.starts_with("@e"), "shadow ref shape: {r}");
-    // Password masked, raw secret absent.
     assert!(def.contains("••••"), "password mask:\n{def}");
     assert!(!def.contains("supersecret123"), "raw password absent");
     assert!(def.chars().count() <= 8000, "bounded to 8000 chars");

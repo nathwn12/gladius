@@ -161,8 +161,6 @@ fn a_wedged_call_returns_typed_timeout_and_frees_the_lock() {
     let nav = c.call("navigate", json!({"url": fixture("wedge.html")}));
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // Block the renderer for 6 s but ask for a 2 s budget: the call must come
-    // back typed at ~2 s, not at the 30 s CDP timeout.
     c.call_id(
         json!(10),
         "evaluate",
@@ -205,8 +203,6 @@ fn a_wedged_call_returns_typed_timeout_and_frees_the_lock() {
         "the answer names the budget: {timed_out}"
     );
 
-    // The execution lock was released: a lock-taking call runs (and the
-    // renderer is free once the 6 s loop ends).
     let again = c.call("evaluate", json!({"expression": "1 + 1"}));
     assert!(
         again.get("isError").is_none(),
@@ -217,7 +213,6 @@ fn a_wedged_call_returns_typed_timeout_and_frees_the_lock() {
         Some(&json!(2)),
         "the page answers again: {again}"
     );
-    // A read-only call works too.
     let snap = c.call("snapshot", json!({}));
     assert!(
         snap.get("isError").is_none(),
@@ -262,7 +257,6 @@ fn start_loopback() -> u16 {
                 let text = String::from_utf8_lossy(&req);
                 let path = text.split_whitespace().nth(1).unwrap_or("/").to_string();
                 if path.starts_with("/never") {
-                    // Accept and never answer: the image request stays pending.
                     std::thread::sleep(Duration::from_secs(120));
                     return;
                 }
@@ -303,8 +297,6 @@ fn a_wedged_critical_call_returns_typed_timeout_and_frees_the_lock() {
     );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // Two images that never finish: `document.images` holds both, neither is
-    // `complete`, so the settle wait runs to its 5 s cap.
     let inject = format!(
         "(() => {{ for (let i = 0; i < 2; i++) {{ const img = \
          document.createElement('img'); img.src = 'http://127.0.0.1:{port}/never' + i + \
@@ -317,8 +309,6 @@ fn a_wedged_critical_call_returns_typed_timeout_and_frees_the_lock() {
         "both pending images are in the document: {injected}"
     );
 
-    // Deterministic capture (exec-locked AND section-gated) with a 2 s budget:
-    // the budget lands inside the settle wait, not inside the mutation window.
     c.call_id(
         json!(10),
         "screenshot",
@@ -361,10 +351,6 @@ fn a_wedged_critical_call_returns_typed_timeout_and_frees_the_lock() {
         "the answer names the budget: {timed_out}"
     );
 
-    // (1) The engine is still usable: a read-only snapshot answers promptly.
-    // (`snapshot` is lock-free by design, so on its own it does not observe the
-    // defect - it is the positive control that the wedged capture left the
-    // browser readable.)
     let t1 = Instant::now();
     c.call_id(json!(11), "snapshot", json!({}));
     let snap = c.wait_id(
@@ -382,9 +368,6 @@ fn a_wedged_critical_call_returns_typed_timeout_and_frees_the_lock() {
         "snapshot after the budget timeout ({snap_latency:?})"
     );
 
-    // (2) The EXEC LOCK is free: this call takes it. While the wedged capture
-    // still held it (until the 5 s settle cap plus the shot and the restore)
-    // this waited seconds behind the wedged call.
     let t2 = Instant::now();
     c.call_id(json!(12), "evaluate", json!({"expression": "1 + 1"}));
     let ev = c.wait_id(
@@ -407,10 +390,6 @@ fn a_wedged_critical_call_returns_typed_timeout_and_frees_the_lock() {
         "an exec-locked call ran immediately after the budget timeout ({ev_latency:?})"
     );
 
-    // (3) The SEMAPHORE PERMIT is free: four concurrent calls are all admitted.
-    // A permit still held by the wedged call leaves only three slots, and the
-    // fourth is refused `-32603 Server busy`. The four answers interleave, so
-    // they are collected by id instead of one `wait_id` at a time.
     for id in 20..24 {
         c.call_id(
             json!(id),
@@ -473,7 +452,6 @@ fn cancelled_call_answers_promptly() {
     std::fs::create_dir_all(&vdir).expect("visual dir");
     let vdir_s = vdir.to_string_lossy().to_string();
     let mut c = Client::spawn(&[
-        // Widen the mutation window so the cancel lands inside it.
         ("GLADIUS_TEST_CRITICAL_DELAY_MS", "1500"),
         ("GLADIUS_VISUAL_DIR", &vdir_s),
     ]);
@@ -483,7 +461,6 @@ fn cancelled_call_answers_promptly() {
     let vp = c.call("viewport", json!({"width": 900, "height": 700}));
     assert!(vp.get("isError").is_none(), "viewport ok: {vp}");
 
-    // Start a deterministic capture, then cancel it inside its window.
     c.call_id(json!(10), "screenshot", json!({"deterministic": true}));
     std::thread::sleep(Duration::from_millis(400));
     c.send(
@@ -509,9 +486,6 @@ fn cancelled_call_answers_promptly() {
         "the reason is client_cancelled: {answer}"
     );
 
-    // The restore still ran: the caller's override is back and no freeze
-    // stylesheet is left behind (this read needs the exec lock, so it also
-    // proves the lock was released only after the restore).
     let state = c.call("evaluate", json!({"expression": STATE}));
     assert!(
         state.get("isError").is_none(),

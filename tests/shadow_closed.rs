@@ -130,8 +130,6 @@ fn reason_of(v: &Value) -> String {
 fn ref_for(snapshot_text: &str, needle: &str) -> Option<String> {
     for line in snapshot_text.lines() {
         if line.contains(needle) {
-            // The rendered line shape is `@eN ... name ...`; take the first
-            // `@e` token on it.
             if let Some(i) = line.find('@') {
                 let rest = &line[i + 1..];
                 let end = rest
@@ -174,8 +172,6 @@ fn closed_shadow_target_is_typed_not_not_found() {
         "the prose names the closed root and the @eN lever: {prose}"
     );
 
-    // The same for `type`, `hover` and `layout`, so no action tool lies about
-    // a closed-root target.
     for (tool, args) in [
         ("type", json!({"element": "#inner", "text": "x"})),
         ("hover", json!({"element": "#inner"})),
@@ -189,15 +185,6 @@ fn closed_shadow_target_is_typed_not_not_found() {
         );
     }
 
-    // `#host` lives in the light DOM and is invisible from inside the closed
-    // root, so no selector engine can match `#host #inner`: the whole selector
-    // handed to the root is a guaranteed miss. The target still exists, so the
-    // answer is `shadow_closed`, never `not_found`.
-    //
-    // `#host > #direct` is the same boundary with a `>`: `#direct` IS a direct
-    // child of the root, so it would match in the flattened tree.
-    // `#\68 ost #inner` is `#host #inner` written with a CSS hex escape: the
-    // space terminates the escape and is not a descendant combinator.
     for (tool, args, label) in [
         (
             "click",
@@ -234,9 +221,6 @@ fn closed_shadow_target_is_typed_not_not_found() {
         );
     }
 
-    // `#container #inner` and `#first + #inner` live entirely inside the closed
-    // root, so the DOM domain resolves the whole selector there - a tail-only
-    // probe cannot see them, and reporting `not_found` would be the same lie.
     for (tool, args, label) in [
         (
             "click",
@@ -258,9 +242,6 @@ fn closed_shadow_target_is_typed_not_not_found() {
         assert_eq!(reason_of(&r), "unreachable", "{label}: {r}");
     }
 
-    // `#inner` is not a direct child of the root, so `#host > #inner` would not
-    // match even in the flattened tree. Claiming `shadow_closed` here would be
-    // a false positive: the selector genuinely matches nothing.
     let not_child = c.call("click", json!({"element": "#host > #inner"}));
     assert_eq!(
         code_of(&not_child),
@@ -277,9 +258,6 @@ fn closed_shadow_target_is_typed_not_not_found() {
     );
     assert_eq!(reason_of(&missing), "not_found", "{missing}");
 
-    // The element exists inside the closed root, but the selector's leading
-    // part matches no ancestor of the host: this path crosses nothing, so the
-    // honest answer stays the ordinary miss (no false `shadow_closed`).
     let wrong_path = c.call("click", json!({"element": "#no-such-host #inner"}));
     assert_eq!(
         code_of(&wrong_path),
@@ -298,9 +276,6 @@ fn closed_shadow_target_is_typed_not_not_found() {
     );
     let reference = reference.expect("ref");
     let by_ref = c.call("click", json!({"element": format!("@{reference}")}));
-    // The engine either resolves it (the documented supported path) or proves
-    // it unreachable; the test accepts exactly those two answers and records
-    // which one this engine gives.
     if by_ref.get("isError").is_none() {
         println!("closed-shadow @eN path: CLICKS (ref @{reference})");
         let clicks = c.call("evaluate", json!({"expression": "window.__closedClicks"}));

@@ -323,9 +323,6 @@ fn snapshot_redacts_password_and_autocomplete_values() {
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     let url = format!("http://127.0.0.1:{port}/");
     let mut nav = c.call("navigate", json!({"url": url}));
-    // CDP can abort the first navigation while the browser attaches
-    // (net::ERR_ABORTED); this test's subject is redaction, not navigation,
-    // so one retry is allowed — any other error stays fatal and verbatim.
     if is_error(&nav) && nav.to_string().contains("net::ERR_ABORTED") {
         nav = c.call("navigate", json!({"url": url}));
         assert!(
@@ -369,9 +366,6 @@ fn snapshot_redacts_password_and_autocomplete_values() {
         "normal value kept in structured block:\n{second}"
     );
 
-    // Node-level: every sensitive input reports exactly the mask (never the
-    // raw value, never as the name), the placeholder input falls back to
-    // its placeholder as the name, and the normal input keeps its value.
     let obj: Value = serde_json::from_str(second).expect("second block parses");
     let nodes = obj
         .get("nodes")
@@ -426,7 +420,6 @@ fn dead_session_recovers_on_fresh_page() {
     let snap0 = c.call("snapshot", json!({}));
     assert!(!is_error(&snap0), "baseline snapshot ok: {snap0}");
 
-    // Close the ACTIVE target out from under the cached session.
     let listed: Value =
         serde_json::from_str(&content_text(&c.call("targets", json!({})))).expect("targets json");
     let active_id = listed
@@ -452,12 +445,8 @@ fn dead_session_recovers_on_fresh_page() {
         .and_then(|o| o.get("result")?.get("success")?.as_bool())
         .unwrap_or(false);
     assert!(ok_close, "engine closed the target: {closed}");
-    // Let the detach land so the test exercises recovery, not a still-live page.
     std::thread::sleep(Duration::from_secs(1));
 
-    // First navigate: the corpse may fail it with the typed stale-session
-    // error (single send, never a silent resend). A permanent failure is
-    // the only wrong answer.
     let nav1 = c.call("navigate", json!({"url": url}));
     if is_error(&nav1) {
         let sc = structured(&nav1);
@@ -477,8 +466,6 @@ fn dead_session_recovers_on_fresh_page() {
             "stale-session prose owns the ambiguity: {nav1}"
         );
     }
-    // The second navigate and the following snapshot MUST succeed on a
-    // fresh page: recovery, not a permanent failure.
     let nav2 = c.call("navigate", json!({"url": url}));
     assert!(
         !is_error(&nav2),
@@ -497,16 +484,10 @@ fn dead_session_recovers_on_fresh_page() {
 
 #[test]
 fn wait_for_selector_fails_fast_on_dead_session() {
-    // Deterministic dead session via the scripted engine (see FakeEngine):
-    // the first session-scoped evaluate fails with the exact session-gone
-    // CDP error, every later one answers boolean true.
     let fake = FakeEngine::spawn();
     let mut c = Client::spawn_with_env(&[("GLADIUS_CDP_URL", &fake.url)]);
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
 
-    // Absent selector, long budget: a live page would poll the full 10s.
-    // On the corpse the wait must stop at once with typed stale_session,
-    // after exactly one session-scoped send (no resend, no polling).
     let t0 = Instant::now();
     let w = c.call(
         "wait_for",
@@ -535,7 +516,6 @@ fn wait_for_selector_fails_fast_on_dead_session() {
         "exactly one session-scoped send, never a resend or a poll loop"
     );
 
-    // Recovery: the next wait re-attaches and resolves on the fresh session.
     let w2 = c.call("wait_for", json!({"selector": "#nope", "ms": 2000}));
     assert!(!is_error(&w2), "next wait recovers: {w2}");
     assert!(fake.evals() >= 2, "recovery re-attached and evaluated");
@@ -553,7 +533,6 @@ fn key_rejects_unknown_name() {
     let nav = c.call("navigate", json!({"url": url}));
     assert!(!is_error(&nav), "navigate ok: {nav}");
 
-    // Every currently recognized name keeps working.
     let mut names: Vec<String> = vec![
         "enter",
         "tab",
@@ -595,7 +574,6 @@ fn key_rejects_unknown_name() {
         assert!(!is_error(&r), "recognized key {n:?} dispatches: {r}");
     }
 
-    // One unknown multi-char name fails loud, naming the key.
     let bad = c.call("key", json!({"key": "NoSuchKey"}));
     assert!(is_error(&bad), "unknown key must fail, not no-op: {bad}");
     let sc = structured(&bad);
@@ -639,7 +617,6 @@ fn dialog_note_truth_under_dismiss_policy() {
     let nav = c.call("navigate", json!({"url": url}));
     assert!(!is_error(&nav), "navigate ok: {nav}");
 
-    // Dismiss policy: both the click path and the evaluate path report dismissed.
     let set = c.call("dialog", json!({"action": "policy", "accept": false}));
     assert!(!is_error(&set), "dismiss policy ok: {set}");
     let cf = c.call("click", json!({"element": "#confirm2"}));
@@ -668,7 +645,6 @@ fn dialog_note_truth_under_dismiss_policy() {
         "evaluate dismiss note truthful: {enote}"
     );
 
-    // Accept policy: both paths report accepted.
     let back = c.call("dialog", json!({"action": "policy", "accept": true}));
     assert!(!is_error(&back), "accept policy ok: {back}");
     let cf2 = c.call("click", json!({"element": "#confirm2"}));
@@ -711,7 +687,6 @@ fn wait_for_selector_requires_visibility() {
     let nav = c.call("navigate", json!({"url": url}));
     assert!(!is_error(&nav), "navigate ok: {nav}");
 
-    // Present-but-hidden never satisfies the wait: the typed timeout.
     let w = c.call("wait_for", json!({"selector": "#gone", "ms": 600}));
     assert!(is_error(&w), "hidden node must time out, not resolve: {w}");
     let sc = structured(&w);
@@ -726,7 +701,6 @@ fn wait_for_selector_requires_visibility() {
         "hidden wait reason: {w}"
     );
 
-    // A visible node resolves immediately.
     let v = c.call("wait_for", json!({"selector": "#here", "ms": 2000}));
     assert!(!is_error(&v), "visible node resolves: {v}");
 

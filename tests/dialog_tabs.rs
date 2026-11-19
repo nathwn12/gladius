@@ -34,8 +34,6 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
-        // resolves from its versioned cache with no env override.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -160,7 +158,6 @@ fn dialog_click_waits_for_late_button() {
         Duration::from_secs(60),
     );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
-    // Late button: appears after 3s, fires an alert naming itself.
     let inj = c.call(
         "evaluate",
         json!({"expression": "setTimeout(() => { const b = document.createElement('button'); b.id='late-alert'; b.textContent='LATE'; b.onclick=()=>alert('DLG_PROBE_late-xyz'); document.body.appendChild(b); }, 3000); 'injected'"}),
@@ -225,7 +222,6 @@ fn dialog_alert_reports_real_dialog_and_never_hangs() {
         t.contains("dialog") && t.contains("DLG_PROBE_alert-xyz"),
         "real dialog report with the probe message, got: {t}"
     );
-    // The page kept running: the click's own handler ran.
     let res = content_text(&c.call(
         "evaluate",
         json!({"expression": "document.getElementById('result').textContent"}),
@@ -297,8 +293,6 @@ fn new_tab_waits_for_slow_commit() {
                 .nth(1)
                 .unwrap_or("/")
                 .to_string();
-            // The target page answers SLOWLY (the uncommitted-blank phase);
-            // anything else (favicon) answers at once.
             if path.starts_with("/slow") {
                 std::thread::sleep(Duration::from_secs(4));
             }
@@ -382,7 +376,6 @@ fn new_tab_settles_to_committed_url() {
         href.contains("tab-target.html"),
         "fresh tab observes committed URL (not blank), got: {href}"
     );
-    // wait_for observes the fresh tab too.
     let w = c.call(
         "wait_for",
         json!({"text": "TAB_TARGET_MARKER_abc-789", "ms": 10000}),

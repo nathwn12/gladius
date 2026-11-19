@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// No compiler, packer or test runner here. Publish only verified local bytes.
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -96,7 +95,6 @@ try {
     if (!ref) api("git/refs", { ref: "refs/tags/gladius", sha: env.COMMIT });
     const notes = bytes(path.join(dir, "release-notes.md")).toString();
     if (!release) release = api("releases", { tag_name: "gladius", target_commitish: env.COMMIT, name: `gladius ${env.VERSION}`, body: notes, draft: false, prerelease: false });
-    // Immutable npm runtime assets are additive. Never clobber or remove them.
     for (const a of immutable) {
       if (!release.assets.some((asset) => asset.name === a.name)) gh(["release", "upload", "gladius", path.join(dir, a.name), "--repo", repo]);
     }
@@ -118,7 +116,6 @@ try {
     });
     if (published) await verify();
     else await publishAndVerify({
-      // OIDC uses the existing release.yml publisher identity. Never repack.
       publish: () => {
         const command = `npm publish "${npmArtifact.name}" --ignore-scripts`;
         const result = spawnSync(command, { shell: true, cwd: path.resolve(dir), stdio: "inherit", windowsHide: true });

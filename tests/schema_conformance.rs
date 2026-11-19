@@ -146,20 +146,16 @@ fn shutdown(c: Client) {
 }
 
 fn content_text(v: &Value) -> String {
-    // screenshot carries image+text; the JSON meta is the text block.
     if let Some(arr) = v.get("content").and_then(|c| c.as_array()) {
         for b in arr {
             if b.get("type").and_then(|t| t.as_str()) == Some("text") {
                 if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
-                    // Prefer a block that parses as JSON (the meta); fall
-                    // back to the first text block.
                     if serde_json::from_str::<Value>(t).is_ok() {
                         return t.to_string();
                     }
                 }
             }
         }
-        // Fallback: first text block (snapshot text mode has one block).
         if let Some(t) = arr
             .iter()
             .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
@@ -288,7 +284,6 @@ fn assert_conforms(tool: &str, sc: &Value, schema: &Value, args: &Value) {
             );
         }
     } else {
-        // Top required (usually empty) must hold, plus at least one branch.
         for key in &top_req {
             let v = sc
                 .get(key)
@@ -306,7 +301,6 @@ fn assert_conforms(tool: &str, sc: &Value, schema: &Value, args: &Value) {
             "{tool} {args} matches no anyOf/oneOf branch: {sc} vs {schema}"
         );
     }
-    // Every present key must be declared and type-allowed.
     let obj = sc.as_object().expect("object");
     for (key, val) in obj {
         let ps = props.get(key).unwrap_or_else(|| {
@@ -370,7 +364,6 @@ fn schema_conformance_all_tools() {
     }
     let mut covered: HashSet<String> = HashSet::new();
 
-    // navigate first: all later tools act on this page (http origin so storage works).
     do_check(
         &mut c,
         &schemas,
@@ -378,7 +371,6 @@ fn schema_conformance_all_tools() {
         "navigate",
         json!({"url": http_url}),
     );
-    // history reload keeps the same http page.
     do_check(
         &mut c,
         &schemas,
@@ -386,7 +378,6 @@ fn schema_conformance_all_tools() {
         "history",
         json!({"action": "reload"}),
     );
-    // snapshot both branches (AX + text) cover the anyOf.
     do_check(&mut c, &schemas, &mut covered, "snapshot", json!({}));
     {
         let r = c.call("snapshot", json!({"mode": "text"}));
@@ -479,7 +470,6 @@ fn schema_conformance_all_tools() {
         "tabs",
         json!({"action": "list"}),
     );
-    // targets both branches: list (targets) + select (tabs).
     do_check(
         &mut c,
         &schemas,
@@ -569,7 +559,6 @@ fn schema_conformance_all_tools() {
         "cdp",
         json!({"method": "Browser.getVersion"}),
     );
-    // upload needs a live file input.
     c.call(
         "evaluate",
         json!({"expression": "document.body.insertAdjacentHTML('beforeend', '<input type=file id=upfile>'); 'added'"}),
@@ -591,7 +580,6 @@ fn schema_conformance_all_tools() {
         "fetch_text",
         json!({"url": http_url}),
     );
-    // storage: every action shape shares {ok,action} but carries different keys.
     do_check(
         &mut c,
         &schemas,
@@ -659,7 +647,6 @@ fn schema_conformance_all_tools() {
         "layout",
         json!({"selector": "#toggle"}),
     );
-    // visual: all four file/pixel shapes share {ok,action}.
     do_check(
         &mut c,
         &schemas,
@@ -698,7 +685,6 @@ fn schema_conformance_all_tools() {
             &json!({"action": "delete"}),
         );
     }
-    // tabs new/select/close share {tabs,ok}; list already covers, exercise the rest.
     {
         let r = c.call("tabs", json!({"action": "new", "url": http_url}));
         assert!(!is_error(&r), "tabs new ok: {r}");

@@ -165,7 +165,6 @@ fn wait_for_expression_resolves_when_value_flips() {
     );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // The fixture flips `window.__flip` to 'FLIPPED_OK' after ~1.5 s.
     let w = c.call(
         "wait_for",
         json!({"expression": "window.__flip === 'FLIPPED_OK'", "ms": 10000}),
@@ -174,7 +173,6 @@ fn wait_for_expression_resolves_when_value_flips() {
     let t = content_text(&w);
     assert!(t.contains("\"ok\":true"), "ok payload: {t}");
 
-    // Truthiness follows JS rules: a non-empty string is truthy.
     let w2 = c.call(
         "wait_for",
         json!({"expression": "window.__flip", "ms": 2000}),
@@ -225,7 +223,6 @@ fn wait_for_expression_times_out_typed_when_never_true() {
         "budget honored, took {dt:?}"
     );
 
-    // A throwing condition is a real error, not "not yet true".
     let bad = c.call(
         "wait_for",
         json!({"expression": "null.foo.bar", "ms": 2000}),
@@ -235,7 +232,6 @@ fn wait_for_expression_times_out_typed_when_never_true() {
         "throwing condition isError: {bad}"
     );
 
-    // expression + selector is one condition per call, never both.
     let both = c.call(
         "wait_for",
         json!({"expression": "true", "selector": "#x", "ms": 1000}),

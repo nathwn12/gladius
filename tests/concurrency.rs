@@ -52,9 +52,6 @@ impl Client {
                         let _ = tx.send(line.trim_end().to_string());
                     }
                     Err(e) => {
-                        // Read errors must fail loudly downstream, never
-                        // vanish: forward a sentinel the parser rejects
-                        // with the raw error attached.
                         let _ = tx.send(format!("READ_ERROR: {e}"));
                         break;
                     }
@@ -119,10 +116,6 @@ impl Client {
             Some(&json!("2.0")),
             "stdout frame without jsonrpc 2.0: {line:?}"
         );
-        // This server sends only response frames on stdout: every frame
-        // must carry an id (string/number/null) and exactly one of
-        // result/error. Bare or response-less frames fail with the raw
-        // line instead of slipping through the count assertions.
         let id_ok = v
             .get("id")
             .map(|id| id.is_string() || id.is_number() || id.is_null())
@@ -296,8 +289,6 @@ fn ping_during_long_call() {
     std::thread::sleep(Duration::from_millis(300));
     let t0 = Instant::now();
     c.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}}));
-    // The ping reply must arrive while the 5s wait is still in flight:
-    // strictly less than 1s, and no id-1 response may precede it.
     let pong = c.wait_id(&json!(2), Duration::from_secs(1), "ping during wait");
     let ping_dt = t0.elapsed();
     assert!(pong.get("error").is_none(), "ping must not error: {pong}");
@@ -306,7 +297,6 @@ fn ping_during_long_call() {
         ping_dt < Duration::from_secs(1),
         "ping answered in {ping_dt:?} while wait in flight"
     );
-    // The long call still completes afterwards with its own id.
     let done = c.wait_id(&json!(1), Duration::from_secs(10), "wait completion");
     assert!(
         done.get("error").is_none(),
@@ -328,7 +318,6 @@ fn cancelled_call_answers_with_a_typed_cancel() {
         "params": {"requestId": 1}}),
     );
     let t_cancel = Instant::now();
-    // The answer arrives promptly, for the cancelled id, typed.
     let answer = c.wait_id(&json!(1), Duration::from_secs(2), "cancel answer");
     assert!(
         t_cancel.elapsed() < Duration::from_secs(2),
@@ -336,7 +325,6 @@ fn cancelled_call_answers_with_a_typed_cancel() {
         t_cancel.elapsed()
     );
     assert_cancel_answer(&answer, &json!(1), "cancelled wait");
-    // Ping still answers on a live server.
     let t0 = Instant::now();
     c.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}}));
     let pong = c.wait_id(&json!(2), Duration::from_secs(2), "ping after cancel");
@@ -345,11 +333,8 @@ fn cancelled_call_answers_with_a_typed_cancel() {
         t0.elapsed() < Duration::from_secs(2),
         "ping fast after cancel"
     );
-    // No late duplicate for the cancelled id after another 1s; nothing else.
     let late = c.drain(Duration::from_secs(1));
     assert_window(&late, &json!(1), &[], "no late duplicate");
-    // Keep observing PAST the original 5s deadline: the cancelled wait
-    // would have completed by then, and still nothing else may arrive.
     let deadline = t_start + Duration::from_millis(6500);
     let rest = c.drain(deadline.saturating_duration_since(Instant::now()));
     assert_window(&rest, &json!(1), &[], "no response past 5s deadline");
@@ -361,8 +346,6 @@ fn duplicate_id_newest_generation_wins_single_response() {
     let t0 = Instant::now();
     c.wait_for(json!(7), 2000); // older generation: superseded, must stay silent
     c.wait_for(json!(7), 100); // newer generation: answers fast
-                               // The whole 3s window (past the older 2s deadline) must contain
-                               // exactly one frame: the newest generation's fast answer.
     let got = c.drain_stamped(t0 + Duration::from_secs(3));
     assert_eq!(
         got.len(),
@@ -383,11 +366,6 @@ fn duplicate_id_newest_generation_wins_single_response() {
 
 #[test]
 fn duplicate_id_at_capacity_single_response() {
-    // Repro: 4 active long calls fill the semaphore; reusing id 1 must
-    // yield exactly one response for id 1 — the replacement result (if its
-    // permit freed) or a single busy error — never both, and never the
-    // superseded old result after its deadline. The whole window is
-    // collected: exactly four frames, nothing else.
     let mut c = Client::spawn();
     let t0 = Instant::now();
     for id in 1..=4 {
@@ -395,7 +373,6 @@ fn duplicate_id_at_capacity_single_response() {
     }
     std::thread::sleep(Duration::from_millis(200));
     c.wait_for(json!(1), 100); // supersedes the in-flight id 1
-                               // Observe past the old 1200ms deadline (plus margin).
     let got = c.drain_stamped(t0 + Duration::from_secs(3));
     assert_eq!(
         got.len(),
@@ -428,7 +405,6 @@ fn duplicate_id_at_capacity_single_response() {
             "id 1 replacement answers ok: {only}"
         );
     }
-    // The other three long calls were never superseded: one response each.
     for id in 2..=4 {
         let n = got
             .iter()
@@ -440,9 +416,6 @@ fn duplicate_id_at_capacity_single_response() {
 
 #[test]
 fn duplicate_id_invalid_tool_name_single_error() {
-    // id 77 runs a long wait; a second frame with id 77 but no tool name
-    // supersedes it before validation. The whole window (past the old
-    // 400ms deadline) must contain exactly one frame: the -32602.
     let mut c = Client::spawn();
     let t0 = Instant::now();
     c.wait_for(json!(77), 400);
@@ -463,9 +436,6 @@ fn duplicate_id_invalid_tool_name_single_error() {
 
 #[test]
 fn duplicate_id_fast_method_single_response() {
-    // id 77 runs a long wait; a ping reusing id 77 supersedes it. The whole
-    // window (past the old 400ms deadline) must contain exactly one frame:
-    // the fast ping response.
     let mut c = Client::spawn();
     let t0 = Instant::now();
     c.wait_for(json!(77), 400);
@@ -485,11 +455,6 @@ fn duplicate_id_fast_method_single_response() {
 
 #[test]
 fn invalid_id_cancel_frame_rejected_call_survives() {
-    // A frame with an invalid id type (bool) naming notifications/cancelled
-    // must be rejected -32600 with id null: no supersession, no dispatch,
-    // so the live call 77 is NOT cancelled and still completes. Ping 88
-    // then works on the healthy server. Every stdout frame in the window
-    // is collected: exactly three responses and nothing else.
     let mut c = Client::spawn();
     let t0 = Instant::now();
     c.wait_for(json!(77), 400);
@@ -498,8 +463,6 @@ fn invalid_id_cancel_frame_rejected_call_survives() {
         &json!({"jsonrpc": "2.0", "id": true, "method": "notifications/cancelled",
         "params": {"requestId": 77}}),
     );
-    // Let the old 400ms wait run past its deadline, then ping on the same
-    // connection. All three responses fall inside one collected window.
     std::thread::sleep(Duration::from_millis(600));
     c.send(&json!({"jsonrpc": "2.0", "id": 88, "method": "ping", "params": {}}));
     let got = c.drain(t0 + Duration::from_secs(3) - Instant::now());
@@ -538,12 +501,6 @@ fn invalid_id_cancel_frame_rejected_call_survives() {
 
 #[test]
 fn invalid_version_cancel_frame_rejected_call_survives() {
-    // A frame with an invalid `jsonrpc` version ("1.0") carrying
-    // notifications/cancelled must be rejected -32600 with its own id:
-    // no supersession, no cancellation dispatch, so the live call 1 is
-    // NOT cancelled and still completes. Ping 3 then works on the healthy
-    // server. Every stdout frame in the window is collected: exactly three
-    // responses and nothing else.
     let mut c = Client::spawn();
     let t0 = Instant::now();
     c.wait_for(json!(1), 1200);
@@ -589,8 +546,6 @@ fn invalid_version_cancel_frame_rejected_call_survives() {
 
 #[test]
 fn many_cancels_then_healthy_and_id_reuse() {
-    // 1100 wait+cancel pairs: past the 1024 tombstone bound, so eviction
-    // runs. Then reuse a cancelled id and check server health.
     let mut c = Client::spawn();
     const N: i64 = 1100;
     for i in 0..N {
@@ -601,16 +556,9 @@ fn many_cancels_then_healthy_and_id_reuse() {
             "params": {"requestId": id}}),
         );
     }
-    // Observe past the 2000ms wait (3s): map every response by id. A
-    // cancelled call answers exactly once - the typed cancel (S2.3) - or, if
-    // its permit was refused before dispatch, the busy refusal. Never a
-    // second frame, never a tool result from a call that actually ran.
     let got = c.drain(Duration::from_secs(3));
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for v in &got {
-        // No id-less frames: `parse_frame` already rejects response-less
-        // shapes, and this loop must not skip anything either — every
-        // server frame is counted.
         let id = v
             .get("id")
             .unwrap_or_else(|| panic!("id-less stdout frame: {v:?}"));
@@ -637,11 +585,9 @@ fn many_cancels_then_healthy_and_id_reuse() {
             ),
         }
     }
-    // Reusing a cancelled id must answer (no stale suppression).
     c.wait_for(json!(2000), 100);
     let r = c.wait_id(&json!(2000), Duration::from_secs(5), "reused id answers");
     assert!(r.get("error").is_none(), "id reuse ok: {r}");
-    // Server still healthy.
     c.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}}));
     let pong = c.wait_id(&json!(1), Duration::from_secs(2), "ping");
     assert_eq!(pong.get("result"), Some(&json!({})), "ping ok: {pong}");
@@ -649,8 +595,6 @@ fn many_cancels_then_healthy_and_id_reuse() {
 
 #[test]
 fn writer_death_exits_cleanly_no_panic() {
-    // Close the stdout read end, then ping: the writer's first flush fails,
-    // and the server must exit 0 without polling its writer handle twice.
     let bin = env!("CARGO_BIN_EXE_gladius");
     let mut cmd = Command::new(bin);
     cmd.arg("mcp")
@@ -726,7 +670,6 @@ fn pre_start_cancel_answers_the_cancelled_call() {
     );
     let answer = c.wait_id(&json!(1), Duration::from_secs(2), "pre-start cancel answer");
     assert_cancel_answer(&answer, &json!(1), "pre-start cancel");
-    // An id that was never dispatched: no entry, so no response at all.
     c.send(
         &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
         "params": {"requestId": 999}}),
@@ -736,7 +679,6 @@ fn pre_start_cancel_answers_the_cancelled_call() {
         got.is_empty(),
         "a cancel for an unknown id answers nothing: {got:?}"
     );
-    // Server still alive.
     c.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}}));
     let pong = c.wait_id(&json!(2), Duration::from_secs(2), "ping");
     assert_eq!(pong.get("result"), Some(&json!({})), "ping ok: {pong}");
@@ -753,7 +695,6 @@ fn read_only_calls_overlap() {
     let dt = t0.elapsed();
     assert!(r1.get("error").is_none(), "wait 1 ok: {r1}");
     assert!(r2.get("error").is_none(), "wait 2 ok: {r2}");
-    // Serial execution would take ~3s; overlap lands near max(1.5s).
     assert!(
         dt < Duration::from_millis(2800),
         "two 1.5s waits overlapped, took {dt:?}"
@@ -784,7 +725,6 @@ fn eof_with_call_in_flight_exits_clean() {
 #[test]
 fn result_type_preserved_after_dispatch_rewrite() {
     let mut c = Client::spawn();
-    // Modern tools/list carries resultType complete + 25 tools.
     c.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list",
         "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}}));
     let modern = c.wait_id(&json!(1), Duration::from_secs(10), "modern tools/list");
@@ -802,7 +742,6 @@ fn result_type_preserved_after_dispatch_rewrite() {
         Some(25),
         "25 tools: {modern}"
     );
-    // Legacy tools/list carries no resultType.
     c.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}));
     let legacy = c.wait_id(&json!(2), Duration::from_secs(10), "legacy tools/list");
     let result = legacy.get("result").expect("legacy result");
@@ -810,7 +749,6 @@ fn result_type_preserved_after_dispatch_rewrite() {
         result.get("resultType").is_none(),
         "legacy tools/list no resultType: {legacy}"
     );
-    // Ping answers {} on both eras.
     c.send(&json!({"jsonrpc": "2.0", "id": 3, "method": "ping", "params": {}}));
     let pong = c.wait_id(&json!(3), Duration::from_secs(10), "ping");
     assert_eq!(pong.get("result"), Some(&json!({})), "ping: {pong}");
@@ -853,7 +791,6 @@ fn deterministic_capture_serializes_with_navigation() {
     let nav = c.wait_id(&json!(2), Duration::from_secs(60), "navigate");
     assert!(nav.get("error").is_none(), "navigate: {nav}");
 
-    // A caller-owned override the captures must read and put back.
     c.call(
         json!(3),
         "viewport",
@@ -863,10 +800,6 @@ fn deterministic_capture_serializes_with_navigation() {
     assert!(vp.get("error").is_none(), "viewport: {vp}");
 
     let reduce_baseline = motion_baseline(&mut c);
-    // Four calls in flight at once: three deterministic captures with
-    // DIFFERENT forced geometry plus a navigation. The in-flight cap is 4, so
-    // they really overlap. If the overrides interleaved, a capture would
-    // report a viewport it never asked for (or restore the wrong one).
     c.call(
         json!(10),
         "screenshot",
@@ -937,9 +870,6 @@ fn deterministic_capture_serializes_with_navigation() {
         );
     }
 
-    // Final state: the override is intact, the freeze style is gone, the
-    // motion preference is exactly what it was before the captures. Any
-    // interleaved restoration breaks one.
     c.call(
         json!(20),
         "evaluate",
@@ -1036,7 +966,6 @@ fn capture_waits_for_an_in_flight_navigation() {
 
     let reduce_baseline = motion_baseline(&mut c);
 
-    // Baseline: a deterministic capture of a settled page is fast.
     c.call(json!(2), "navigate", json!({"url": "about:blank"}));
     let nav0 = c.wait_id(&json!(2), Duration::from_secs(60), "about:blank");
     assert!(nav0.get("error").is_none(), "about:blank: {nav0}");
@@ -1045,9 +974,6 @@ fn capture_waits_for_an_in_flight_navigation() {
     let _ = c.wait_id(&json!(3), Duration::from_secs(60), "baseline capture");
     let baseline = t0.elapsed();
 
-    // The real thing: start a slow navigation, wait until the server has the
-    // request (so the navigation is in flight and holds the exec lock), then
-    // send the capture.
     let url = format!("http://127.0.0.1:{port}/slow");
     c.call(json!(10), "navigate", json!({"url": url}));
     ready_rx
@@ -1056,7 +982,6 @@ fn capture_waits_for_an_in_flight_navigation() {
     let shot_sent = Instant::now();
     c.call(json!(11), "screenshot", json!({"deterministic": true}));
 
-    // Collect both frames with arrival stamps (order asserted, not assumed).
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut nav: Option<(Instant, Value)> = None;
     let mut shot: Option<(Instant, Value)> = None;
@@ -1089,7 +1014,6 @@ fn capture_waits_for_an_in_flight_navigation() {
          with-navigation {shot_wait:?}"
     );
 
-    // And it still restored everything it touched.
     c.call(
         json!(20),
         "evaluate",
@@ -1120,8 +1044,6 @@ fn capture_waits_for_an_in_flight_navigation() {
     c.call(json!(21), "close", json!({}));
     let closed = c.wait_id(&json!(21), Duration::from_secs(30), "close");
     assert!(closed.get("error").is_none(), "close: {closed}");
-    // The loopback thread is detached: it served its one request and the
-    // listener is already dropped, so nothing is left waiting on it.
     drop(srv);
 }
 
@@ -1193,7 +1115,6 @@ fn cancel_during_capture_restores_everything() {
         .and_then(|v| v.as_bool())
         .expect("motion preference in the pre-state");
 
-    // Fire the capture, then cancel INSIDE its 1200 ms mutation window.
     c.call(json!(10), "screenshot", json!({"deterministic": true}));
     std::thread::sleep(Duration::from_millis(350));
     c.send(
@@ -1201,12 +1122,9 @@ fn cancel_during_capture_restores_everything() {
         "params": {"requestId": 10}}),
     );
     let cancelled_at = Instant::now();
-    // S2.3: the cancel is answered immediately, before the restore finishes.
     let cancel_answer = c.wait_id(&json!(10), Duration::from_secs(5), "cancel answer");
     assert_cancel_answer(&cancel_answer, &json!(10), "cancel during capture");
 
-    // This needs the execution lock, so it cannot answer until the cancelled
-    // capture has finished cleaning up: "lock released only after cleanup".
     let post = state(&mut c, 20, "post-cancel state");
     let waited = cancelled_at.elapsed();
 
@@ -1240,8 +1158,6 @@ fn cancel_during_capture_restores_everything() {
         "the state read had to wait for the rest of the capture ({waited:?}), \
          which proves the lock was held until cleanup"
     );
-    // `wait_id` fails on any unexpected frame, so the only frame for id 10 was
-    // the typed cancel answer consumed above.
 
     c.call(json!(30), "viewport", json!({"reset": true}));
     let _ = c.wait_id(&json!(30), Duration::from_secs(30), "viewport reset");
@@ -1267,9 +1183,6 @@ fn cancel_during_compare_closes_the_scratch_target() {
             .unwrap_or(0)
     }
 
-    // Longer hook: the compare runs capture (hook) then diff (hook), so the
-    // scratch target is open for a full 2 s window. The visual dir is a temp
-    // dir so a test run never leaves a baseline in the repo.
     let vdir = tempfile::tempdir().expect("tempdir");
     let vdir_s = vdir.path().to_string_lossy().to_string();
     let mut c = Client::spawn_extra(&[
@@ -1312,8 +1225,6 @@ fn cancel_during_compare_closes_the_scratch_target() {
         "visual",
         json!({"action": "compare", "name": "cancel-probe"}),
     );
-    // Wait for the scratch target to exist (targets list is lock-free, so it
-    // answers while the compare holds the execution lock).
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if page_count(&mut c, 31) > base {
@@ -1325,12 +1236,10 @@ fn cancel_during_compare_closes_the_scratch_target() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Cancel while the target is provably open.
     c.send(
         &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
         "params": {"requestId": 30}}),
     );
-    // S2.3: answered immediately, while the section finishes its restore.
     let cancel_answer = c.wait_id(&json!(30), Duration::from_secs(5), "cancel answer");
     assert_cancel_answer(&cancel_answer, &json!(30), "cancel during compare");
 
@@ -1346,8 +1255,6 @@ fn cancel_during_compare_closes_the_scratch_target() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // The page is clean as well, and the cancelled compare answered exactly
-    // once (its typed cancel answer, consumed below).
     c.call(
         json!(40),
         "evaluate",
@@ -1413,11 +1320,8 @@ fn cancel_in_the_entry_window_never_mutates() {
     let vp = c.wait_id(&json!(3), Duration::from_secs(30), "viewport");
     assert!(vp.get("error").is_none(), "viewport: {vp}");
 
-    // The motion preference before anything runs (host-derived on the pinned
-    // engine: there is no Emulation.setEmulatedMedia there).
     let reduce_baseline = motion_baseline(&mut c);
 
-    // Fire the capture, then cancel while it is parked in the entry window.
     c.call(json!(10), "screenshot", json!({"deterministic": true}));
     std::thread::sleep(Duration::from_millis(250));
     c.send(
@@ -1425,13 +1329,9 @@ fn cancel_in_the_entry_window_never_mutates() {
         "params": {"requestId": 10}}),
     );
     let cancelled_at = Instant::now();
-    // S2.3: the cancel is answered immediately, even while the parked task
-    // still holds the execution lock.
     let cancel_answer = c.wait_id(&json!(10), Duration::from_secs(5), "cancel answer");
     assert_cancel_answer(&cancel_answer, &json!(10), "cancel in the entry window");
 
-    // The exec lock is held by the parked task, so this can only answer once
-    // the cancel has been honoured and the task dropped.
     c.call(json!(20), "evaluate", json!({"expression": STATE}));
     let ev = c.wait_id(&json!(20), Duration::from_secs(60), "state after cancel");
     let waited = cancelled_at.elapsed();
@@ -1470,8 +1370,6 @@ fn cancel_in_the_entry_window_never_mutates() {
         "the state read waited for the parked call to be aborted ({waited:?}), \
          which is the lock-released-after-abort guarantee"
     );
-    // `wait_id` fails on unexpected frames, so the cancelled call emitted
-    // nothing.
 
     c.call(json!(30), "viewport", json!({"reset": true}));
     let _ = c.wait_id(&json!(30), Duration::from_secs(30), "viewport reset");
@@ -1518,14 +1416,9 @@ fn cancel_while_queued_never_enters_the_section() {
         &json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
         "params": {"requestId": 10}}),
     );
-    // S2.3: the cancel is answered now; the task still never enters the
-    // section (that is what this test proves, 2 s from now).
     let cancel_answer = c.wait_id(&json!(10), Duration::from_secs(5), "cancel answer");
     assert_cancel_answer(&cancel_answer, &json!(10), "cancel while queued");
 
-    // Wait until the queued task has had the gate handed to it (entry 300 ms,
-    // abort hold 1500 ms) and would be inside the section if the recheck were
-    // missing. 2 s is inside the 3 s section delay.
     std::thread::sleep(Duration::from_millis(2000));
     c.call(
         json!(20),
@@ -1569,20 +1462,8 @@ fn lost_media_clear_is_repaired_before_return() {
     let nav = c.wait_id(&json!(2), Duration::from_secs(60), "navigate");
     assert!(nav.get("error").is_none(), "navigate: {nav}");
 
-    // The motion preference BEFORE any capture. On an engine with
-    // `Emulation.setEmulatedMedia` this is `false` and the dropped clear must
-    // be repaired back to it; on the pinned chrome-headless-shell the command
-    // does not exist, so the preference is the host's and the invariant is
-    // "unchanged" (which is also what proves nothing leaked).
-    // `Emulation.setEmulatedMedia` lives on the PAGE session (a browser-level
-    // `cdp` call answers `-32601`), which is why the capability is read from
-    // the capture reply rather than probed through `cdp`.
     let reduce_baseline = motion_baseline(&mut c);
 
-    // Two captures: the hook drops the first clear of EACH where the clear
-    // exists, so on a supporting engine both must be repaired before their
-    // call returns. On the pinned engine there is nothing to clear and the
-    // assertion is the unchanged-preference invariant.
     for (i, id) in [(0, 10_i64), (1, 20_i64)] {
         c.call(json!(id), "screenshot", json!({"deterministic": true}));
         let shot = c.wait_id(&json!(id), Duration::from_secs(60), "capture");
@@ -1590,9 +1471,6 @@ fn lost_media_clear_is_repaired_before_return() {
             shot.pointer("/result/isError").is_none(),
             "capture {i} succeeded: {shot}"
         );
-        // The reply reports whether the engine actually emulated motion, so a
-        // caller can tell "frozen by emulation" from "the host already asked
-        // for reduced motion".
         assert!(
             shot.pointer("/result/structuredContent/reducedMotionEmulated")
                 .and_then(|v| v.as_bool())

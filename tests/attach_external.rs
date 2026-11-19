@@ -211,8 +211,6 @@ impl External {
             match version_ws_dbg(&self.base_url()) {
                 Ok(_) => return,
                 Err(e) => {
-                    // The engine is usually up in <2s; log only when a wait
-                    // drags, so happy runs stay quiet.
                     if t0.elapsed() > Duration::from_secs(5) && n % 20 == 1 {
                         eprintln!(
                             "[attach-test] wait_ready pid={} port={} attempt={n} err={e}",
@@ -257,22 +255,16 @@ fn version_ws_dbg(base: &str) -> Result<String, String> {
         .strip_prefix("http://")
         .unwrap_or(base)
         .trim_end_matches('/');
-    // The engine builds `webSocketDebuggerUrl` from the Host header: it must
-    // carry the port, or the returned ws url has none (measured).
     let req = format!("GET /json/version HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     let mut s = std::net::TcpStream::connect(host).map_err(|e| format!("connect {host}: {e}"))?;
     s.set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| format!("read timeout: {e}"))?;
     s.set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| format!("write timeout: {e}"))?;
-    // NOTE: the engine's DevTools server speaks HTTP/1.1: send HTTP/1.1,
-    // and frame the body by Content-Length (read-to-end would wait for a
-    // close that never comes).
     s.write_all(req.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
     let mut raw = Vec::new();
     let mut buf = [0u8; 4096];
-    // Headers first.
     loop {
         let n = s.read(&mut buf).map_err(|e| format!("read head: {e}"))?;
         if n == 0 {
@@ -422,8 +414,6 @@ fn attach_over_ws_drives_and_leaves_external_alive() {
         .unwrap_or("");
     assert!(data.starts_with("iVBORw0KGgo"), "real png bytes");
 
-    // gladius created no browser of its own: no owned profile, and no
-    // chrome-headless-shell.exe process parented under the gladius pid.
     assert!(
         profile_dirs(gpid).is_empty(),
         "attached gladius owns no profile: {:?}",
@@ -440,7 +430,6 @@ fn attach_over_ws_drives_and_leaves_external_alive() {
     assert!(closed.get("isError").is_none(), "close ok: {closed}");
     shutdown(c);
 
-    // Ownership: the external engine is STILL ALIVE after gladius exits.
     assert!(ext.alive(), "external engine must survive gladius close");
     assert!(
         profile_dirs(gpid).is_empty(),
@@ -495,7 +484,6 @@ fn dom_only_refuses_screenshot_but_keeps_dom_tools() {
     ]);
     assert_initialize(&mut c, "external-cdp", "dom-only");
 
-    // DOM tools keep working on a renderless backend.
     let nav = c.call("navigate", json!({"url": DATA_URL}));
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
     let snap = c.call("snapshot", json!({}));
@@ -505,7 +493,6 @@ fn dom_only_refuses_screenshot_but_keeps_dom_tools() {
         "snapshot works dom-only"
     );
 
-    // screenshot refuses with the backend and the reason, never an image.
     let shot = c.call("screenshot", json!({}));
     assert!(
         shot.get("isError").is_some(),
@@ -525,8 +512,6 @@ fn dom_only_refuses_screenshot_but_keeps_dom_tools() {
         "refusal carries no image bytes: {shot}"
     );
 
-    // upload speaks DOM CDP only (no compositor path), so it keeps working
-    // dom-only: real temp files onto the data: page's file input.
     let dir = std::env::temp_dir().join(format!(
         "gladius-domup-{}-{}",
         std::process::id(),
@@ -562,8 +547,6 @@ fn dom_only_refuses_screenshot_but_keeps_dom_tools() {
 
 #[test]
 fn initialize_reports_default_backend_without_launching() {
-    // Neither var set: cold handshake reports the owned Chromium render
-    // backend and launches nothing (no navigate here, so no browser spawns).
     let mut c = Client::spawn_with_env(&[]);
     assert_initialize(&mut c, "chromium", "render");
     let pong = c.result("ping", json!({}));

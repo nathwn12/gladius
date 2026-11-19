@@ -1,8 +1,3 @@
-// The tool table is one large `json!` literal (one macro expansion per tool,
-// and one nesting level per field). The `visual` entry carries the AA rule and
-// environment contract, which pushes the default 128-level macro recursion
-// limit over the edge; 256 is the smallest bump that compiles and is stable
-// against future schema growth.
 #![recursion_limit = "256"]
 
 mod browser;
@@ -17,12 +12,6 @@ mod visual;
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // Version handshake (fail closed): the npm launcher pins the engine it
-    // provisioned, but nothing in the protocol binds the two — a stale
-    // launcher once ran a stale engine silently. When the launcher exports
-    // GLADIUS_EXPECTED_VERSION (its own package version), a mismatch refuses
-    // to serve instead of running mixed versions. Unset = local/dev run, no
-    // gate. Launcher-side export is still required for this to bite.
     if let Ok(expected) = std::env::var("GLADIUS_EXPECTED_VERSION") {
         let actual = env!("CARGO_PKG_VERSION");
         if !expected.trim().is_empty() && expected.trim() != actual {
@@ -33,8 +22,6 @@ async fn main() {
             std::process::exit(3);
         }
     }
-    // One stderr line on every startup so a harness can record exactly which
-    // engine ran. Stderr only: stdout belongs to the MCP channel in serve.
     eprintln!(
         "[gladius] engine gladius {} ({}{})",
         env!("CARGO_PKG_VERSION"),
@@ -44,9 +31,6 @@ async fn main() {
             _ => "",
         }
     );
-    // No headed path exists (headless-only by owner decision 2026-10-17):
-    // a headed request fails closed here, before anything resolves,
-    // provisions, or launches.
     if args.iter().any(|a| a == "--headed" || a == "headed") {
         eprintln!(
             "[gladius] headed mode is not supported: gladius is headless-only by owner decision \
@@ -56,14 +40,6 @@ async fn main() {
         std::process::exit(2);
     }
     let arg = args.first().map(|s| s.as_str());
-    // The serve/selftest futures host every tool chain, including the
-    // browser launch + ws-connect depth. `#[tokio::main]`'s block_on polls
-    // its future on the MAIN thread, whose stack is the 1 MB PE default on
-    // Windows - the launch path sits right at that edge, so a layout shift
-    // (any rebuild) can flip a cold start between run and stack overflow.
-    // Spawn onto a runtime worker (2 MB stack) so the depth has headroom no
-    // rebuild can take away. Observed 2026-10-18: cold `navigate` overflowed
-    // main deterministically on one build and ran clean on the next.
     let code = match arg {
         None | Some("mcp") => match tokio::spawn(mcp::serve()).await {
             Ok(Ok(())) => 0,
@@ -77,12 +53,6 @@ async fn main() {
             }
         },
         Some("selftest") => {
-            // Own thread with an explicit generous stack. The chain the
-            // selftest drives (run -> tools::call -> launch -> ws) is deep,
-            // and a debug profile gives every local its own stack slot with
-            // no reuse, so the 2 MB tokio worker default is too tight for an
-            // end-to-end check that keeps growing. The product path is
-            // unaffected: `serve` still runs on the normal worker pool.
             let handle = std::thread::Builder::new()
                 .name("gladius-selftest".to_string())
                 .stack_size(16 * 1024 * 1024)
@@ -101,9 +71,6 @@ async fn main() {
                 }
             }
         }
-        // Provenance: the crate version plus the commit this binary was built
-        // from (`build.rs`), with `-dirty` when the tree was modified at build
-        // time. This is the referent a deployed binary can be checked against.
         Some("--version") | Some("version") => {
             let stamp = match env!("GLADIUS_GIT_DIRTY") {
                 "1" => "-dirty",

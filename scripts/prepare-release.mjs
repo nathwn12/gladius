@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// Build once, test the final package, write a receipt only after every gate.
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync, execSync } from "node:child_process";
@@ -51,11 +50,6 @@ try {
   gate("selftest", () => run(path.join(root, "target/release/gladius.exe"), ["selftest"]));
 
   const manifest = json("npm/engine-manifest.json");
-  // The browser pin has ONE home: scripts/chromium-manifest.json. The published
-  // package cannot derive it at runtime (npm/ ships no scripts/), so it is
-  // derived here, at release time, into the manifest this run writes. The
-  // committed npm copy is kept in step by ci.yml, which fails at PR time when
-  // the two blocks disagree - an assertion there, a derivation here.
   manifest.browser = json("scripts/chromium-manifest.json").browser;
   const browser = manifest.browser;
   const provisioner = read("scripts/fetch-chromium.ps1").toString();
@@ -84,7 +78,6 @@ try {
   const pkg = path.join(work, "npm");
   fs.cpSync("npm", pkg, { recursive: true });
   fs.copyFileSync(path.join(out, "engine-manifest.json"), path.join(pkg, "engine-manifest.json"));
-  // Constant command, generated working directory: no caller-controlled shell arguments.
   const packed = JSON.parse(execSync("npm pack --json ./npm", { cwd: work, windowsHide: true, encoding: "utf8" }));
   const entry = Array.isArray(packed) ? packed[0] : Object.values(packed)[0];
   need(entry.filename === `gladius-mcp-${version}.tgz`, "unexpected npm tarball name");

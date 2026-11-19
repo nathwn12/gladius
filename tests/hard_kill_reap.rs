@@ -41,8 +41,6 @@ impl Client {
         for (k, v) in env_extra {
             cmd.env(k, v);
         }
-        // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
-        // resolves from its versioned cache with no env override.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -220,14 +218,11 @@ fn hard_kill_reaps_owned_browser_tree_and_sweeps_stale_profile() {
     let nav = a.call("navigate", json!({"url": fixture_url()}));
     assert!(nav.get("isError").is_none(), "A navigate ok: {nav}");
 
-    // The owned launch owns one fresh private profile dir for this instance.
     assert!(
         !profile_dirs(apid).is_empty(),
         "owned launch owns a private profile dir for server A (pid {apid})"
     );
 
-    // The browser tree is up: a chrome-headless-shell.exe process parented
-    // under A.
     let mut kids: Vec<u32> = engine_parentage()
         .iter()
         .filter(|(_, ppid)| *ppid == apid)
@@ -249,10 +244,6 @@ fn hard_kill_reaps_owned_browser_tree_and_sweeps_stale_profile() {
         "owned browser running under server A (pid {apid}) before kill"
     );
 
-    // Then release EVERY handle to A (including the process handle
-    // itself): the job object reaps the tree once the last handle closes.
-    // Graceful profile cleanup never runs here, so A's profile dir survives
-    // the kill as stale debris until the next owned launch sweeps it.
     a.child.kill().expect("hard-kill server A");
     let _ = a.child.wait();
     drop(a);
@@ -268,8 +259,6 @@ fn hard_kill_reaps_owned_browser_tree_and_sweeps_stale_profile() {
         "ORPHAN: owned browser survived the hard kill of server A: {survivors:?}"
     );
 
-    // Server B: happy path works on a fresh owned launch, and B's launch
-    // sweeps A's stale profile (the recovery path for hard-killed servers).
     let mut b = Client::spawn();
     b.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     let navb = b.call("navigate", json!({"url": fixture_url()}));
@@ -292,7 +281,6 @@ fn hard_kill_reaps_owned_browser_tree_and_sweeps_stale_profile() {
         profile_dirs(bpid)
     );
 
-    // Graceful close kills B's browser tree AND sweeps B's profile.
     let bkids: Vec<u32> = engine_parentage()
         .iter()
         .filter(|(_, ppid)| *ppid == bpid)
@@ -380,8 +368,6 @@ fn pid_file_reaps_a_jobless_orphan() {
     let nav = a.call("navigate", json!({"url": fixture_url()}));
     assert!(nav.get("isError").is_none(), "A navigate ok: {nav}");
 
-    // The record is written before readiness: it names the owner, the engine
-    // and the private profile the engine is holding.
     let rec_path = pid_record(apid);
     let rec_text = std::fs::read_to_string(&rec_path)
         .unwrap_or_else(|e| panic!("owned launch writes {}: {e}", rec_path.display()));
@@ -451,7 +437,6 @@ fn pid_file_reaps_a_jobless_orphan() {
         rec_path.display()
     );
 
-    // B is healthy on its own engine and closes cleanly.
     let bpid = b.child.id();
     let snap = b.call("snapshot", json!({}));
     assert!(
@@ -630,8 +615,6 @@ fn fake_engine(token: &str) -> Child {
 #[test]
 fn pid_record_matches_the_profile_argument_exactly() {
     let temp = private_temp("arg-match");
-    // The recorded profile's name encodes a LIVE pid (this test's), so the
-    // dir-only sweep never touches it: any deletion here is the record path.
     let own = std::process::id();
     let suffix_dir = temp.join(format!("gladius-{own}-1-1"));
     let exact_dir = temp.join(format!("gladius-{own}-2-1"));
@@ -640,7 +623,6 @@ fn pid_record_matches_the_profile_argument_exactly() {
         std::fs::write(d.join("keep.txt"), "gladius-created profile").expect("create profile file");
     }
 
-    // Same recorded dir, one character longer on the command line.
     let mut stray = fake_engine(&format!(
         "--user-data-dir={}-suffix",
         suffix_dir.to_string_lossy()
@@ -674,8 +656,6 @@ fn pid_record_matches_the_profile_argument_exactly() {
 
     let mut b = launch_once_in(&temp);
 
-    // The exact match is reaped (kill, then delete); poll for it so the stray
-    // observations below are made after the sweep has fully run.
     let mut deadline = 30;
     while deadline > 0 && (process_alive(exact_pid) || exact_dir.exists()) {
         std::thread::sleep(Duration::from_millis(500));
@@ -688,7 +668,6 @@ fn pid_record_matches_the_profile_argument_exactly() {
     let exact_dir_gone = !exact_dir.exists();
     let exact_rec_gone = !rec_exact.exists();
 
-    // Evidence before assertions: a red run leaves nothing behind.
     let _ = stray.kill();
     let _ = exact.kill();
     kill_tree(stray_pid);

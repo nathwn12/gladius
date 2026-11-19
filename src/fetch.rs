@@ -23,9 +23,6 @@ pub async fn fetch_text(url: &str) -> Result<String, String> {
     if !status.is_success() {
         return Err(format!("http {status}"));
     }
-    // Stream with a byte budget: pre-size from the declared length, then take
-    // at most the first MAX_FETCH_BYTES. Dropping `resp` after the budget
-    // closes the connection, so a gigabyte body never lands in memory.
     let hint = resp
         .content_length()
         .unwrap_or(0)
@@ -49,20 +46,9 @@ pub async fn fetch_text(url: &str) -> Result<String, String> {
 }
 
 fn html_to_text(html: &str) -> String {
-    // Strip tags; drop script/style contents; decode common entities.
     let mut out = String::with_capacity(html.len().min(32768));
     let mut in_tag = false;
     let mut tag_buf = String::new();
-    // A comment is its own lexical unit: nothing inside it is a tag, and the
-    // `>` rule below must never fire there. Its terminator is a state
-    // machine, not a dash count: `-->` needs both dashes, `--!>` needs the
-    // bang and only one of them, and only an empty comment closes abruptly
-    // (`<!-->`, `<!--->`). The states are the HTML tokenizer's
-    // comment-start, comment-start-dash, comment, comment-end-dash,
-    // comment-end and comment-end-bang states with everything that is not a
-    // terminator collapsed into `Data` (a comment appends its text anyway,
-    // and appended text is never emitted). `Done` is written once, then the
-    // comment is left on the next line, so it is never read back.
     #[derive(Clone, Copy, PartialEq)]
     enum Comment {
         Start,
@@ -79,9 +65,6 @@ fn html_to_text(html: &str) -> String {
     for (pos, c) in html.char_indices() {
         if let Some(raw_tag) = skip {
             if !in_tag {
-                // In raw text, '<' is ordinary data unless it starts the
-                // matching end tag. In particular, comparisons must not
-                // consume the real closing tag as part of a fake tag.
                 let rest = &html[pos..];
                 let end = 2 + raw_tag.len();
                 let matches_end = rest.starts_with("</")
@@ -108,7 +91,6 @@ fn html_to_text(html: &str) -> String {
                 (Comment::Data, '-') => Comment::EndDash,
                 (Comment::Data, _) => Comment::Data,
                 (Comment::EndDash, '-') => Comment::End,
-                // A single `-` is data: reconsume it in the comment state.
                 (Comment::EndDash, _) => Comment::Data,
                 (Comment::End, '>') => Comment::Done, // `-->`
                 (Comment::End, '!') => Comment::EndBang,
@@ -147,9 +129,6 @@ fn html_to_text(html: &str) -> String {
                 tag_buf.clear();
             } else {
                 tag_buf.push(c);
-                // `<!--` is a comment, not a tag that a bare `>` closes.
-                // Only reached outside raw text: in script/style, `<` is data
-                // and never sets `in_tag`, so `<!--` there stays script data.
                 if tag_buf == "!--" {
                     in_tag = false;
                     tag_buf.clear();
@@ -169,9 +148,6 @@ fn html_to_text(html: &str) -> String {
         }
         out.push(c);
     }
-    // Entity order matters: `&amp;` is decoded LAST so each entity decodes
-    // exactly once. Decoding it first double-decodes: `&amp;lt;` (which
-    // renders as the literal text `&lt;`) would come back as `<`.
     let s = out
         .replace("&nbsp;", " ")
         .replace("&lt;", "<")
@@ -267,7 +243,6 @@ mod tests {
         assert_eq!(html_to_text("<!--><p>visible</p>"), "visible");
         assert_eq!(html_to_text("<!---><p>visible</p>"), "visible");
         assert_eq!(html_to_text("<!----><p>visible</p>"), "visible");
-        // A dash run that is not followed by `>` keeps the comment open.
         assert_eq!(html_to_text("<!-- a -- b --><p>visible</p>"), "visible");
     }
 
@@ -345,7 +320,6 @@ mod tests {
         let port = ln.local_addr().expect("loopback addr").port();
         let srv = tokio::spawn(async move {
             let (mut s, _) = ln.accept().await.expect("loopback accept");
-            // Consume the request head.
             let mut buf = vec![0u8; 4096];
             let mut req = Vec::new();
             loop {

@@ -24,8 +24,6 @@ fn read_rel(rel: &str) -> String {
 fn assert_flagged(rel: &str, text: &str) {
     let lines: Vec<&str> = text.lines().collect();
     for (i, ln) in lines.iter().enumerate() {
-        // `Command::new(` with the paren: matches real spawn sites, not
-        // string literals naming the pattern (like this guard's own scan).
         if ln.contains("Command::new(") {
             let window = lines
                 .iter()
@@ -65,12 +63,9 @@ fn every_test_spawn_is_windowless() {
         if p.extension().and_then(|x| x.to_str()) != Some("rs") {
             continue;
         }
-        // The guard itself only names the pattern in string literals.
         if p.file_name().and_then(|x| x.to_str()) == Some("no_console_flash.rs") {
             continue;
         }
-        // The headless assertions spawn the pinned browser and probe the OS
-        // (powershell/tasklist): those sites carry the flag like all others.
         let text = std::fs::read_to_string(&p).expect("read test file");
         if text.contains("Command::new(") {
             checked += 1;
@@ -142,9 +137,6 @@ fn forbidden_patterns() -> Vec<&'static str> {
 fn scan_text(name: &str, text: &str) -> Vec<String> {
     let mut hits = Vec::new();
     for (i, ln) in text.lines().enumerate() {
-        // Normalize once: backslashes become `/` so the Windows spelling of
-        // a path (`AppData\Local\Google\Chrome\Application\...`) hits the
-        // same forward-slash patterns (no second literal needed).
         let low = ln.to_lowercase().replace('\\', "/");
         let scrubbed = low
             .replace("gladius_backend_caps", "")
@@ -162,10 +154,6 @@ fn scan_text(name: &str, text: &str) -> Vec<String> {
 
 #[test]
 fn self_containment_no_ambient_or_shared_browser_in_src() {
-    // The owned pinned browser (`chrome-headless-shell` via `GLADIUS_CHROMIUM`
-    // / `GLADIUS_CHROMIUM_CACHE` / `%LOCALAPPDATA%`) is the ONLY resolution;
-    // any ambient or shared-browser resolution regressed into `src/` fails
-    // the build here.
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut hits: Vec<String> = Vec::new();
     let mut files = 0;
@@ -189,9 +177,6 @@ fn self_containment_no_ambient_or_shared_browser_in_src() {
 
 #[test]
 fn guard_bites_known_ambient_resolutions() {
-    // Positive control: the scanner MUST flag every forbidden shape. A check
-    // that cannot fail proves nothing - if any sample below ever scans
-    // clean, the guard is vacuous and this test fails.
     let bad_samples = [
         (
             "playwright cache",
@@ -229,11 +214,6 @@ fn guard_bites_known_ambient_resolutions() {
             "guard is vacuous: it does not bite the {what} sample: {sample:?}"
         );
     }
-    // And the owned shapes must scan CLEAN, so the guard passes with our
-    // pinned binary present and cannot false-positive on it. The accepted
-    // browser shape is the COMPLETE versioned pinned layout
-    // (`<version>-<zip-sha8>/chrome-headless-shell-win64/chrome-headless-shell.exe`),
-    // never a bare exe name or an artifact-relative suffix alone.
     let good_samples = [
         "let exe = find_chromium()?;",
         "std::env::var(\"GLADIUS_CHROMIUM\")",

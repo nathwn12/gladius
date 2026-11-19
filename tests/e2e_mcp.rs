@@ -35,12 +35,6 @@ impl Client {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .creation_flags(0x08000000); // CREATE_NO_WINDOW
-                                         // Owned-engine resolution: the server resolves the pinned
-                                         // Chromium from its versioned cache
-                                         // (`%LOCALAPPDATA%\gladius\chromium\`, honouring
-                                         // `GLADIUS_CHROMIUM_CACHE`) with no env override, so
-                                         // integration tests set nothing here and exercise the
-                                         // default path end to end.
         let mut child = cmd.spawn().expect("spawn gladius mcp");
         let stdin = child.stdin.take().expect("child stdin");
         let stdout: ChildStdout = child.stdout.take().expect("child stdout");
@@ -141,7 +135,6 @@ fn serve_once(body: &'static str) -> u16 {
 fn e2e_mcp_fixture_flow() {
     let mut c = Client::spawn();
 
-    // initialize (echo protocolVersion) + tools/list
     let init = c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     assert_eq!(
         init.get("protocolVersion"),
@@ -185,11 +178,9 @@ fn e2e_mcp_fixture_flow() {
     }
     assert!(names.len() >= 8, ">=8 tools");
 
-    // ping
     let pong = c.result("ping", json!({}));
     assert_eq!(pong, json!({}), "ping replies {{}}");
 
-    // navigate to fixture
     let url = fixture_url();
     let nav = c.call("navigate", json!({"url": url}));
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
@@ -201,7 +192,6 @@ fn e2e_mcp_fixture_flow() {
         "navigate has title: {nav_text}"
     );
 
-    // snapshot contains marker
     let snap = c.call("snapshot", json!({}));
     assert!(snap.get("isError").is_none(), "snapshot ok: {snap}");
     let snap_text = content_text(&snap);
@@ -211,20 +201,16 @@ fn e2e_mcp_fixture_flow() {
         snap_text.chars().take(200).collect::<String>()
     );
 
-    // evaluate returns known value
     let ev = c.call("evaluate", json!({"expression": "window.__gladiusValue"}));
     assert!(ev.get("isError").is_none(), "evaluate ok: {ev}");
     let ev_text = content_text(&ev);
     let ev_obj: Value = serde_json::from_str(&ev_text).expect("evaluate json");
-    // Numeric compare (as_f64): engines differ in number shape (some return
-    // `42`, others `42.0`) while the VALUE is identical.
     assert_eq!(
         ev_obj.get("value").and_then(|v| v.as_f64()),
         Some(42.0),
         "known value: {ev_text}"
     );
 
-    // click toggles the element
     let clk = c.call("click", json!({"element": "#toggle"}));
     assert!(clk.get("isError").is_none(), "click ok: {clk}");
     let toggled = c.call(
@@ -237,7 +223,6 @@ fn e2e_mcp_fixture_flow() {
         "click toggled: {toggled_text}"
     );
 
-    // screenshot returns a non-empty PNG image block
     let shot = c.call("screenshot", json!({}));
     assert!(shot.get("isError").is_none(), "screenshot ok: {shot}");
     let img = shot
@@ -266,7 +251,6 @@ fn e2e_mcp_fixture_flow() {
         data.chars().take(24).collect::<String>()
     );
 
-    // type into the input, value lands via JS property path
     let typed = c.call("type", json!({"element": "#name", "text": "hello-42"}));
     assert!(typed.get("isError").is_none(), "type ok: {typed}");
     let val = c.call(
@@ -279,7 +263,6 @@ fn e2e_mcp_fixture_flow() {
         "typed value present: {val_text}"
     );
 
-    // type with submit=true submits the form (Enter key -> onsubmit)
     let sub = c.call(
         "type",
         json!({"element": "#name", "text": "world", "submit": true}),
@@ -295,7 +278,6 @@ fn e2e_mcp_fixture_flow() {
         "form submitted: {got_text}"
     );
 
-    // wait_for: existing selector and existing text resolve ok
     let wsel = c.call("wait_for", json!( {"selector": "#toggle"}));
     assert!(
         wsel.get("isError").is_none(),
@@ -303,7 +285,6 @@ fn e2e_mcp_fixture_flow() {
     );
     let wtxt = c.call("wait_for", json!({"text": "GLADIUS_MARKER_hello-12345"}));
     assert!(wtxt.get("isError").is_none(), "wait_for text ok: {wtxt}");
-    // wait_for: missing selector times out as a tool error (not a protocol error)
     let wmiss = c.call(
         "wait_for",
         json!({"selector": "#no-such-element-xyz", "ms": 500}),
@@ -317,7 +298,6 @@ fn e2e_mcp_fixture_flow() {
         "wait_for timeout message: {wmiss}"
     );
 
-    // fetch_text against a one-shot localhost server (plain HTTP, no browser)
     let port = serve_once(
         "<!doctype html><html><head><title>t</title></head><body><h1>FETCH_HELLO marker-999</h1><script>var hidden_xyz=1;</script></body></html>",
     );
@@ -340,11 +320,9 @@ fn e2e_mcp_fixture_flow() {
         "fetch_text drops script: {fetched_text}"
     );
 
-    // close kills the browser
     let closed = c.call("close", json!({}));
     assert!(closed.get("isError").is_none(), "close ok: {closed}");
 
-    // EOF the server and expect a clean exit (proves no hang, no orphan hold).
     drop(c.stdin);
     let mut exited = false;
     for _ in 0..100 {

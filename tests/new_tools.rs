@@ -31,8 +31,6 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
-        // resolves from its versioned cache with no env override.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -156,7 +154,6 @@ fn hover_dispatches_mouse_move() {
         "mouseover fired via real mouse move: {got_text}"
     );
 
-    // Missing element is a tool error, not a protocol error.
     let miss = c.call("hover", json!({"element": "#no-such-element-xyz"}));
     assert!(
         miss.get("isError").is_some(),
@@ -175,7 +172,6 @@ fn select_by_value_and_text() {
     let nav = c.call("navigate", json!({"url": fixture_url()}));
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // By value (preferred).
     let s1 = c.call("select", json!({"element": "#color", "value": "g"}));
     assert!(s1.get("isError").is_none(), "select value ok: {s1}");
     let v1 = c.call(
@@ -197,7 +193,6 @@ fn select_by_value_and_text() {
         content_text(&r1)
     );
 
-    // By visible text.
     let s2 = c.call("select", json!({"element": "#color", "text": "Blue"}));
     assert!(s2.get("isError").is_none(), "select text ok: {s2}");
     let v2 = c.call(
@@ -210,7 +205,6 @@ fn select_by_value_and_text() {
         content_text(&v2)
     );
 
-    // Missing option / element / non-select / no selector args.
     let no_opt = c.call("select", json!({"element": "#color", "value": "zzz"}));
     assert!(
         no_opt.get("isError").is_some(),
@@ -244,7 +238,6 @@ fn key_presses_real_keys() {
     let nav = c.call("navigate", json!({"url": fixture_url()}));
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // Backspace deletes the last char of the focused input.
     let typed = c.call("type", json!({"element": "#name", "text": "ab"}));
     assert!(typed.get("isError").is_none(), "type ok: {typed}");
     let back = c.call("key", json!({"key": "Backspace"}));
@@ -259,8 +252,6 @@ fn key_presses_real_keys() {
         "Backspace deleted last char, got: {val_text}"
     );
 
-    // Enter on the focused input submits the form (same default action
-    // the `type` submit path relies on).
     let typed2 = c.call("type", json!({"element": "#name", "text": "hello-key"}));
     assert!(typed2.get("isError").is_none(), "type ok: {typed2}");
     let enter = c.call("key", json!({"key": "Enter"}));
@@ -275,7 +266,6 @@ fn key_presses_real_keys() {
         content_text(&got)
     );
 
-    // Escape is accepted (no-op on this page, but proves the mapping).
     let esc = c.call("key", json!({"key": "Escape"}));
     assert!(esc.get("isError").is_none(), "key Escape ok: {esc}");
 
@@ -307,7 +297,6 @@ fn tabs_list_new_select_close() {
     );
     assert_eq!(arr0[0].get("index"), Some(&json!(0)), "index 0: {l0}");
 
-    // Open a second tab on the same fixture page.
     let url = fixture_url();
     let opened = c.call("tabs", json!({"action": "new", "url": url}));
     assert!(opened.get("isError").is_none(), "tabs new ok: {opened}");
@@ -328,8 +317,6 @@ fn tabs_list_new_select_close() {
         "new tab becomes active: {l1}"
     );
 
-    // The new (active) tab loaded the fixture: wait + snapshot prove the
-    // other tools follow the tracked tab.
     let w = c.call("wait_for", json!({"selector": "#toggle", "ms": 10000}));
     assert!(w.get("isError").is_none(), "new tab loaded: {w}");
     let snap = c.call("snapshot", json!({}));
@@ -339,7 +326,6 @@ fn tabs_list_new_select_close() {
         "marker on new tab"
     );
 
-    // Back to the first tab: still the fixture, still tracked.
     let sel = c.call("tabs", json!({"action": "select", "index": 0}));
     assert!(sel.get("isError").is_none(), "tabs select ok: {sel}");
     let l2 = tabs_obj(&sel);
@@ -365,7 +351,6 @@ fn tabs_list_new_select_close() {
         "marker on tab 0 after select"
     );
 
-    // Bad index / action are tool errors.
     let bad_idx = c.call("tabs", json!({"action": "select", "index": 99}));
     assert!(
         bad_idx.get("isError").is_some(),
@@ -377,7 +362,6 @@ fn tabs_list_new_select_close() {
         "bad action isError: {bad_act}"
     );
 
-    // Close the second tab; one tracked tab remains.
     let closed_tab = c.call("tabs", json!({"action": "close", "index": 1}));
     assert!(
         closed_tab.get("isError").is_none(),

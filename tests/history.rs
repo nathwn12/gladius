@@ -176,7 +176,6 @@ fn history_walks_back_forward_and_reloads() {
         assert!(nav.get("isError").is_none(), "navigate {page} ok: {nav}");
     }
 
-    // Back twice: h3 -> h2 -> h1, reading location.href after each step.
     let b1 = hist_url(&mut c, "back");
     assert!(b1.get("isError").is_none(), "back ok: {b1}");
     let o1 = content_obj(&b1);
@@ -198,8 +197,6 @@ fn history_walks_back_forward_and_reloads() {
         "back lands on h1: {b2}"
     );
 
-    // One more back reaches the session's initial about:blank entry, and
-    // past THAT is the boundary: typed error, never a silent no-op.
     let b3 = hist_url(&mut c, "back");
     assert!(b3.get("isError").is_none(), "back to blank ok: {b3}");
     assert!(
@@ -221,7 +218,6 @@ fn history_walks_back_forward_and_reloads() {
         "boundary reason: {bend}"
     );
 
-    // Forward three times: blank -> h1 -> h2 -> h3.
     for (want, n) in [("/h1.html", 1), ("/h2.html", 2), ("/h3.html", 3)] {
         let f = hist_url(&mut c, "forward");
         assert!(f.get("isError").is_none(), "forward {n} ok: {f}");
@@ -240,7 +236,6 @@ fn history_walks_back_forward_and_reloads() {
         "boundary forward isError: {fend}"
     );
 
-    // Reload replays the current entry: still h3, marker intact.
     let rel = hist_url(&mut c, "reload");
     assert!(rel.get("isError").is_none(), "reload ok: {rel}");
     assert!(
@@ -260,7 +255,6 @@ fn history_walks_back_forward_and_reloads() {
         "reloaded page intact: {ev}"
     );
 
-    // Unknown action and missing action are typed.
     let bad = hist_url(&mut c, "bogus");
     assert!(bad.get("isError").is_some(), "unknown action: {bad}");
     assert_eq!(

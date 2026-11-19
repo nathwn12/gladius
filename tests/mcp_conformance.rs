@@ -120,7 +120,6 @@ fn exact_tools_capabilities(caps: &Value) {
 #[test]
 fn initialize_matrix() {
     let mut c = Client::spawn();
-    // 2025-06-18 echo
     let r = c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     assert_eq!(
         r.get("protocolVersion"),
@@ -138,7 +137,6 @@ fn initialize_matrix() {
     let instr = r.get("instructions").and_then(|v| v.as_str()).unwrap_or("");
     assert!(!instr.is_empty(), "instructions non-empty");
 
-    // 2025-11-25 echo
     let r = c.result("initialize", json!({"protocolVersion": "2025-11-25"}));
     assert_eq!(
         r.get("protocolVersion"),
@@ -147,7 +145,6 @@ fn initialize_matrix() {
     );
     exact_tools_capabilities(r.get("capabilities").expect("capabilities present"));
 
-    // 2026-07-28 -> 2025-11-25
     let r = c.result("initialize", json!({"protocolVersion": "2026-07-28"}));
     assert_eq!(
         r.get("protocolVersion"),
@@ -160,7 +157,6 @@ fn initialize_matrix() {
         "initialize never carries resultType: {r}"
     );
 
-    // unknown -> 2025-11-25
     let r = c.result("initialize", json!({"protocolVersion": "1999-01-01"}));
     assert_eq!(
         r.get("protocolVersion"),
@@ -203,7 +199,6 @@ fn discover_contract() {
 #[test]
 fn tools_list_versioning() {
     let mut c = Client::spawn();
-    // modern -> resultType complete + 25 tools
     let modern = c.result(
         "tools/list",
         json!({"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}),
@@ -219,7 +214,6 @@ fn tools_list_versioning() {
         .expect("tools array");
     assert_eq!(tools.len(), 25, "25 tools, got {}", tools.len());
 
-    // legacy -> no resultType
     let legacy = c.result("tools/list", json!({}));
     assert!(
         legacy.get("resultType").is_none(),
@@ -235,7 +229,6 @@ fn tools_list_versioning() {
 #[test]
 fn tools_call_close_versioning() {
     let mut c = Client::spawn();
-    // modern close
     let modern = c.result(
         "tools/call",
         json!({"name": "close", "arguments": {}, "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}),
@@ -250,7 +243,6 @@ fn tools_call_close_versioning() {
         "close content present: {modern}"
     );
 
-    // legacy close
     let legacy = c.result("tools/call", json!({"name": "close", "arguments": {}}));
     assert!(
         legacy.get("resultType").is_none(),
@@ -385,9 +377,6 @@ fn strict_framing_invalid_id_types() {
 #[test]
 fn strict_framing_non_utf8_is_a_parse_error_and_the_session_survives() {
     let mut c = Client::spawn();
-    // One invalid UTF-8 byte inside an otherwise well-formed frame. A JSON-RPC
-    // peer answers -32700 and keeps serving; it must not die on the byte (the
-    // reader used to surface this as an io::Error and end the whole session).
     let mut frame = br#"{"jsonrpc":"2.0","id":7,"method":"ping","x":""#.to_vec();
     frame.push(0x80);
     frame.push(b'"');
@@ -397,7 +386,6 @@ fn strict_framing_non_utf8_is_a_parse_error_and_the_session_survives() {
     let err = resp.get("error").expect("non-utf8 frame must be error");
     assert_eq!(err.get("code"), Some(&json!(-32700)), "code: {resp}");
     assert_eq!(resp.get("id"), Some(&json!(null)), "id null: {resp}");
-    // The session is still alive: a normal frame after the bad one round-trips.
     let ping = c.request("ping", json!({}));
     assert!(ping.get("error").is_none(), "session must survive: {ping}");
     assert_eq!(ping.get("result"), Some(&json!({})), "ping: {ping}");
@@ -416,7 +404,6 @@ fn unterminated_final_frame_is_answered_then_eof_exits_clean() {
     let mut child = cmd.spawn().expect("spawn gladius mcp");
     {
         let mut stdin = child.stdin.take().expect("child stdin");
-        // No trailing newline, then close: the frame is data, the next read is EOF.
         stdin
             .write_all(br#"{"jsonrpc":"2.0","id":11,"method":"ping"}"#)
             .expect("write unterminated frame");
@@ -436,7 +423,6 @@ fn unterminated_final_frame_is_answered_then_eof_exits_clean() {
 #[test]
 fn valid_id_types_echo() {
     let mut c = Client::spawn();
-    // string id executes and echoes
     c.send_line(r#"{"jsonrpc":"2.0","id":"abc-1","method":"ping","params":{}}"#);
     let resp = c.recv_timeout(Duration::from_secs(10), "string id");
     assert!(
@@ -453,7 +439,6 @@ fn valid_id_types_echo() {
         Some(&json!({})),
         "string id result: {resp}"
     );
-    // numeric id executes and echoes
     c.send_line(r#"{"jsonrpc":"2.0","id":42,"method":"ping","params":{}}"#);
     let resp = c.recv_timeout(Duration::from_secs(10), "numeric id");
     assert!(
@@ -493,11 +478,8 @@ fn expected_hints(name: &str) -> (bool, bool, bool, bool) {
         "tabs" => (false, true, false, true),
         "close" => (false, true, true, false),
         "storage" => (false, true, false, false),
-        // Geometry without pixels: read-only. `assert_layout` may write
-        // one screenshot on failure, which is still a read of the page.
         "assert_layout" => (true, false, true, false),
         "layout" => (true, false, true, false),
-        // Writes baseline files (and can delete them): not read-only.
         "visual" => (false, true, false, false),
         other => panic!("unexpected tool {other}"),
     }
@@ -629,11 +611,9 @@ fn tools_call_close_structured() {
 #[test]
 fn notification_silence_then_ping() {
     let mut c = Client::spawn();
-    // notification: no id -> no response
     c.send_line(r#"{"jsonrpc":"2.0","method":"ping","params":{}}"#);
     let got = c.try_recv(Duration::from_secs(2));
     assert!(got.is_none(), "notification must be silent, got {got:?}");
-    // server still alive
     let pong = c.result("ping", json!({}));
     assert_eq!(pong, json!({}), "ping replies {{}}");
 }

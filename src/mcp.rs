@@ -138,9 +138,6 @@ fn server_info() -> Value {
     if let Some(url) = info.get("cdpUrl") {
         m.insert("cdpUrl".to_string(), url.clone());
     }
-    // Preserved extras (moved out of capabilities): tool count derived
-    // from the real tool list (never hardcoded), and `gated` names the
-    // render-dependent tools refused on the CURRENT backend.
     let tool_count = crate::tools::list()
         .get("tools")
         .and_then(|t| t.as_array())
@@ -193,19 +190,11 @@ fn needs_exec_lock(name: &str, args: &Value) -> bool {
     match name {
         "navigate" | "click" | "type" | "select" | "upload" | "key" | "hover" | "viewport"
         | "tabs" | "history" | "cdp" | "evaluate" | "close" => true,
-        // Only the deterministic capture mutates page-visible state (metrics
-        // override, emulated media, freeze stylesheet) and restores it; a
-        // plain screenshot is a read of the current surface and stays
-        // lock-free. `assert_layout` locks only when its screenshotOnFail
-        // capture runs.
         "screenshot" => args
             .get("deterministic")
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
         "assert_layout" => {
-            // The freeze walk (S1.6) mutates page-visible state exactly like a
-            // deterministic capture, so a deterministic assert_layout must hold
-            // the same locks; without either flag it stays a pure read.
             args.get("screenshotOnFail")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
@@ -214,9 +203,6 @@ fn needs_exec_lock(name: &str, args: &Value) -> bool {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false)
         }
-        // `visual` writes baseline files and opens a scratch target for the
-        // in-engine diff: serialise it with the mutating tools so a compare
-        // cannot race another page action mid-capture.
         "visual" => true,
         "targets" => {
             args.get("action")
@@ -275,9 +261,6 @@ fn needs_critical_section(name: &str, args: &Value) -> bool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
         "assert_layout" => {
-            // A deterministic measurement applies the freeze walk and restores
-            // it, so a cancel must wait for that section exactly as it does for
-            // a deterministic capture (S1.6).
             args.get("screenshotOnFail")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
@@ -311,22 +294,13 @@ fn abort_after_critical(handle: JoinHandle<()>, critical: Arc<Mutex<()>>) {
     tokio::spawn(async move {
         match tokio::time::timeout(CANCEL_GRACE, critical.lock()).await {
             Ok(guard) => {
-                // Test-only: widen the window between acquiring the gate and
-                // issuing the abort, so the entry-race test can prove a
-                // queued task cannot enter the section in between.
                 if let Some(ms) = test_abort_hold_ms() {
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
-                // Test-only: leave the abort unissued. Simulates "the abort
-                // never arrived", which makes the section's own liveness
-                // recheck the ONLY thing keeping a cancelled task out - the
-                // test uses it to prove that recheck works.
                 if test_abort_skip() {
                     drop(guard);
                     return;
                 }
-                // The abort is issued WHILE the gate is held; the guard is
-                // dropped only after it. No await between the two.
                 handle.abort();
                 drop(guard);
             }
@@ -428,8 +402,6 @@ async fn commit_emit(
     if let Some(st) = map.get_mut(key) {
         st.emitted = true;
     }
-    // Unbounded send only fails when the writer is gone (shutdown); report
-    // unsent so callers never assume delivery. Cleanup still happens.
     let sent = tx.send(resp).is_ok();
     map.remove(key);
     sent
@@ -577,9 +549,6 @@ pub async fn serve() -> Result<(), String> {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
     let (writer_done_tx, mut writer_done_rx) = oneshot::channel::<()>();
-    // Awaited exactly once, on the shutdown path below. The read loop
-    // watches `writer_done_rx`, never the handle itself, so a completed
-    // handle is never polled twice (`JoinHandle polled after completion`).
     let writer_handle: JoinHandle<()> = tokio::spawn(async move {
         let mut out = tokio::io::stdout();
         while let Some(v) = rx.recv().await {
@@ -595,19 +564,11 @@ pub async fn serve() -> Result<(), String> {
         let _ = writer_done_tx.send(());
     });
 
-    // Raw bytes, not `lines()`: `Lines` refuses a frame that is not valid
-    // UTF-8 with an `io::Error` (InvalidData), and that used to end the whole
-    // session on ONE malformed byte - a valid JSON-RPC answer to a bad frame
-    // is `-32700 parse error`, not process death. `read_frame` therefore reads
-    // bytes, strips the frame terminator like `lines()` did, and reports
-    // invalid UTF-8 as its own variant so the loop can answer and keep serving.
     let mut reader = BufReader::new(tokio::io::stdin());
     loop {
         let next: FrameRead = tokio::select! {
             biased;
             _ = &mut writer_done_rx => {
-                // Writer exited (stdout gone or broken): stop accepting.
-                // Shared shutdown below closes the browser and exits 0.
                 break;
             }
             next = read_frame(&mut reader) => {
@@ -617,8 +578,6 @@ pub async fn serve() -> Result<(), String> {
         let line = match next {
             FrameRead::Eof => break, // EOF: cleanup below.
             FrameRead::NotUtf8 => {
-                // A frame that is not valid UTF-8 cannot be JSON text, so it is
-                // a parse error like any other (id null: no id is recoverable).
                 if send_resp(
                     &tx,
                     json!({"jsonrpc": "2.0", "id": null,
@@ -650,8 +609,6 @@ pub async fn serve() -> Result<(), String> {
                 continue;
             }
         };
-        // Strict framing: batch arrays and non-object scalars are one
-        // -32600 with id null (never silent).
         if req.is_array() || !req.is_object() {
             if send_resp(
                 &tx,
@@ -668,14 +625,6 @@ pub async fn serve() -> Result<(), String> {
             .as_object()
             .map(|o| o.contains_key("id"))
             .unwrap_or(false);
-        // Strict JSON-RPC version first: `jsonrpc` must be exactly "2.0" on
-        // EVERY frame (requests and notifications alike), BEFORE id handling,
-        // supersession, method extraction, or cancellation dispatch. A
-        // wrong-version frame is -32600 (echoing a valid string/number id,
-        // else null) and never disturbs a live call: without this, an
-        // invalid-version `notifications/cancelled` would abort the task it
-        // names, and an invalid-version frame carrying a live id would
-        // supersede (cancel) it.
         if req.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
             let echo = match req.get("id") {
                 Some(v) if v.is_string() || v.is_number() => v.clone(),
@@ -692,19 +641,6 @@ pub async fn serve() -> Result<(), String> {
             }
             continue;
         }
-        // Id presence/type next. A frame carrying an `id`
-        // key with bool/object/array type is immediately rejected -32600
-        // with id null: no supersession, no method dispatch, so a malformed
-        // frame can never cancel or disturb a live call.
-        // A valid id (string/number/null) supersedes any in-flight call
-        // with the same canonical id first — flagged cancelled, aborted,
-        // entry removed — so at most one response is ever emitted per
-        // IN-FLIGHT id (completed ids are free for sequential reuse).
-        // Completed ids are free: sequential reuse is normal JSON-RPC, not
-        // a duplicate. The superseded task's epilogue sees a missing entry
-        // and stays silent. This covers fast methods too: a duplicate
-        // ping/tools/list with an in-flight call id kills the call; only
-        // the fast response emits.
         if has_id {
             let raw = req.get("id").cloned().unwrap_or(Value::Null);
             if !(raw.is_string() || raw.is_number() || raw.is_null()) {
@@ -730,7 +666,6 @@ pub async fn serve() -> Result<(), String> {
             };
             map.remove(&key);
             drop(map);
-            // Same rule as `handle_cancel`: never drop a future mid-restore.
             if let Some((h, critical)) = taken {
                 abort_after_critical(h, critical);
             }
@@ -740,8 +675,6 @@ pub async fn serve() -> Result<(), String> {
             .and_then(|m| m.as_str())
             .unwrap_or("")
             .to_string();
-        // Cancellation is a notification: never a response, even when it
-        // carries an `id` of its own.
         if method == "notifications/cancelled" {
             handle_cancel(&req, &registry, &tx).await;
             if tx.is_closed() {
@@ -763,10 +696,6 @@ pub async fn serve() -> Result<(), String> {
         }
     }
 
-    // Shutdown (EOF or dead stdout): stop accepting, abort every in-flight
-    // call (aborted calls emit no response), give the writer up to 2s to
-    // flush what is already queued, close the browser, exit 0. Bounded
-    // throughout: never hangs, never panics.
     {
         let mut map = registry.lock().await;
         for (_, mut st) in map.drain() {
@@ -806,15 +735,9 @@ async fn handle_cancel(req: &Value, registry: &Registry, tx: &mpsc::UnboundedSen
     }
     st.cancelled = true;
     st.emitted = true;
-    // Answer NOW: the caller waited in silence for up to CANCEL_GRACE before
-    // this release. The restore keeps running behind the answer, so the page
-    // is still cleaned up - the answer just stops being held hostage to it.
     let tool = st.tool.clone();
     let _ = tx.send(json!({"jsonrpc": "2.0", "id": rid.clone(),
         "result": cancelled_result(&tool)}));
-    // Take the handle + its section gate out under the lock, then abort from
-    // a detached waiter so the read loop is never blocked by a capture that
-    // is finishing its restore (see `abort_after_critical`).
     let taken = st.handle.take().map(|h| (h, st.critical.clone()));
     map.remove(&key);
     evict_stale_locked(&mut map);
@@ -840,8 +763,6 @@ async fn dispatch_call(
     gen_ctr: &Arc<AtomicU64>,
     tx: &mpsc::UnboundedSender<Value>,
 ) {
-    // JSON-RPC notifications (no `id`) get NO response, whatever the method:
-    // a tools/call notification never executes.
     if !req
         .as_object()
         .map(|o| o.contains_key("id"))
@@ -897,9 +818,6 @@ async fn dispatch_call(
     }
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     let mut args = args;
-    // The per-call budget (S2.3): `_budgetMs` is stripped here so no tool's
-    // unknown-argument gate ever sees it, and a value that cannot be honoured
-    // is refused as a tool result, never silently replaced.
     let budget = match call_budget(&mut args) {
         Ok(b) => b,
         Err(e) => {
@@ -912,18 +830,6 @@ async fn dispatch_call(
     };
     let key = id_key(&id);
     let gen = gen_ctr.fetch_add(1, Ordering::Relaxed);
-    // Duplicate-id supersession BEFORE the semaphore decision (idempotent
-    // with the top-level supersede in the read loop, which already removed
-    // any live entry for this id): an in-flight entry for this id is cancelled, aborted, and removed, so at most the
-    // newest generation can ever emit for the id. Completed ids are free:
-    // sequential reuse is normal JSON-RPC and always proceeds as a fresh
-    // call. Its epilogue then sees a
-    // missing/stale entry and stays silent. The lock is released before the
-    // semaphore acquisition below: never held across it or tool execution.
-    // (Invalid-id frames never reach dispatch: the read loop rejects them
-    // -32600 before supersession. Valid-but-malformed duplicates — bad
-    // method/tool/params — still supersede here, and their error is the
-    // single in-flight response for the id.)
     {
         let mut map = registry.lock().await;
         if let Some(old) = map.get_mut(&key) {
@@ -937,8 +843,6 @@ async fn dispatch_call(
     let permit = match sem.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            // The superseded old call is already silent; the busy error is
-            // the single response for this id.
             let _ = send_resp(
                 tx,
                 json!({"jsonrpc": "2.0", "id": id,
@@ -947,11 +851,6 @@ async fn dispatch_call(
             return;
         }
     };
-    // Placeholder BEFORE spawn: the task can never finish before its entry
-    // exists. No duplicate can be present here (superseded above, and
-    // dispatch runs sequentially on the read loop); a present entry would
-    // mean a task finished between the blocks, which is impossible without
-    // an entry — defensively abort it rather than leak its handle.
     let critical = Arc::new(Mutex::new(()));
     {
         let mut map = registry.lock().await;
@@ -964,7 +863,6 @@ async fn dispatch_call(
             None => None,
         };
         if let Some((h, prev_critical)) = taken {
-            // Finish any restore before dropping the previous future.
             abort_after_critical(h, prev_critical);
         }
         map.insert(
@@ -989,21 +887,12 @@ async fn dispatch_call(
     let key_task = key.clone();
     let tool_name = name.clone();
     let handle: JoinHandle<()> = tokio::spawn(async move {
-        // The permit releases when the task ends (normal, abort, panic).
         let _permit = permit;
         if !is_live(&registry_task, &key_task, gen).await {
             remove_if_mine(&registry_task, &key_task, gen).await;
             return;
         }
-        // ONE total budget for the whole call (S2.3): the lock wait, the
-        // section wait and the tool work all share this deadline, so the
-        // budget bounds the call rather than one phase of it.
         let deadline = tokio::time::Instant::now() + budget;
-        // Phase 1 - the execution lock. Acquired HERE, by the dispatch task,
-        // not inside the work future: a budget timeout then answers and
-        // returns, which releases the lock (and the permit) at once instead of
-        // leaving them held by the wedged call. A cancelled task waiting here
-        // aborts cleanly: the lock future is dropped, the tool never runs.
         let exec_guard = if lock_needed {
             match tokio::time::timeout_at(deadline, exec.clone().lock_owned()).await {
                 Ok(g) => Some(g),
@@ -1028,8 +917,6 @@ async fn dispatch_call(
             remove_if_mine(&registry_task, &key_task, gen).await;
             return;
         }
-        // Test-only: park in the window between the liveness check and the
-        // section gate so a cancel can land exactly there.
         if let Some(ms) = test_entry_ms() {
             if tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(ms)))
                 .await
@@ -1049,9 +936,6 @@ async fn dispatch_call(
                 return;
             }
         }
-        // Phase 2 - the section gate: held for the WHOLE call by the work task
-        // below, so a cancel can only abort after the capture/compare has
-        // restored what it touched (see `abort_after_critical`).
         let section = if section_needed {
             match tokio::time::timeout_at(deadline, critical_task.clone().lock_owned()).await {
                 Ok(g) => Some(g),
@@ -1073,17 +957,10 @@ async fn dispatch_call(
         } else {
             None
         };
-        // DECISIVE liveness recheck, under the gate: a cancel that landed while
-        // we were waiting for the gate must stop us HERE. Without this the task
-        // could enter the mutating section just before the waiter's abort and
-        // leave the page mid-override.
         if !is_live(&registry_task, &key_task, gen).await {
             remove_if_mine(&registry_task, &key_task, gen).await;
             return;
         }
-        // Phase 3 - the tool work, in its own task (see `CallWork`) so the
-        // budget can release the execution lock while a section-holding call
-        // finishes its restore. A panic is caught there and becomes `-32603`.
         let mut work = CallWork::spawn(async move {
             let _section = section;
             std::panic::AssertUnwindSafe(async { tools::call(&name, &args, &browser).await })
@@ -1100,16 +977,8 @@ async fn dispatch_call(
                 }
                 Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
             }
-            // The work task panicked (caught above) or died at the join.
             Ok(Ok(Err(_))) | Ok(Err(_)) => Some(panic_response(&id)),
             Err(_) => {
-                // Budget exceeded: answer typed and immediately, then release
-                // the execution lock and the permit so the next call can run
-                // instead of queueing behind a wedged one. A call that mutates
-                // page state and restores it is NOT dropped mid-section: it
-                // keeps running detached, holding only the section gate, so
-                // the page is still cleaned up. Anything else has nothing to
-                // restore and is cancelled here.
                 drop(exec_guard);
                 commit_budget(
                     &registry_task,
@@ -1136,14 +1005,9 @@ async fn dispatch_call(
     {
         let mut map = registry.lock().await;
         match map.get_mut(&key) {
-            // Our placeholder still current: record the handle for cancel.
             Some(st) if st.gen == gen && !st.emitted => {
                 st.handle = Some(handle);
             }
-            // A fast task already finished (its epilogue committed and
-            // removed the entry) or the entry was superseded/evicted: the
-            // handle is done or will exit silently on its own; aborting is
-            // a harmless no-op.
             _ => {
                 handle.abort();
             }
@@ -1152,7 +1016,6 @@ async fn dispatch_call(
 }
 
 async fn handle_fast(req: &Value, _browser: &Arc<Browser>) -> Option<Value> {
-    // JSON-RPC notifications (no `id`) get NO response, whatever the method.
     let has_id = req
         .as_object()
         .map(|o| o.contains_key("id"))
@@ -1160,16 +1023,12 @@ async fn handle_fast(req: &Value, _browser: &Arc<Browser>) -> Option<Value> {
     if !has_id {
         return None;
     }
-    // JSON-RPC request IDs: string, number, or null only. Boolean, object,
-    // and array IDs are Invalid Request: -32600 with id null (never echo
-    // the invalid value, never execute the method).
     let raw_id = req.get("id").cloned().unwrap_or(Value::Null);
     if !(raw_id.is_string() || raw_id.is_number() || raw_id.is_null()) {
         return Some(json!({"jsonrpc": "2.0", "id": null,
             "error": {"code": -32600, "message": "invalid request"}}));
     }
     let id = raw_id;
-    // Strict JSON-RPC: require jsonrpc=="2.0" and a (non-empty) string method.
     let jsonrpc_ok = req.get("jsonrpc").and_then(|v| v.as_str()) == Some("2.0");
     let method = match req.get("method").and_then(|m| m.as_str()) {
         Some(m) if !m.is_empty() => m.to_string(),
@@ -1182,7 +1041,6 @@ async fn handle_fast(req: &Value, _browser: &Arc<Browser>) -> Option<Value> {
         return Some(json!({"jsonrpc": "2.0", "id": id,
             "error": {"code": -32600, "message": "invalid request"}}));
     }
-    // Per-request modern detection.
     let requested = requested_version(req);
     if let Some(ref v) = requested {
         if !is_supported(v) {
@@ -1268,15 +1126,10 @@ mod frame_read_tests {
 
     #[tokio::test]
     async fn terminator_shapes_match_lines() {
-        // `\n` and `\r\n` terminators are removed whole...
         assert_eq!(ours(b"x\n").await.0, vec!["x".to_string()]);
         assert_eq!(ours(b"x\r\n").await.0, vec!["x".to_string()]);
-        // ...but only ONE `\r` goes: the inner one is payload (this case read
-        // `x` for `x\r\r\n` before the terminal fix).
         assert_eq!(ours(b"x\r\r\n").await.0, vec!["x\r".to_string()]);
-        // A `\r` with no `\n` after it is payload, not a terminator.
         assert_eq!(ours(b"x\r").await.0, vec!["x\r".to_string()]);
-        // Consecutive frames keep their own shape.
         assert_eq!(
             ours(b"a\r\r\nb\r").await.0,
             vec!["a\r".to_string(), "b\r".to_string()]
@@ -1340,9 +1193,6 @@ mod frame_read_tests {
             "differential compared too little to mean anything: {total_payloads} payloads"
         );
 
-        // The one intended divergence: `Lines` refuses invalid UTF-8 with an
-        // io::Error, ours reports `NotUtf8` so the session can answer -32700
-        // and keep serving. Pinned so the difference stays deliberate.
         let invalid = &b"{\"jsonrpc\":\"2.0\",\"x\":\"\x80\"}\n"[..];
         assert!(reference(invalid).await.is_err(), "Lines must reject it");
         assert_eq!(ours(invalid).await.1, 1, "ours must report NotUtf8");
@@ -1407,7 +1257,6 @@ mod concurrency_tests {
     async fn commit_silent_on_stale_generation() {
         let reg = test_registry();
         let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-        // Newest generation owns the entry; the old task must not touch it.
         reg.lock().await.insert("1".to_string(), live_state(2));
         let resp = json!({"jsonrpc": "2.0", "id": 1, "result": {}});
         assert!(!commit_emit(&reg, "1", 1, resp, &tx).await);
@@ -1429,7 +1278,6 @@ mod concurrency_tests {
     /// `tests/concurrency.rs::cancel_while_queued_never_enters_the_section`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abort_waiter_takes_the_section_gate_first() {
-        // A child task standing in for the cancelled call.
         let child = tokio::spawn(async {
             std::future::pending::<()>().await;
         });
@@ -1437,14 +1285,12 @@ mod concurrency_tests {
         std::env::set_var("GLADIUS_TEST_ABORT_HOLD_MS", "600");
         abort_after_critical(child, gate.clone());
 
-        // During the hold the waiter owns the gate: nobody else can take it.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             gate.try_lock().is_err(),
             "the gate is held while the abort is pending (a queued task cannot enter)"
         );
 
-        // Once the abort is issued the gate is released again.
         tokio::time::sleep(Duration::from_millis(900)).await;
         assert!(
             gate.try_lock().is_ok(),
@@ -1488,7 +1334,6 @@ mod concurrency_tests {
             map.len()
         );
         assert!(map.contains_key("live"), "live entry kept");
-        // Under the bound nothing is touched.
         evict_stale_locked(&mut map);
         assert!(map.contains_key("live"), "no-op under bound");
     }
@@ -1508,7 +1353,6 @@ mod exec_lock_tests {
 
     #[test]
     fn capture_tools_hold_the_execution_lock() {
-        // The section gate only makes sense inside the execution lock.
         for (tool, args) in [
             ("screenshot", json!({"deterministic": true})),
             ("assert_layout", json!({"screenshotOnFail": true})),
@@ -1523,8 +1367,6 @@ mod exec_lock_tests {
                 "{tool} mutates page-visible state during a capture and must hold the exec lock"
             );
         }
-        // Plain reads of the current surface do not lock: a non-deterministic
-        // screenshot and an assert_layout without its capture are pure reads.
         assert!(!needs_exec_lock("screenshot", &json!({})));
         assert!(!needs_exec_lock(
             "screenshot",
@@ -1538,7 +1380,6 @@ mod exec_lock_tests {
                 "{tool} restores nothing, so it must stay abortable"
             );
         }
-        // Pure reads stay lock-free so they keep overlapping.
         for tool in ["snapshot", "wait_for", "fetch_text", "console", "network"] {
             assert!(
                 !needs_exec_lock(tool, &json!({})),

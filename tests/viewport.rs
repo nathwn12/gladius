@@ -36,8 +36,6 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
-        // resolves from its versioned cache with no env override.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -169,7 +167,6 @@ fn viewport_override_readback_reset_and_new_tab() {
     let mut c = Client::spawn();
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
 
-    // The tool is advertised with its parameter schema.
     let listed = c.result("tools/list", json!({}));
     let tools = listed
         .get("tools")
@@ -197,21 +194,14 @@ fn viewport_override_readback_reset_and_new_tab() {
     let nav = c.call("navigate", json!({"url": fixture_url()}));
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // Baseline = the engine's own default, measured before any override.
     let (dw, dh) = size_of(&mut c);
     eprintln!("ENGINE-DEFAULT-VIEWPORT: {dw}x{dh}");
 
-    // 1440x900.
     let env = c.viewport(json!({"width": 1440, "height": 900}));
     assert_eq!(readback(&env), (1440, 900), "1440x900 read-back: {env}");
     assert_eq!(env.get("matched"), Some(&json!(true)), "matched: {env}");
     assert_eq!(size_of(&mut c), (1440, 900), "page agrees: 1440x900");
 
-    // 390x844 (phone-sized), with the scale factor named. (No `mobile: true`
-    // here: on Chromium a mobile override on a page WITHOUT a viewport meta
-    // lays out at the 980px default - correct mobile behavior, honestly
-    // reported as `matched: false` - so the exact-match leg uses the desktop
-    // override, where the engine honours the size.)
     let env = c.viewport(json!({"width": 390, "height": 844, "deviceScaleFactor": 3}));
     assert_eq!(readback(&env), (390, 844), "390x844 read-back: {env}");
     assert_eq!(
@@ -223,12 +213,10 @@ fn viewport_override_readback_reset_and_new_tab() {
     );
     assert_eq!(size_of(&mut c), (390, 844), "page agrees: 390x844");
 
-    // A NAVIGATE keeps the override (it lives on the CDP session).
     let nav = c.call("navigate", json!({"url": fixture_url()}));
     assert!(nav.get("isError").is_none(), "re-navigate ok: {nav}");
     assert_eq!(size_of(&mut c), (390, 844), "override survived a navigate");
 
-    // A NEW TAB inherits the override (the session-scoped replay).
     let t = c.call("tabs", json!({"action": "new", "url": "about:blank"}));
     assert!(t.get("isError").is_none(), "tabs new ok: {t}");
     assert_eq!(
@@ -237,12 +225,10 @@ fn viewport_override_readback_reset_and_new_tab() {
         "new tab inherited the override"
     );
 
-    // reset -> the engine default, exactly the baseline measured above.
     let env = c.viewport(json!({"reset": true}));
     assert_eq!(readback(&env), (dw, dh), "reset read-back: {env}");
     assert_eq!(size_of(&mut c), (dw, dh), "page agrees: default back");
 
-    // A new tab opened AFTER reset gets the default too.
     let t = c.call("tabs", json!({"action": "new", "url": "about:blank"}));
     assert!(t.get("isError").is_none(), "tabs new ok: {t}");
     assert_eq!(
@@ -251,7 +237,6 @@ fn viewport_override_readback_reset_and_new_tab() {
         "post-reset new tab is at the engine default"
     );
 
-    // Refusals stay typed tool errors, never a silent no-op.
     let zero = c.call("viewport", json!({"width": 0, "height": 100}));
     assert!(zero.get("isError").is_some(), "zero width refused: {zero}");
     assert!(
@@ -324,9 +309,6 @@ fn viewport_input_schema_models_reset_branches() {
     let closed = c.call("close", json!({}));
     assert!(closed.get("isError").is_none(), "close ok: {closed}");
     shutdown(c);
-    // reset:false alone is invalid (runtime requires width/height);
-    // reset:false or absent with width+height is valid; reset:true is
-    // valid with or without dimensions (the runtime ignores them).
     for (args, want) in [
         (json!({"reset": false}), false),
         (json!({"reset": false, "width": 800, "height": 600}), true),

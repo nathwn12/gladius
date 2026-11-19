@@ -1,53 +1,5 @@
 #!/usr/bin/env node
 'use strict';
-//
-// gladius-mcp launcher.
-//
-// Published package model (see docs/PUBLISHING.md): this tarball holds ONLY
-// this launcher plus the pinned browser/runtime manifest (engine-manifest.json).
-// It holds NO browser bytes, NO server bytes, NO `os` field, NO
-// `scripts`/postinstall field. npm 12 blocks dependency install scripts by
-// default (measured `allow-scripts=false`), and npx has no project
-// package.json for `allowScripts` to consult, so a postinstall download
-// would silently never run. Everything is therefore acquired on first RUN
-// by the code below.
-//
-// Two provisions, two caches, both verified:
-//   - The server runtime (manifest runtime.archive) downloads from the
-//     tagged GitHub Release, verifies zip sha256+size BEFORE extraction,
-//     extracts atomically (staging dir, then rename) into
-//     %LOCALAPPDATA%\gladius\engine\<serverVersion>-<bundleSha8>\, verifies
-//     the server binary against the manifest, writes a .ready marker, and
-//     is reused on later runs (re-verified each time).
-//   - The browser (manifest browser.asset) downloads from Google's
-//     Chrome-for-Testing endpoint, verifies zip sha256+size BEFORE
-//     extraction, extracts atomically into the owned browser cache
-//     %LOCALAPPDATA%\gladius\chromium\<version>-<zipSha8>\ (the same layout
-//     scripts/fetch-chromium.ps1 provisions), verifies every extracted file
-//     against the manifest (exact set, no extras), writes a .ready marker,
-//     and is reused on later runs (re-verified each time: marker + exe
-//     sha256 + a full name/size walk). Any mismatch refuses and writes
-//     nothing. The browser is NEVER redistributed: it is fetched here, at
-//     provision time, from Google.
-//   - The server (gladius.exe, no args = MCP stdio serve) spawns with
-//     GLADIUS_CHROMIUM pointed at the provisioned browser (the server reads
-//     that variable), unless the user already set it: an explicit
-//     GLADIUS_CHROMIUM wins, and then no browser is provisioned at all.
-//     The child env always carries GLADIUS_EXPECTED_VERSION set to this
-//     launcher's own package.json version, so the engine's fail-closed gate
-//     (src/main.rs) refuses instead of serving a mixed-version pair.
-//     stdio is inherited. ALL launcher chatter goes to stderr; stdout belongs
-//     to the MCP channel. No stdout writes exist on the run path.
-//   - `--doctor` / `--print-manifest` is the no-network diagnostic: it
-//     prints the manifest plus the resolved cache paths and exits 0. It
-//     returns BEFORE any fetch call (all fetch use lives in
-//     downloadToMemory, reachable only from the ensure* functions, which the
-//     diagnostic path never calls).
-//
-// Builtins only: node:fs, node:path, node:os, node:crypto,
-// node:child_process, node:zlib, and the global fetch (Node >= 22.14).
-// No dependencies, so the published tarball stays tiny and auditable.
-//
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -61,18 +13,10 @@ const MANIFEST_PATH = path.join(PKG_DIR, 'engine-manifest.json');
 const PKG_JSON_PATH = path.join(PKG_DIR, 'package.json');
 const PLATFORM_OVERRIDE_ENV = 'GLADIUS_MCP_ALLOW_NON_WINDOWS';
 const RUNTIME_CACHE_OVERRIDE_ENV = 'GLADIUS_ENGINE_CACHE';
-// Local-bundle override, diagnostics only. A normal run leaves it unset and
-// downloads runtime.archive from the Release. The pre-publish cleanroom names
-// the archive it just built, because the Release that would serve it does not
-// exist until AFTER the build job passes. Every size/sha256 assertion still
-// runs on the local bytes: an override can never smuggle in a bad artifact.
 const RUNTIME_BUNDLE_OVERRIDE_ENV = 'GLADIUS_ENGINE_BUNDLE';
 const BROWSER_CACHE_OVERRIDE_ENV = 'GLADIUS_CHROMIUM_CACHE';
 const BROWSER_PATH_OVERRIDE_ENV = 'GLADIUS_CHROMIUM';
 const DOWNLOAD_TIMEOUT_MS = 15 * 60 * 1000;
-// Staging/extraction guards: the real runtime bundle is small and the real
-// browser zip holds 288 entries / ~290 MB extracted. These caps reject zip
-// bombs, never the real artifacts.
 const MAX_ENTRIES = 4096;
 const MAX_TOTAL_UNCOMPRESSED = 2 * 1024 * 1024 * 1024;
 const MAX_ENTRY_SIZE = 1 * 1024 * 1024 * 1024;
@@ -86,9 +30,6 @@ function log(message) {
   process.stderr.write(`gladius-mcp: ${message}\n`);
 }
 
-// The launcher's own version (the referent the engine gate checks against).
-// Read fresh from package.json on every run: never a cached constant, never
-// a fixed tag.
 function loadPackageVersion() {
   let pkg;
   try {
@@ -116,10 +57,6 @@ function loadManifest() {
   }
 }
 
-// A sha256 slot the release workflow has not filled yet. The committed
-// manifest carries the sentinel for every hash computed at release time;
-// the workflow replaces each with the real 64-hex digest. Anything else
-// shaped (64 hex chars) is release-provisioned.
 function isPlaceholderSha(sha) {
   return typeof sha !== 'string' || !/^[0-9a-fA-F]{64}$/.test(sha);
 }
@@ -128,8 +65,6 @@ function shortHash(sha) {
   return isPlaceholderSha(sha) ? 'unpublished' : sha.toLowerCase().slice(0, 8);
 }
 
-// Resolved runtime cache directory. Never throws: the diagnostic path must
-// print SOMETHING and exit 0 even where provisioning could never run.
 function resolveRuntimeDir(manifest) {
   const notes = [];
   let root = process.env[RUNTIME_CACHE_OVERRIDE_ENV];
@@ -143,9 +78,6 @@ function resolveRuntimeDir(manifest) {
   return { dir: path.join(root, 'gladius', 'engine', leaf), overridden, notes };
 }
 
-// Resolved browser cache directory: the same owned layout
-// scripts/fetch-chromium.ps1 provisions (<version>-<zipSha8>). Never throws,
-// for the same diagnostic reason as above.
 function resolveBrowserDir(manifest) {
   const notes = [];
   let root = process.env[BROWSER_CACHE_OVERRIDE_ENV];
@@ -159,10 +91,6 @@ function resolveBrowserDir(manifest) {
   return { dir: path.join(root, 'gladius', 'chromium', leaf), overridden, notes };
 }
 
-// The built commit of an already-provisioned engine, read from its own
-// `--version` stamp (build.rs embeds it). `null` when no engine is provisioned
-// or the stamp cannot be read: the diagnostic must never fail or hang, so the
-// spawn is bounded and every error is a `null`.
 function engineCommit(runtimeDir, manifest) {
   if (runtimeDir.startsWith('<unresolvable>')) return null;
   const exe = path.join(runtimeDir, manifest.runtime.server.name);
@@ -183,9 +111,6 @@ function engineCommit(runtimeDir, manifest) {
 function printDoctor(manifest) {
   const runtime = resolveRuntimeDir(manifest);
   const browser = resolveBrowserDir(manifest);
-  // The built commit, and the engine's own stamp when one is already
-  // provisioned: "which bytes am I running" is a question about both sides,
-  // so the diagnostic names both instead of trusting the version string.
   const commit = typeof manifest.commit === 'string' && /^[0-9a-f]{40}$/.test(manifest.commit)
     ? manifest.commit
     : 'unpublished';
@@ -248,13 +173,6 @@ function usage(exitCode, stream) {
   process.exit(exitCode);
 }
 
-// --- minimal zip reader (stored + deflate, builtins only) -----------------
-// Both zips (the Compress-Archive runtime bundle, the CfT browser archive)
-// are ordinary deflate zips. Node has no builtin unzip, and this package is
-// dependency-free by design, so the container parse is hand-rolled here
-// (~120 lines) over zlib.inflateRawSync. Anything outside the artifacts'
-// actual shape (encryption, data descriptors, zip64, unknown methods) is an
-// explicit error, never a silent misparse.
 
 const CRC_TABLE = (() => {
   const t = new Int32Array(256);
@@ -273,7 +191,6 @@ function crc32(buf) {
 }
 
 function findEocd(buf) {
-  // EOCD is >= 22 bytes at the very end, with up to 64 KiB of comment.
   const lo = Math.max(0, buf.length - (65557 + 22));
   for (let i = buf.length - 22; i >= lo; i--) {
     if (buf.readUInt32LE(i) === 0x06054b50) return i;
@@ -318,16 +235,6 @@ function extractZip(buf, destDir) {
     total += uncompSize;
     if (total > MAX_TOTAL_UNCOMPRESSED) throw new Error('archive uncompressed total exceeds cap');
 
-    // Traversal guard: zip names normally use forward slashes, but
-    // PowerShell's Compress-Archive can write nested entry names
-    // with backslashes (e.g. `THIRD-PARTY-LICENSES\Apache-2.0.txt`). Split
-    // on `/` alone would treat those as one segment, so normalize every
-    // backslash to `/` FIRST, then run the unchanged checks below on the
-    // normalized name: absolute paths, drive letters, and `..` segments
-    // stay rejected, and a `..\..\evil.txt` entry still trips the `..`
-    // guard. The resolved target must still sit under destDir.
-    // (Spelled via char code so the source never holds a literal
-    // double-backslash.)
     const BACKSLASH = String.fromCharCode(92);
     const name = rawName.split(BACKSLASH).join('/');
     if (name.startsWith('/') || /^[A-Za-z]:/.test(name)) {
@@ -360,7 +267,6 @@ function extractZip(buf, destDir) {
   return extracted;
 }
 
-// --- provisioning ---------------------------------------------------------
 
 function sha256File(filePath) {
   const h = crypto.createHash('sha256');
@@ -369,7 +275,6 @@ function sha256File(filePath) {
 }
 
 function checkFile(filePath, want) {
-  // want: {name, sha256, size}. Returns null when good, else a reason.
   let st;
   try {
     st = fs.statSync(filePath);
@@ -383,9 +288,6 @@ function checkFile(filePath, want) {
   return null;
 }
 
-// Walk a cache dir into zip-relative names (forward slashes) with sizes.
-// The browser cache keeps the zip's own tree (root dir included), so the
-// walked names compare directly against the manifest file list.
 function walkFiles(dir) {
   const out = [];
   const visit = (d) => {
@@ -402,35 +304,7 @@ function walkFiles(dir) {
   return out;
 }
 
-// --- concurrent provisioning ---------------------------------------------
-//
-// Two MCP clients (two project directories in the same editor, two agents in
-// the same session) start this launcher at the same instant and resolve the
-// SAME cache leaf. Both then staged and renamed onto the same final path, and
-// each deleted that path on entry and on failure, so on Windows one process
-// got `EPERM ... rename` from the move and its cleanup deleted the tree the
-// other had just published; the winner then reported "server binary missing
-// after provisioning" and the whole tool namespace vanished (observed
-// 2026-10-23 against v0.4.5, engine 0.4.5-997b287f, two pids seconds apart).
-//
-// The shape below makes a shared cache safe without weakening any check:
-//   - ONE writer at a time, via an atomically-created `<cache>.lock` directory
-//     (`mkdirSync` is the only exclusive-create primitive Node has on Windows).
-//     Waiters poll; a lock whose owner pid is gone, or that outlives the hard
-//     ceiling without a heartbeat, is broken by renaming it aside so exactly
-//     one waiter can win the break.
-//   - A bounded retry on the transient Windows errors only (EPERM/EACCES/
-//     EBUSY: an indexer, an AV scanner, or a just-closed handle), never on a
-//     real failure. Every retry re-runs the same size/sha256 assertions.
-//   - "The final directory now verifies" is SUCCESS, not failure: that is the
-//     other process having just produced the exact bytes. A rename that loses
-//     the race therefore reuses the winner's cache instead of erroring.
-//   - Staging leftovers from a crashed run are reaped so they cannot pile up.
-//   - The final path is never deleted outside the lock, and never deleted in
-//     a failure path at all: a loser can no longer destroy a winner's cache.
 const LOCK_WAIT_MS = 25 * 60 * 1000;
-// A live owner heartbeats the lock directory at every phase, so this ceiling
-// only fires for a lock whose process is wedged, not for a slow download.
 const LOCK_STALE_MS = 30 * 60 * 1000;
 const STAGING_STALE_MS = 60 * 60 * 1000;
 const TRANSIENT_FS_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
@@ -451,7 +325,6 @@ function pidAlive(pid) {
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    // EPERM means the pid exists but belongs to someone we may not signal.
     return err.code === 'EPERM';
   }
 }
@@ -469,8 +342,6 @@ function heartbeatLock(lockDir) {
   try {
     fs.utimesSync(lockDir, now, now);
   } catch {
-    // The lock may have been broken and taken over; the release owner check
-    // below is what keeps that safe.
   }
 }
 
@@ -481,12 +352,9 @@ function releaseProvisionLock(lockDir) {
   try {
     fs.rmSync(lockDir, { recursive: true, force: true });
   } catch {
-    // Best effort: a leftover lock is broken by the stale rule on the next run.
   }
 }
 
-// Returns true when this caller moved a dead/slow lock out of the way. The
-// rename is the race-breaker: only one waiter can perform it.
 function breakStaleLock(lockDir, label) {
   let st;
   try {
@@ -497,8 +365,6 @@ function breakStaleLock(lockDir, label) {
   const owner = readLockOwner(lockDir);
   const age = Date.now() - st.mtimeMs;
   const ownerDead = owner && Number.isInteger(owner.pid) ? !pidAlive(owner.pid) : false;
-  // A lock is a directory. Anything else sitting on that path is corruption,
-  // not a live holder, so it is cleared without waiting for the ceiling.
   if (st.isDirectory() && !ownerDead && age < LOCK_STALE_MS) return false;
   const park = `${lockDir}.broken-${process.pid}-${Date.now()}`;
   try {
@@ -527,7 +393,6 @@ async function acquireProvisionLock(cacheDir, label) {
           JSON.stringify({ pid: process.pid, host: os.hostname(), since: new Date().toISOString(), label }, null, 2)
         );
       } catch {
-        // The directory itself is the lock; the owner file only names it.
       }
       return lockDir;
     } catch (err) {
@@ -559,9 +424,6 @@ async function acquireProvisionLock(cacheDir, label) {
   }
 }
 
-// Runs fn under the single-writer lock and always releases it, including when
-// fn throws. fn must throw on failure and must NOT call fail(): process.exit()
-// would skip the release.
 async function withProvisionLock(cacheDir, label, fn) {
   const lockDir = await acquireProvisionLock(cacheDir, label);
   try {
@@ -571,9 +433,6 @@ async function withProvisionLock(cacheDir, label, fn) {
   }
 }
 
-// A directory rename that loses to a concurrent mover, or to a handle an
-// indexer/AV has open, fails with one of the transient codes. Retry those
-// with short backoff; any other error is real and propagates at once.
 async function renameWithRetry(from, to, label) {
   let last = null;
   for (let i = 0; i < RENAME_BACKOFF_MS.length; i++) {
@@ -592,9 +451,6 @@ async function renameWithRetry(from, to, label) {
   return { ok: false, error: last };
 }
 
-// Remove a cache tree that cannot be used. Moved out of the final path first:
-// a half-deleted tree must never sit where the next run reads it as a cache.
-// Only called while holding the lock.
 async function removeCacheTree(target) {
   const park = `${target}.stale-${process.pid}-${Date.now()}`;
   const moved = await (async () => {
@@ -616,9 +472,6 @@ async function removeCacheTree(target) {
   fs.rmSync(park, { recursive: true, force: true });
 }
 
-// Reap leftovers of an earlier crashed provision next to this cache: staging
-// and parked trees whose pid is gone or that are older than any live run can
-// be. Best effort: a live or unreadable sibling is left alone.
 function reapStaleSiblings(cacheDir) {
   const parent = path.dirname(cacheDir);
   const base = path.basename(cacheDir) + '.';
@@ -649,7 +502,6 @@ function reapStaleSiblings(cacheDir) {
       fs.rmSync(full, { recursive: true, force: true });
       log(`removed an abandoned provisioning leftover: ${full}`);
     } catch {
-      // In use after all; the next run tries again.
     }
   }
 }
@@ -660,9 +512,6 @@ function describeCacheStatus(status) {
   return `present but did not verify (${status})`;
 }
 
-// The ONLY fetch call site in this package. The diagnostic path returns
-// before the ensure* functions, so --doctor/--print-manifest provably reach
-// no network: grep `fetch(` — it appears exactly once, here.
 async function downloadToMemory(url) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), DOWNLOAD_TIMEOUT_MS);
@@ -678,8 +527,6 @@ async function downloadToMemory(url) {
   return Buffer.from(await res.arrayBuffer());
 }
 
-// Cache state without trusting the marker: 'ok' means the server binary at
-// the final path matches the manifest name/size/sha256 exactly.
 function runtimeCacheStatus(cacheDir, rt) {
   let st;
   try {
@@ -694,9 +541,6 @@ function runtimeCacheStatus(cacheDir, rt) {
   return 'ok';
 }
 
-// The marker records what this launcher verified for the tree it published. It
-// is written INSIDE the staged tree, so the rename publishes a cache that is
-// already marked and a reader can never observe an unmarked final directory.
 function writeRuntimeMarker(dir, manifest, rt) {
   fs.writeFileSync(
     path.join(dir, '.ready'),
@@ -739,16 +583,12 @@ async function ensureRuntime(manifest, cacheDir) {
 
   try {
     await withProvisionLock(cacheDir, 'runtime', async (lockDir) => {
-      // The process we may have just waited behind can have finished: re-check
-      // under the lock before spending a download on the same bytes.
       if (reusable(false)) {
         log(`runtime cache ready (reused): ${cacheDir}`);
         return;
       }
       const status = runtimeCacheStatus(cacheDir, rt);
       if (status === 'ok') {
-        // A previous run published these exact bytes but never got to write
-        // the marker (killed between rename and marker). Adopt, don't refetch.
         log(`runtime cache bytes verify but are unmarked; adopting ${cacheDir}`);
         writeRuntimeMarker(cacheDir, manifest, rt);
         return;
@@ -773,11 +613,6 @@ async function ensureRuntime(manifest, cacheDir) {
 }
 
 async function provisionRuntime(manifest, cacheDir, rt, lockDir) {
-  // Local bundle override: the pre-publish cleanroom builds the archive in
-  // this same job, before any GitHub Release exists, so it hands the zip over
-  // instead of fetching a URL that cannot exist yet. The size and sha256
-  // checks below stay unconditional: a local zip that disagrees with the
-  // manifest is refused exactly like a corrupt download would be.
   const localBundle = process.env[RUNTIME_BUNDLE_OVERRIDE_ENV];
   const origin = localBundle ? 'local bundle' : 'download';
   let data;
@@ -801,8 +636,6 @@ async function provisionRuntime(manifest, cacheDir, rt, lockDir) {
   }
   heartbeatLock(lockDir);
 
-  // Integrity: mandatory on every path, first attempt or retry. A retry can
-  // never skip or weaken these two checks.
   if (data.length !== rt.archive.size) {
     throw new Error(`${origin} size ${data.length} != manifest ${rt.archive.size}; wrote nothing.`);
   }
@@ -813,8 +646,6 @@ async function provisionRuntime(manifest, cacheDir, rt, lockDir) {
 
   reapStaleSiblings(cacheDir);
 
-  // Extract into a staging dir, verify, then rename: the target dir is never
-  // observed half-written.
   const staging = `${cacheDir}.staging-${process.pid}`;
   fs.rmSync(staging, { recursive: true, force: true });
   try {
@@ -827,9 +658,6 @@ async function provisionRuntime(manifest, cacheDir, rt, lockDir) {
     heartbeatLock(lockDir);
     const moved = await renameWithRetry(staging, cacheDir, 'runtime');
     if (!moved.ok) {
-      // Windows refuses to move a directory onto one a concurrent process has
-      // just published. If that directory holds exactly the bytes this process
-      // verified, the race was won elsewhere and provisioning has SUCCEEDED.
       const status = runtimeCacheStatus(cacheDir, rt);
       if (status !== 'ok') {
         throw new Error(`${moved.error.message} (final dir ${describeCacheStatus(status)})`);
@@ -840,9 +668,6 @@ async function provisionRuntime(manifest, cacheDir, rt, lockDir) {
       return;
     }
   } catch (err) {
-    // Staging only. The final path is NEVER deleted here: it may hold the other
-    // process's good cache, and deleting it is what produced the original
-    // "server binary missing after provisioning" crash.
     fs.rmSync(staging, { recursive: true, force: true });
     throw err;
   }
@@ -868,10 +693,6 @@ function checkBrowserPin(browser) {
   }
 }
 
-// Re-verification on reuse: the marker must bind this exact pin, the exe
-// (the security-critical file) must match name/size/sha256, and a full
-// name/size walk must equal the manifest set (exact files, no extras).
-// Returns null when good, else a reason.
 function reverifyBrowserCache(dir, browser) {
   const exeRel = `${browser.root}/chrome-headless-shell.exe`;
   const exeWant = browser.files.find((f) => f.name === exeRel);
@@ -925,16 +746,12 @@ async function ensureBrowser(manifest, cacheDir) {
 
   try {
     await withProvisionLock(cacheDir, 'browser', async (lockDir) => {
-      // The process we may have waited behind can have finished: re-check
-      // before downloading ~120 MB of the same bytes.
       if (reusable(false)) {
         log(`browser cache ready (reused): ${cacheDir}`);
         return;
       }
       const reason = reverifyBrowserCache(cacheDir, browser);
       if (reason === null) {
-        // Exact manifest set present, only the marker is missing (a run killed
-        // between rename and marker). Adopt the bytes, don't refetch them.
         log(`browser cache verifies but is unmarked; adopting ${cacheDir}`);
         writeBrowserMarker(cacheDir, browser, asset);
         return;
@@ -990,7 +807,6 @@ async function provisionBrowser(manifest, cacheDir, browser, asset, lockDir) {
   }
   heartbeatLock(lockDir);
 
-  // Integrity: mandatory on every path, first attempt or retry.
   if (data.length !== asset.size) {
     throw new Error(`browser download size ${data.length} != manifest ${asset.size}; wrote nothing.`);
   }
@@ -1001,9 +817,6 @@ async function provisionBrowser(manifest, cacheDir, browser, asset, lockDir) {
 
   reapStaleSiblings(cacheDir);
 
-  // Extract into a staging dir, verify EVERY file against the manifest
-  // (exact set, no extras), then rename: the target dir is never observed
-  // half-written.
   const staging = `${cacheDir}.staging-${process.pid}`;
   fs.rmSync(staging, { recursive: true, force: true });
   try {
@@ -1034,8 +847,6 @@ async function provisionBrowser(manifest, cacheDir, browser, asset, lockDir) {
     heartbeatLock(lockDir);
     const moved = await renameWithRetry(staging, cacheDir, 'browser');
     if (!moved.ok) {
-      // Same rule as the runtime: if the final dir now matches the manifest
-      // exactly, another process won the race and provisioning succeeded.
       const reason = reverifyBrowserCache(cacheDir, browser);
       if (reason !== null) {
         throw new Error(`${moved.error.message} (final dir did not verify: ${reason})`);
@@ -1046,7 +857,6 @@ async function provisionBrowser(manifest, cacheDir, browser, asset, lockDir) {
       return;
     }
   } catch (err) {
-    // Staging only: the final path may hold the other process's good cache.
     fs.rmSync(staging, { recursive: true, force: true });
     throw err;
   }
@@ -1056,8 +866,6 @@ async function provisionBrowser(manifest, cacheDir, browser, asset, lockDir) {
 function runServer(cacheDir, manifest, browserExe) {
   const exe = path.join(cacheDir, manifest.runtime.server.name);
   if (!fs.existsSync(exe)) {
-    // Provisioning reported success, so this is a filesystem surprise, not a
-    // download problem: name the tree, its siblings, and what is left in it.
     let listing = '<unreadable>';
     try {
       listing = fs.readdirSync(cacheDir).join(', ') || '<empty>';
@@ -1069,11 +877,6 @@ function runServer(cacheDir, manifest, browserExe) {
       '`npx -y gladius-mcp@latest --doctor`.'
     );
   }
-  // Bare gladius with no args serves MCP over stdio (src/main.rs:
-  // None | Some("mcp") => serve). stdio is inherited so the child IS the
-  // MCP channel; the launcher writes nothing to stdout on this path.
-  // Ctrl+C reaches both processes on Windows (shared console), so no
-  // signal relay is needed; the exit code is forwarded below.
   const env = { ...process.env };
   if (browserExe) env[BROWSER_PATH_OVERRIDE_ENV] = browserExe;
   env.GLADIUS_EXPECTED_VERSION = loadPackageVersion();
@@ -1093,11 +896,6 @@ async function main() {
   const manifest = loadManifest();
   if (manifest.package !== 'gladius-mcp') fail('engine manifest names the wrong package.');
   const pkgVersion = loadPackageVersion();
-  // Fail closed on a stale manifest: the runtime cache leaf derives from
-  // manifest.serverVersion, so agreement here is what binds the selected
-  // cache directory to this launcher's version. Never take "whatever is
-  // cached": a skew refuses with the reinstall line instead of provisioning
-  // or serving a mixed-version pair.
   if (manifest.serverVersion !== pkgVersion) {
     fail(
       `version skew: launcher ${pkgVersion} vs manifest serverVersion ${manifest.serverVersion} ` +
@@ -1118,7 +916,6 @@ async function main() {
     if (unknown.length > 0) usage(2, process.stderr);
     printDoctor(manifest); // exits 0; no network on this path by construction
   }
-  // Every known flag returns above; anything left is unknown.
   if (args.length > 0) usage(2, process.stderr);
 
   if (process.platform !== 'win32' && process.env[PLATFORM_OVERRIDE_ENV] !== '1') {
@@ -1134,8 +931,6 @@ async function main() {
   }
   const readyRuntime = await ensureRuntime(manifest, runtime.dir);
 
-  // An explicit GLADIUS_CHROMIUM wins: the user's binary is their
-  // responsibility, so no browser is provisioned at all on that path.
   const override = process.env[BROWSER_PATH_OVERRIDE_ENV];
   if (override && override.trim() !== '') {
     log(`using explicit browser from ${BROWSER_PATH_OVERRIDE_ENV}: ${override}`);

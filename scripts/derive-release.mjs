@@ -1,61 +1,4 @@
 #!/usr/bin/env node
-// Derive the release version from history, so the release run produces the
-// version and the tag instead of trusting a hand-made tag.
-//
-// The old lane took its version FROM the pushed tag: `v0.7.0` decided the
-// version, the workflow only checked that the tree matched it. A tag that
-// disagreed with the manifests, or a tag cut before the gate was green, could
-// only be caught by a human reading the log. Here the history is the input:
-// the commits since the last release decide the hop, the manifests and the
-// changelog are checked against it, and the tag is created from it at the end
-// of the publish job (see .github/workflows/release.yml).
-//
-// MANIFESTS ARE ASSERTED, NEVER WRITTEN. This script reads Cargo.toml,
-// Cargo.lock, npm/package.json and npm/engine-manifest.json and refuses unless
-// every one of them ALREADY carries the derived version, so the release either
-// matches its history or stops in seconds. The release lane never repairs a
-// version: a tree that disagrees with its own commits is a defect to land in
-// that commit range, not a number for CI to guess. The only files written here
-// are CHANGELOG.md and the release-notes body, in --changelog mode, after the
-// gate is green.
-//
-// LEVEL
-//   major  a commit with `!` before the `:` in its subject, or a
-//          `BREAKING CHANGE:` / `BREAKING-CHANGE:` trailer in its body
-//   minor  any `feat:`
-//   patch  any `fix:` or `perf:`
-//   refuse everything else: a release with no user-visible change in it is
-//          not a release, it is a rerun waiting to happen.
-//   On 0.x a major hop moves the MINOR, so 0.6.2 + breaking -> 0.7.0.
-//
-// MODES
-//   (default)          derive + validate, print the derivation, write nothing.
-//   --dry-run          same, spelled out, and said so in the output.
-//   --json             derive + validate, print machine JSON, write nothing.
-//   --changelog        derive + validate, then close `## [Unreleased]` into
-//                      `## [X.Y.Z] - <UTC date>`. Idempotent: a second run
-//                      over an already-closed section changes nothing.
-//   --check            run the fixture cases; exit 0 only if every one passes.
-//   --repo <dir>       operate on <dir> instead of this script's parent.
-//   --date YYYY-MM-DD  heading date for --changelog (default: UTC today).
-//   --notes-out <path> also write the closed section as release-body markdown,
-//                      with the provenance footer (the commit and the
-//                      Cargo.lock digest the release was built from).
-//   --assert-body <p>  refuse a release body that does not name a 40-hex
-//                      commit; --commit <sha> also requires that exact commit.
-//
-// PROVENANCE (S3.4)
-//   The body written by --notes-out ends with a machine-checkable footer:
-//
-//     commit: <40-hex sha>
-//     cargo-lock-sha256: <64-hex digest>
-//
-//   so "which bytes is the user running?" is answerable from the release page
-//   instead of from version-string convention. The release lane runs
-//   `--assert-body dist/release-notes.md --commit $(git rev-parse HEAD)` after
-//   it writes the notes, so a body without the footer cannot be published.
-//
-// No dependencies beyond Node stdlib and git.
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -104,8 +47,6 @@ function cmpSemver(a, b) {
   return 0;
 }
 
-// 0.x: a major hop moves the minor (the brief's rule), and so does a minor
-// hop; the two are indistinguishable before 1.0 and that is deliberate.
 function bumpVersion(version, level) {
   const [maj, min, pat] = SEMVER.exec(version).slice(1).map(Number);
   if (maj === 0) {
@@ -134,9 +75,6 @@ function headSha(root) {
   }
 }
 
-// Highest legacy `vX.Y.Z` or product tag reachable from HEAD, plus the tag on
-// HEAD (a rerun of an existing release, which must resolve to its own version
-// rather than derive a new one from an empty range).
 function readTags(root) {
   const head = headSha(root);
   let names;
@@ -274,10 +212,6 @@ function readManifestVersions(root) {
   };
 }
 
-// Every manifest must ALREADY name the derived version. There is no repair
-// path on purpose: the release run is not the writer of the version, so a
-// disagreement is a tree defect that fails the run before it builds or tags
-// anything.
 function checkManifests(versions, manifest, pkgText, derived) {
   const rows = [["Cargo.toml", versions.cargo], ["npm/package.json", versions.pkg], ["npm/engine-manifest.json", versions.man]];
   const disagree = rows.filter(([, v]) => v !== versions.cargo);
@@ -303,9 +237,6 @@ function checkManifests(versions, manifest, pkgText, derived) {
         "commit range as the change it releases; this lane asserts the version, it never writes it",
     );
   }
-  // The launcher resolves the archive from runtime.source/archive.name, so a
-  // bumped serverVersion with a stale URL fails the publish assert instead of
-  // shipping a release that 404s on first run. Catch it here, at derive time.
   const source = manifest?.runtime?.source ?? "";
   const archive = manifest?.runtime?.archive?.name ?? "";
   if (!source.endsWith(`/v${derived}`) || !archive.includes(`v${derived}`)) {
@@ -316,9 +247,6 @@ function checkManifests(versions, manifest, pkgText, derived) {
         `  runtime.archive.name: ${archive || "(missing)"}`,
     );
   }
-  // package.json carries the version twice: `version` and the npx hint inside
-  // the global-install-refusal preinstall guard. A stale hint tells the user to
-  // install a version that no longer exists, so it is asserted too.
   const stale = [...pkgText.matchAll(/gladius-mcp@(\d+\.\d+\.\d+)/g)]
     .map((m) => m[1])
     .filter((v) => v !== derived);
@@ -389,10 +317,6 @@ function deriveAll(opts = {}) {
   let base;
   let baseSource;
   if (tags.headTag && cmpSemver(committed, tags.headTag.version) === 0) {
-    // A rerun of an existing release resolves to the version that tag names;
-    // deriving anew would read an empty range and disagree with the tag. When
-    // the tree says something else, fall through and check the tag against the
-    // derivation instead.
     const version = tags.headTag.version;
     const changelogText = readFileSync(join(root, FILES.changelog), "utf8");
     const parsed = parseChangelog(changelogText);
@@ -432,9 +356,6 @@ function deriveAll(opts = {}) {
   }
   const level = deriveLevel(records);
   const derived = bumpVersion(base ? base.version : committed, level);
-  // A tag already sitting on this commit is a claim, not a source of truth: it
-  // must name the version the history derives. That is what a hand-cut tag is
-  // checked against, and why a rerun of a released tag still resolves.
   if (tags.headTag && tags.headTag.version !== derived) {
     refuse(
       "tag-mismatch",
@@ -521,9 +442,6 @@ function fixtureLock(v) {
   return `version = 4\n\n[[package]]\nname = "gladius"\nversion = "${v}"\ndependencies = []\n`;
 }
 
-// package.json carries the version twice: `version` and the npx hint inside the
-// global-install-refusal preinstall guard. `hintAt` lets one fixture leave the
-// hint behind while the version field moves, which is the drift asserted below.
 function fixturePkg(v, hintAt = v) {
   const hint = `gladius-mcp: global install refused - use npx gladius-mcp@${hintAt}`;
   return JSON.stringify({
@@ -556,10 +474,6 @@ function writeFixtureManifests(dir, version, { pathVersion = version, hintAt = v
   write(FILES.man, fixtureManifest(version, pathVersion));
 }
 
-// A fixture repo: manifests at <manifestAt> (landed as a `chore:` commit, so the
-// bump itself carries no release hop — the shape the lane now demands), a base
-// tag at <base>, then the commits under test. `pathVersion` and `hintAt` leave
-// one version-bearing field behind on purpose.
 function makeFixture({ base, manifestAt = base, commits = [], changelog = CHECK_CHANGELOG, pathVersion = null, hintAt = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "derive-release-"));
   const run = (args) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
@@ -594,9 +508,6 @@ function tryDerive(root) {
   }
 }
 
-// The consumer's own path: the release lane runs the script, not deriveAll.
-// Exit status and stderr are what the workflow sees, so the refusal cases run
-// this too.
 function runCli(dir, args = []) {
   const got = spawnSync(process.execPath, [fileURLToPath(import.meta.url), "--repo", dir, ...args], {
     encoding: "utf8",
@@ -609,8 +520,6 @@ function runCheck() {
   const record = (name, ok, detail) => rows.push([name, ok ? "PASS" : "FAIL", detail]);
   const fixtures = [];
 
-  // want.version implies the manifests must already carry it, which is the
-  // lane's contract: derive AND assert in one call.
   const expect = (name, base, commits, want, opts = {}) => {
     const dir = makeFixture({
       base,
@@ -648,8 +557,6 @@ function runCheck() {
     expect("zero-x-major-moves-minor", "0.6.2", [{ subject: "feat!: reshape" }], { version: "0.7.0", level: "major" });
     expect("zero-x-patch", "0.6.2", [{ subject: "fix(core): patch it" }], { version: "0.6.3", level: "patch" });
     expect("mixed-takes-highest", "1.4.2", [{ subject: "docs: notes" }, { subject: "feat: thing" }, { subject: "fix: other" }], { version: "1.5.0", level: "minor" });
-    // A real empty range: the base tag sits on an ancestor and HEAD is only a
-    // merge, so `--no-merges base..HEAD` yields nothing to derive from.
     {
       const dir = makeFixture({ base: "1.0.0", commits: [{ subject: "docs: release note" }] });
       fixtures.push(dir);
@@ -667,11 +574,6 @@ function runCheck() {
     expect("refuse-non-conventional", "1.0.0", [{ subject: "Fixed the thing" }], { code: "non-conventional" });
     expect("refuse-unknown-type", "1.0.0", [{ subject: "wip: half a feature" }], { code: "non-conventional" });
 
-    // THE CONTRACT: the lane asserts the version, it never writes it. A tree
-    // whose manifests were not bumped alongside its commits is refused, not
-    // repaired — this is the exact case the deleted writer used to paper over.
-    // Run through the CLI because exit status and stderr are what the release
-    // workflow consumes.
     {
       const dir = makeFixture({ base: "1.0.0", manifestAt: "1.0.0", commits: [{ subject: "feat: thing" }] });
       fixtures.push(dir);
@@ -687,8 +589,6 @@ function runCheck() {
         "the refused run left Cargo.toml at 1.0.0");
     }
 
-    // An accepted tree is still not touched: derive + assert writes nothing, so
-    // the working tree is byte-identical and git reports it clean.
     {
       const dir = makeFixture({ base: "1.0.0", manifestAt: "1.1.0", commits: [{ subject: "feat: thing" }] });
       fixtures.push(dir);
@@ -698,8 +598,6 @@ function runCheck() {
       record("assert-writes-nothing", ok, ok ? "exit 0, tree clean, manifests asserted" : `exit ${got.status}, dirty: ${dirty || "(clean but output wrong)"}`);
     }
 
-    // The writer cannot come back unnoticed: no manifest path may be written by
-    // this script, and the writer function must be gone.
     {
       const src = readFileSync(fileURLToPath(import.meta.url), "utf8");
       const manifestWrite = /writeFileSync\([^)]*FILES\.(cargo|lock|pkg|man)\b/.test(src);
@@ -708,7 +606,6 @@ function runCheck() {
       record("no-manifest-writer", ok, ok ? "no writeFileSync on a manifest, no applyVersion" : `manifestWrite=${manifestWrite} applyVersion=${writerFn}`);
     }
 
-    // Empty `## [Unreleased]` refuses...
     {
       const dir = makeFixture({ base: "1.0.0", manifestAt: "1.1.0", commits: [{ subject: "feat: thing" }], changelog: "# Changelog\n\n## [Unreleased]\n" });
       fixtures.push(dir);
@@ -717,7 +614,6 @@ function runCheck() {
       record("refuse-empty-unreleased", ok, ok ? "refused changelog-empty" : `got ${got.ok ? got.result.version : got.code}`);
     }
 
-    // Idempotent changelog close: second run over the closed section is a no-op.
     {
       const dir = makeFixture({ base: "1.0.0", manifestAt: "1.1.0", commits: [{ subject: "feat: thing" }] });
       fixtures.push(dir);
@@ -732,7 +628,6 @@ function runCheck() {
       record("changelog-closed-still-derives", ok2, ok2 ? "1.1.0 derivable with the section already closed" : `got ${derivedAgain.ok ? derivedAgain.result.version : derivedAgain.code}`);
     }
 
-    // Refuse a committed version ahead of the derivation (a hand edit).
     {
       const dir = makeFixture({ base: "1.0.0", commits: [{ subject: "fix: small" }] });
       fixtures.push(dir);
@@ -742,7 +637,6 @@ function runCheck() {
       record("refuse-tree-ahead-of-history", ok, ok ? "refused version-mismatch" : `got ${got.ok ? got.result.version : got.code}`);
     }
 
-    // Refuse manifests that disagree with each other.
     {
       const dir = makeFixture({ base: "1.0.0", manifestAt: "1.0.1", commits: [{ subject: "fix: small" }] });
       fixtures.push(dir);
@@ -752,7 +646,6 @@ function runCheck() {
       record("refuse-manifests-disagree", ok, ok ? "refused manifests-disagree" : `got ${got.ok ? got.result.version : got.code}`);
     }
 
-    // Refuse a Cargo.lock left behind (a --locked build ships a stale version).
     {
       const dir = makeFixture({ base: "1.0.0", manifestAt: "1.0.1", commits: [{ subject: "fix: small" }] });
       fixtures.push(dir);
@@ -762,8 +655,6 @@ function runCheck() {
       record("refuse-lock-drift", ok, ok ? "refused lock-drift" : `got ${got.ok ? got.result.version : got.code}`);
     }
 
-    // Refuse a manifest whose runtime paths still name the old tag: the
-    // launcher would 404 on first run of the new release.
     {
       const dir = makeFixture({ base: "1.0.0", manifestAt: "1.0.1", pathVersion: "1.0.0", commits: [{ subject: "fix: small" }] });
       fixtures.push(dir);
@@ -772,8 +663,6 @@ function runCheck() {
       record("refuse-manifest-path-drift", ok, ok ? "refused manifest-paths" : `got ${got.ok ? got.result.version : got.code}`);
     }
 
-    // Refuse an npx hint left at the old version: it is the string a user
-    // copies out of the install refusal.
     {
       const dir = makeFixture({ base: "1.0.0", manifestAt: "1.0.1", hintAt: "1.0.0", commits: [{ subject: "fix: small" }] });
       fixtures.push(dir);
@@ -782,7 +671,6 @@ function runCheck() {
       record("refuse-pkg-hint-drift", ok, ok ? "refused pkg-hint-drift" : `got ${got.ok ? got.result.version : got.code}`);
     }
 
-    // A tag sitting on HEAD reruns as its own version instead of deriving anew.
     {
       const dir = makeFixture({ base: "1.0.0", commits: [] });
       fixtures.push(dir);
@@ -791,9 +679,6 @@ function runCheck() {
       record("rerun-at-released-tag", ok, ok ? "HEAD tag 1.0.0 resolved" : `got ${got.ok ? `${got.result.version}/${got.result.level}` : got.code}`);
     }
 
-    // A hand-cut tag at HEAD is a claim, and it is checked against the
-    // derivation: one naming another version is refused, and so is one that
-    // names the derivation while the tree behind it was never bumped.
     {
       const dir = makeFixture({ base: "1.0.0", manifestAt: "1.1.0", commits: [{ subject: "feat: thing" }] });
       fixtures.push(dir);
@@ -811,9 +696,6 @@ function runCheck() {
       record("refuse-tag-ahead-of-manifests", ok, ok ? "refused version-mismatch" : `got ${got.ok ? got.result.version : got.code}`);
     }
 
-    // S3.4: the release body names the commit it was built from, and the
-    // assertion refuses a body that does not. A body carrying a DIFFERENT
-    // commit is refused too - "some commit" is not the claim.
     {
       const commit = "0123456789abcdef0123456789abcdef01234567";
       const lock = "b".repeat(64);
@@ -829,10 +711,6 @@ function runCheck() {
         : `body=${commitInBody(body)} lock=${lockInBody(body)} bare=${commitInBody(bare)}`);
     }
 
-    // The writer path the lane actually runs: `--changelog --notes-out` on a
-    // fixture whose manifests already carry the derived version. The body it
-    // writes must name THIS commit, and `--assert-body` must accept it - so a
-    // footer dropped from the writer turns --check red.
     {
       const dir = makeFixture({ base: "1.0.0", manifestAt: "1.1.0", commits: [{ subject: "feat: thing" }] });
       fixtures.push(dir);
@@ -873,8 +751,6 @@ function main(argv) {
     return 0;
   }
 
-  // The gate the release lane runs on the body it just wrote (S3.4): a body
-  // that names no commit, or a commit that is not this release's, is refused.
   if (has("--assert-body")) {
     const path = valueOf("--assert-body");
     if (!path) {
@@ -934,7 +810,6 @@ function main(argv) {
   };
 
   if (has("--json")) {
-    // stdout stays machine-parseable; the human derivation goes to the log.
     console.error(report(result));
     console.log(JSON.stringify(json, null, 2));
     return 0;
@@ -968,8 +843,6 @@ function main(argv) {
     console.log(`  changelog    ${closed.changed ? closed.reason : `unchanged (${closed.reason})`}`);
     if (notesOut) {
       const section = sectionBody(closed.text, result.version);
-      // Fail closed: a release body without its commit is the defect S3.4
-      // closes, so an unresolvable HEAD refuses instead of writing one.
       let commit = null;
       try {
         commit = headSha(root);
@@ -997,14 +870,10 @@ function main(argv) {
     return 0;
   }
 
-  // Default mode writes nothing at all: deriveAll already refused unless every
-  // committed manifest carries the derived version, so there is nothing left to
-  // repair here. Saying so keeps the log honest about the lane's contract.
   console.log(`  manifests    asserted at ${result.version}, nothing written`);
   return 0;
 }
 
-// Body of one closed changelog section, for the release notes.
 function sectionBody(text, version) {
   const lines = text.split("\n");
   const start = lines.findIndex((l) => new RegExp(`^##\\s+\\[${version.replace(/\./g, "\\.")}\\]`).test(l));
@@ -1013,11 +882,6 @@ function sectionBody(text, version) {
   return lines.slice(start + 1, end < 0 ? lines.length : end).join("\n").trim();
 }
 
-//
-// A release body that names only a version is a claim about a string. These
-// two lines make it a claim about bytes: the commit the bundle was built from
-// and the digest of the lockfile that was compiled. They are deliberately
-// machine-readable, because the release lane asserts them before publishing.
 
 const COMMIT_LINE = /^commit: ([0-9a-f]{40})$/m;
 const LOCK_LINE = /^cargo-lock-sha256: ([0-9a-f]{64})$/m;

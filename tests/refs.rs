@@ -32,8 +32,6 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
-        // resolves from its versioned cache with no env override.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -180,7 +178,6 @@ fn snapshot_bears_refs_and_marker() {
 #[test]
 fn ref_actions_are_exact() {
     let mut c = launch_on_fixture();
-    // Two identical buttons: first-match would hit DUP_A; ref must hit DUP_B.
     c.call(
         "evaluate",
         json!({"expression": "document.body.insertAdjacentHTML('beforeend', `<button class=\"dup\" onclick=\"window.__d1=1\">DUP_A_XYZ</button><button class=\"dup\" onclick=\"window.__d2=1\">DUP_B_XYZ</button>`); 'injected'"}),
@@ -195,13 +192,10 @@ fn ref_actions_are_exact() {
     ));
     assert!(got.contains("true"), "EXACT ref hit (DUP_B only): {got}");
 
-    // type by ref.
     let snap2 = content_text(&c.call("snapshot", json!({})));
     let rn = find_ref(&snap2, "DUP_A_XYZ"); // any valid ref proves parse; now name input
     let _ = rn;
     let snap3 = content_text(&c.call("snapshot", json!({})));
-    // #name input has empty name; find via evaluate-free path: snapshot lists
-    // inputs with value=""; use the select instead for a named lookup.
     let rs = find_ref(&snap3, "Red");
     let sel = c.call("select", json!({"element": rs, "value": "g"}));
     assert!(sel.get("isError").is_none(), "select by ref ok: {sel}");
@@ -211,7 +205,6 @@ fn ref_actions_are_exact() {
     ));
     assert!(v.contains('g'), "select-by-ref landed: {v}");
 
-    // hover by ref fires the real mouse path.
     let snap4 = content_text(&c.call("snapshot", json!({})));
     let rh = find_ref(&snap4, "HOVER_ME");
     let hov = c.call("hover", json!({"element": rh}));
@@ -225,8 +218,6 @@ fn ref_actions_are_exact() {
         "hover-by-ref fired mouseover: {h}"
     );
 
-    // type by ref into #name: take its ref from the structured node table
-    // (the page is not stamped any more; refs are backend ids).
     let snapv = c.call("snapshot", json!({}));
     let st: Value = snapv
         .get("content")
@@ -258,10 +249,6 @@ fn ref_actions_are_exact() {
     ));
     assert!(vv.contains("ref-typed-1"), "type-by-ref landed: {vv}");
 
-    // Hidden-node semantics (G3b default is AX): the hidden box is NOT
-    // stamped and has no node line; the legacy path still stamps it. An
-    // old ref to a node absent from the current table is a typed
-    // stale_ref on click, never a silent main-frame click.
     let def = content_text(&c.call("snapshot", json!({})));
     assert!(
         !def.lines()
@@ -270,7 +257,6 @@ fn ref_actions_are_exact() {
     );
     let leg = content_text(&c.call("snapshot", json!({"mode": "legacy"})));
     let rhid = find_ref(&leg, "HIDDEN");
-    // Fresh default snapshot replaces the table: the legacy hidden ref is stale.
     let _ = content_text(&c.call("snapshot", json!({})));
     let stale = c.call("click", json!({"element": rhid}));
     assert!(is_error(&stale), "old hidden ref isError: {stale}");
@@ -288,7 +274,6 @@ fn stale_refs_are_typed() {
     let snap = content_text(&c.call("snapshot", json!({})));
     let r = find_ref(&snap, "CLICK_ME");
 
-    // Unknown ref: never issued.
     let unk = c.call("click", json!({"element": "@e99999"}));
     assert!(is_error(&unk), "unknown ref isError: {unk}");
     let m = content_text(&unk);
@@ -297,7 +282,6 @@ fn stale_refs_are_typed() {
         "typed unknown: {m}"
     );
 
-    // Node gone: remove the stamped node, keep the URL.
     c.call(
         "evaluate",
         json!({"expression": "document.getElementById('toggle').remove(); 'removed'"}),
@@ -310,7 +294,6 @@ fn stale_refs_are_typed() {
         "typed node-gone: {g}"
     );
 
-    // Page navigated: fresh snapshot, then leave the page.
     let nav = c.call("navigate", json!({"url": fixture_url()}));
     assert!(!is_error(&nav), "re-navigate ok: {nav}");
     let snap2 = content_text(&c.call("snapshot", json!({})));
@@ -377,7 +360,6 @@ fn refs_are_unique_across_snapshots() {
     let r2 = find_ref(&snap2, "CLICK_ME");
     assert_ne!(r1, r2, "second snapshot reassigns refs: {r1} vs {r2}");
 
-    // Old ref is gone with the old table: typed unknown, never a wrong click.
     let old = c.call("click", json!({"element": r1}));
     assert!(is_error(&old), "old ref isError: {old}");
     let m = content_text(&old);
@@ -386,7 +368,6 @@ fn refs_are_unique_across_snapshots() {
         "typed stale unknown: {m}"
     );
 
-    // New ref still acts.
     let new = c.call("click", json!({"element": r2}));
     assert!(!is_error(&new), "new ref ok: {new}");
     finish(c);
@@ -468,8 +449,6 @@ fn snapshot_pages_without_renaming_refs() {
             "reply echoes the offset"
         );
         if second_page_ref.is_none() {
-            // First page-2 node that actually carries a name: that is the
-            // label the click must reproduce.
             let named = s.get("nodes").and_then(|n| n.as_array()).and_then(|ns| {
                 ns.iter().find(|n| {
                     n.get("name")
@@ -507,9 +486,6 @@ fn snapshot_pages_without_renaming_refs() {
         "the tail node line survived paging"
     );
 
-    // Acting on a ref from the second page resolves in the SAME table, and it
-    // acts on THAT node: the clicked label must equal the page-2 node's name,
-    // not merely match any of the 400 buttons.
     let r = second_page_ref.expect("page 2 carries a ref");
     let want = second_page_name.expect("page 2 node carries a name");
     let clk = c.call("click", json!({"element": format!("@{r}")}));
@@ -560,7 +536,6 @@ fn assert_layout_by_ref_is_live_and_typed_stale() {
     let snap = content_text(&c.call("snapshot", json!({})));
     let r = find_ref(&snap, "CLICK_ME");
 
-    // Live ref: the invariant holds and the node is found BY the ref.
     let by_ref = c.call(
         "assert_layout",
         json!({"ref": r, "checks": {"exists": true, "visible": true}}),
@@ -589,7 +564,6 @@ fn assert_layout_by_ref_is_live_and_typed_stale() {
         "the ref resolved to a live node: {rep}"
     );
 
-    // Same element, same geometry: the ref path and the selector path agree.
     let ref_layout = c.call("layout", json!({"ref": r, "includeOverlaps": false}));
     assert!(!is_error(&ref_layout), "layout by ref: {ref_layout}");
     let sel_layout = c.call("layout", json!({"selector": "#toggle"}));
@@ -616,7 +590,6 @@ fn assert_layout_by_ref_is_live_and_typed_stale() {
         "same engine box on both targets: {rl} vs {sl}"
     );
 
-    // Removed node: typed stale on BOTH geometry tools.
     c.call(
         "evaluate",
         json!({"expression": "document.getElementById('toggle').remove(); 'removed'"}),

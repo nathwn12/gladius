@@ -93,11 +93,6 @@ fn freeze_js() -> String {
         const was = a.playState;
         const at = a.currentTime;
         a.pause();
-        // Pausing alone freezes the animation at whatever frame the wall clock
-        // had reached, which differs between two captures. Pinning the hold to
-        // the animation's start is what makes the frozen state reproducible -
-        // the same reason the stylesheet uses animation:none rather than
-        // animation-play-state:paused.
         try {{ a.currentTime = 0; }} catch (e) {{}}
         state.waapiPaused++;
         state.restore.push(() => {{
@@ -122,8 +117,6 @@ fn freeze_js() -> String {
     for (const svg of svgs) {{
       try {{
         svg.pauseAnimations();
-        // Same reason as WAAPI: a paused SMIL timeline holds a wall-clock
-        // frame. Rewinding it to 0 is the reproducible hold.
         try {{ svg.setCurrentTime(0); }} catch (e) {{}}
         state.smilPaused++;
         state.restore.push(() => {{ try {{ svg.unpauseAnimations(); }} catch (e) {{}} }});
@@ -134,8 +127,6 @@ fn freeze_js() -> String {
         const wasPaused = m.paused;
         const t = m.currentTime;
         m.pause();
-        // Pin the displayed frame to the start for the same reason: a paused
-        // element at a wall-clock position is not reproducible.
         try {{ m.currentTime = 0; }} catch (e) {{}}
         state.mediaPaused++;
         state.restore.push(() => {{
@@ -225,10 +216,6 @@ const SETTLE_JS: &str = r#"(() => {
     try { wait(() => { clearTimeout(timer); end(false); }); } catch (e) { clearTimeout(timer); end(false); }
   });
   return (async () => {
-    // Font readiness by STATUS, not by a single promise: `document.fonts.ready`
-    // resolves when the current loads finish, so a font-display:swap page can
-    // still swap after it. Every face must reach `loaded` or `error`; a face
-    // still `loading` at the budget is counted and named, never assumed.
     const facesLoading = () => {
       try {
         return Array.from(document.fonts).filter((f) => f.status === 'loading');
@@ -363,18 +350,10 @@ impl Capture {
                 "reducedMotionEmulated".to_string(),
                 json!(self.reduced_motion_emulated),
             );
-            // The capture states whether it settled. A reply that omitted this
-            // would make "stable" and "gave up waiting" look identical.
             m.insert("settled".to_string(), json!(self.settled));
             m.insert("settleTimeouts".to_string(), json!(self.settle_timeouts));
             m.insert("freeze".to_string(), self.freeze.clone());
-            // The mode, named rather than implied: the freeze is
-            // `animation:none` (the animation-off state), never
-            // `animation-play-state:paused`, which would keep a
-            // wall-clock-dependent frame.
             m.insert("freezeMode".to_string(), json!("animation-none"));
-            // Fonts are a status, not a race: the count of faces still loading
-            // is reported so "swapped late" and "loaded" cannot look alike.
             m.insert("fontsPending".to_string(), json!(self.fonts_pending));
         }
         Value::Object(m)
@@ -512,7 +491,6 @@ async fn confirm_restored(browser: &Browser, expect: (i64, i64, f64, bool)) -> b
             let a = v.as_array().cloned().unwrap_or_default();
             let num = |i: usize| a.get(i).and_then(|x| x.as_f64());
             let style_gone = a.get(3).and_then(|x| x.as_bool()) == Some(true);
-            // The preference must be back to the BASELINE (see the doc above).
             let reduced_motion_restored = a.get(4).and_then(|x| x.as_bool()) == Some(e_reduce);
             let size_ok = num(0) == Some(ew as f64) && num(1) == Some(eh as f64);
             let dpr_ok = num(2).map(|d| (d - edpr).abs() < 0.001).unwrap_or(false);
@@ -552,7 +530,6 @@ fn decode(r: &Value, deterministic: bool) -> Result<Capture, String> {
         .get("data")
         .and_then(|v| v.as_str())
         .ok_or("screenshot: no data returned".to_string())?;
-    // Decoded with the `base64` crate (never hand-rolled).
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data.as_bytes())
         .map_err(|e| format!("screenshot: capture payload is not valid base64: {e}"))?;
@@ -638,12 +615,7 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
         return decode(&r, false);
     }
 
-    // Prior override we must put back. Read BEFORE we overwrite anything.
     let prior = browser.viewport_override().await;
-    // The pre-capture read-back is also the EXPECTATION the restore must
-    // confirm later: metrics, dsf AND the motion preference the page reports
-    // before we touch it (which on an engine without media emulation is the
-    // host's, not ours).
     let (vw, vh, vdpr) = browser
         .viewport_readback()
         .await
@@ -663,11 +635,6 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
             true,
         )
         .await?;
-    // Emulate reduced motion ONLY where the engine implements the command.
-    // chrome-headless-shell 155 has no `Emulation.setEmulatedMedia` at all, so
-    // the preference stays the host's (reported as `reducedMotionEmulated:
-    // false`); the freeze stylesheet below still stops CSS animation. The first
-    // attempt doubles as the capability probe.
     let mut media_emulated = media_emu_known().unwrap_or(true);
     if media_emulated {
         match browser
@@ -693,17 +660,8 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
             )),
         }
     }
-    // The walk: same stylesheet in every reachable realm, plus WAAPI, SMIL and
-    // media paused, applied BEFORE settling so the settle waits and the shot
-    // both see a frozen page. The counts are what the reply reports; a realm
-    // the walk could not reach is recorded in `skipped`.
     let freeze = apply_freeze(browser).await;
-    // Test-only: widen the mutation window so a cancellation test can land
-    // inside it deterministically.
     maybe_test_delay().await;
-    // Settle, and record which waits lost. The outer budget is the backstop
-    // for a genuinely stuck renderer; when IT fires the reply names
-    // `settleCap` rather than pretending the page was stable.
     let mut settle_timeouts: Vec<String> = Vec::new();
     let mut fonts_pending: i64 = 0;
     match tokio::time::timeout(SETTLE_CAP, browser.eval(SETTLE_JS)).await {
@@ -736,10 +694,6 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
         .command("Page.captureScreenshot", plain_params(opts.full_page), true)
         .await;
 
-    // Restore on every path, capture success or not: undo the freeze walk in
-    // reverse (styles, WAAPI, SMIL, media), clear the media emulation, then
-    // replay the prior metrics override (or clear it when there was none).
-    // Each failure is logged, never swallowed.
     restore_freeze(browser).await;
     if let Err(e) = browser.eval(&style_restore_js()).await {
         warn(&format!(
@@ -760,13 +714,6 @@ pub async fn capture(browser: &Browser, opts: &Options) -> Result<Capture, Strin
     }
     restore_metrics(browser, prior.as_ref()).await;
 
-    // A CDP reply only says the agent accepted the command. The page's media
-    // query and viewport state are refreshed on the renderer's own schedule,
-    // and a clear can be lost outright (session churn), so a caller that reads
-    // the page immediately after this call can still see the emulated state -
-    // exactly the release-gate failure. Restoration therefore is not complete
-    // until the PAGE reports it: confirm (bounded), and repair once if the
-    // clear did not land.
     let expectation = (vw, vh, vdpr, base_reduce);
     if !confirm_restored(browser, expectation).await {
         warn(

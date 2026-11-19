@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-// 1x1 transparent PNG.
 const PIXEL_PNG: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
     0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
@@ -194,8 +193,6 @@ fn network_captures_fetch_xhr_and_subresource() {
     );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // Start clean (and enable the Network domain), then reload so the
-    // document + subresource load inside the capture window.
     let clr = c.call("network", json!({"action": "clear"}));
     assert!(clr.get("isError").is_none(), "clear ok: {clr}");
     let nav2 = c.call(
@@ -204,7 +201,6 @@ fn network_captures_fetch_xhr_and_subresource() {
     );
     assert!(nav2.get("isError").is_none(), "renavigate ok: {nav2}");
 
-    // Fire fetch + XHR from the page.
     let fire = c.call("click", json!({"element": "#fire"}));
     assert!(fire.get("isError").is_none(), "fire ok: {fire}");
     let w = c.call(
@@ -213,8 +209,6 @@ fn network_captures_fetch_xhr_and_subresource() {
     );
     assert!(w.get("isError").is_none(), "fetch+xhr landed: {w}");
 
-    // The ring holds the subresource, the fetch, and the XHR - each with
-    // method, url, 200 status, resource type, and timing.
     let mut got = Vec::new();
     for _ in 0..50 {
         let g = c.call("network", json!({}));
@@ -278,7 +272,6 @@ fn network_captures_fetch_xhr_and_subresource() {
         "img status: {img}"
     );
 
-    // Filter narrows to the matching url substring.
     let f = c.call("network", json!({"action": "get", "filter": "/api/data"}));
     assert!(f.get("isError").is_none(), "filter ok: {f}");
     let fgot = entries_of(&f);
@@ -292,7 +285,6 @@ fn network_captures_fetch_xhr_and_subresource() {
         "filter exact: {fgot:?}"
     );
 
-    // Drain returns and removes; clear drops the rest.
     let d = c.call("network", json!({"action": "drain"}));
     assert!(d.get("isError").is_none(), "drain ok: {d}");
     let dobj = content_obj(&d);
@@ -307,7 +299,6 @@ fn network_captures_fetch_xhr_and_subresource() {
         "ring empty after drain: {g2}"
     );
 
-    // Unknown action is typed; limit is honored.
     let bad = c.call("network", json!({"action": "bogus"}));
     assert!(bad.get("isError").is_some(), "unknown action: {bad}");
     assert_eq!(

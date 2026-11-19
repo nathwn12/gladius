@@ -152,7 +152,6 @@ fn finish(mut c: Client) {
 #[test]
 fn click_is_trusted_pointer_sequence() {
     let mut c = launch_on_trusted();
-    // Reset the recorder (a prior run on the same page must not leak).
     c.call(
         "evaluate",
         json!({"expression": "window.__clickEvents=[]; window.__clickTrusted=[]; 'reset'"}),
@@ -168,7 +167,6 @@ fn click_is_trusted_pointer_sequence() {
         "trusted click landed: {}",
         content_text(&landed)
     );
-    // Event order: pointerdown -> mousedown -> pointerup -> mouseup -> click.
     let order = c.call(
         "evaluate",
         json!({"expression": "JSON.stringify(window.__clickEvents)"}),
@@ -184,7 +182,6 @@ fn click_is_trusted_pointer_sequence() {
             }
         }
     }
-    // Exactly one of each: five events total.
     let len = c.call(
         "evaluate",
         json!({"expression": "window.__clickEvents.length"}),
@@ -195,7 +192,6 @@ fn click_is_trusted_pointer_sequence() {
         "one of each event, got: {} / {ot}",
         content_text(&len)
     );
-    // Every event in the sequence is trusted (exactly one of each).
     let trusted = c.call(
         "evaluate",
         json!({"expression": "JSON.stringify(window.__clickTrusted)"}),
@@ -249,7 +245,6 @@ fn type_is_trusted_insert_and_replaces() {
         "evaluate",
         json!({"expression": "document.getElementById('t-input').value"}),
     );
-    // select-all preflight: the AAA-BEFORE seed is REPLACED, not appended.
     assert!(
         content_text(&v).contains("hello-42") && !content_text(&v).contains("AAA-BEFORE"),
         "value replaced via select-all, got: {}",
@@ -281,8 +276,6 @@ fn type_contenteditable_keeps_siblings() {
         "contenteditable received text, got: {}",
         content_text(&v)
     );
-    // Insert replaces WITHIN the editable element (select-all of its own
-    // contents); unrelated nodes outside it are untouched.
     let sib = c.call(
         "evaluate",
         json!({"expression": "document.getElementById('ce-sibling').textContent"}),

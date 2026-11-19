@@ -1,4 +1,3 @@
-// Local receipts assert checks; hashes prove byte continuity, not compiler provenance.
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, lstatSync } from "node:fs";
 import { join } from "node:path";
@@ -18,8 +17,6 @@ export function releaseEnvironment(cache, parent = process.env) {
 }
 
 export function assembleRuntime(stage, destination) {
-  // The launcher intentionally rejects ZIP data descriptors. libarchive's ZIP
-  // writer emits them; retain the supported Compress-Archive format instead.
   execFileSync("pwsh", [
     "-NoProfile", "-Command",
     "$ErrorActionPreference = 'Stop'; Compress-Archive -Path (Join-Path $env:RELEASE_RUNTIME_STAGE '*') -DestinationPath $env:RELEASE_RUNTIME_ZIP",

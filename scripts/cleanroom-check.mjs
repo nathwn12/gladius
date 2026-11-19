@@ -1,25 +1,5 @@
 #!/usr/bin/env node
 'use strict';
-//
-// Clean-room gate: install the package the way a stranger does — in a
-// scrubbed profile with empty caches — then prove the engine provisions
-// and the server boots. Prints a PASS/FAIL table; any FAIL exits 1.
-//
-//   node scripts/cleanroom-check.mjs --tarball <path.tgz> [--bundle <path.zip>]
-//   node scripts/cleanroom-check.mjs --registry --version <semver> [--keep]
-//
-// --bundle points the launcher (GLADIUS_ENGINE_BUNDLE) at a locally built
-// runtime archive instead of the Release download, so the gate can run BEFORE
-// that Release exists. It applies to --tarball mode only; the launcher still
-// checks the archive's size and sha256 against the installed manifest, so a
-// wrong zip fails this gate exactly like a bad download would. --registry mode
-// scrubs the override, so the public gate can never be bypassed.
-//
-// The boot itself still provisions the pinned Chromium from Google's
-// Chrome-for-Testing endpoint on first run: that part of the gate stays
-// network-dependent whatever the local runtime bundle says.
-//
-// Node stdlib only. Windows-only.
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -86,8 +66,6 @@ if (tarball) {
     process.exit(1);
   }
 }
-// --bundle is a tarball-mode input only: in --registry mode the launcher must
-// provision from the public Release, so an override there would fake the gate.
 if (bundle && registry) {
   console.error('cleanroom-check: error: --bundle applies to --tarball mode only; --registry must download from the public Release.');
   process.exit(1);
@@ -119,8 +97,6 @@ const appDir = path.join(tmp, 'app');
 for (const d of [home, localAppData, roaming, tempDir, npmCache, npmPrefix, appDir]) {
   fs.mkdirSync(d, { recursive: true });
 }
-// Scrubbed child env: override ONLY the profile/cache vars below; PATH,
-// SystemRoot, ComSpec, ProgramData and everything else pass through.
 const scrubEnv = {
   ...process.env,
   USERPROFILE: home,
@@ -132,16 +108,8 @@ const scrubEnv = {
   npm_config_cache: npmCache,
   npm_config_prefix: npmPrefix,
 };
-// A stale engine pin in the parent env would bypass the clean room: the
-// launcher would reuse a warmed runtime and the gate would prove nothing.
 delete scrubEnv.GLADIUS_ENGINE_CACHE;
-// A local-bundle override is only ever supplied by this script, and only for
-// the pre-publish tarball gate. Scrubbing it here means --registry can never
-// inherit one and skip the real download.
 delete scrubEnv.GLADIUS_ENGINE_BUNDLE;
-// Tarball mode + --bundle: hand the child a copy inside <tmp> so the gate still
-// touches nothing outside its scratch dir. The launcher verifies the copy's
-// size and sha256 against the installed manifest, so a wrong zip is refused.
 if (tarball && bundle) {
   const bundleDir = path.join(tmp, 'bundle');
   fs.mkdirSync(bundleDir, { recursive: true });
@@ -206,8 +174,6 @@ function printTableAndExit(code) {
   process.exit(code);
 }
 
-// The REAL cache must never be touched: the scrubbed LOCALAPPDATA keeps
-// every provision under <tmp>. Snapshot names only, before and after.
 const realEngineDir = path.join(process.env.LOCALAPPDATA ?? '', 'gladius', 'engine');
 const realBefore = listNames(realEngineDir);
 
@@ -250,7 +216,6 @@ try {
     } catch { /* fall back to gladius-mcp */ }
     expectedVersion = version;
     const spec = `${pkgName}@${version}`;
-    // Fail fast with a clear message when the version does not exist.
     const view = run(`npm view ${q(spec)} version`, { timeout: 120 * 1000 });
     if (view.status !== 0 || view.stdout.trim() === '') {
       console.error(`cleanroom-check: error: ${spec} is not on the registry: no such version (npm view failed).`);
@@ -267,7 +232,6 @@ try {
   printTableAndExit(1);
 }
 
-// 1. --version output contains the expected version.
 {
   const r = run(describeRun('--version'));
   if (r.status === 0 && r.stdout.includes(expectedVersion)) {
@@ -277,7 +241,6 @@ try {
   }
 }
 
-// 2. --doctor exits 0 (and reports JSON we reuse below).
 let doctor = null;
 {
   const r = run(describeRun('--doctor'));
@@ -293,7 +256,6 @@ let doctor = null;
   }
 }
 
-// 3. Real boot: spawn the bin with stdin closed, wait up to 300 s.
 let bootErr = '';
 {
   const r = run(describeRun(''), { timeout: BOOT_TIMEOUT_MS, stdin: 'ignore' });
@@ -310,7 +272,6 @@ let bootErr = '';
   }
 }
 
-// 4. Provisioned engine under <tmp>: exe present, size == manifest server.size, .ready present.
 let engineDir = doctor?.runtimeCacheDir ?? '';
 let serverSize = doctor?.runtime?.server?.size;
 let serverName = doctor?.runtime?.server?.name ?? 'gladius.exe';
@@ -329,8 +290,6 @@ if (!engineDir || !engineDir.startsWith(tmp)) {
   else pass('engine-cache', `${exe} (${size} bytes == manifest) + .ready present`);
 }
 
-// Chromium is provisioned alongside on first run (~123 MB): report only,
-// never assert (beyond the boot-clean stderr check above).
 {
   console.log(`cleanroom-check: engine source: ${scrubEnv.GLADIUS_ENGINE_BUNDLE ? `local bundle ${scrubEnv.GLADIUS_ENGINE_BUNDLE}` : 'Release download'}`);
   if (bundle) {
@@ -346,7 +305,6 @@ if (!engineDir || !engineDir.startsWith(tmp)) {
   }
 }
 
-// 5. Real %LOCALAPPDATA%\gladius\engine listing identical before/after (names only).
 {
   const after = listNames(realEngineDir);
   const same = JSON.stringify(after) === JSON.stringify(realBefore);
@@ -354,7 +312,6 @@ if (!engineDir || !engineDir.startsWith(tmp)) {
   else fail('real-cache-untouched', `real cache changed: before [${realBefore.join(',')}] after [${after.join(',')}]`);
 }
 
-// 6. The npm cache was written under <tmp>.
 {
   const n = fs.existsSync(npmCache) ? countEntries(npmCache) : 0;
   if (n > 0) pass('npm-cache-scrubbed', `${n} entries under ${npmCache}`);

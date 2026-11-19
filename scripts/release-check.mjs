@@ -1,8 +1,4 @@
 #!/usr/bin/env node
-// Local release preflight: pack the npm package and assert it is publishable.
-// Usage: node scripts/release-check.mjs [--allow-placeholders] [--compare <manifest.json>]
-//   RELEASE_CHECK_TARBALL=<path> overrides npm pack (test hook: validate a fixture tarball).
-// No dependencies beyond Node stdlib plus the system `tar` binary.
 import { execFileSync, execSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -27,7 +23,6 @@ function printAndExit(code) {
   process.exit(code);
 }
 
-// Fail closed: tar missing or non-zero exit is a hard FAIL, never "nothing found".
 function tarList(tarball) {
   try {
     const out = execFileSync("tar", ["-tzf", tarball], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });

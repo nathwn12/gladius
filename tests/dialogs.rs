@@ -187,7 +187,6 @@ fn dialogs_accept_policy_reports_text_and_effect() {
     let nav = c.call("navigate", json!({"url": url}));
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // Default policy is accept.
     let pol = c.call("dialog", json!({}));
     let pobj = content_obj(&pol);
     assert_eq!(
@@ -196,7 +195,6 @@ fn dialogs_accept_policy_reports_text_and_effect() {
         "default accept: {pobj}"
     );
 
-    // alert: auto-accepted, message recorded, page kept running.
     let a = c.call("click", json!({"element": "#alert2"}));
     assert!(a.get("isError").is_none(), "alert click ok: {a}");
     let at = content_text(&a);
@@ -206,7 +204,6 @@ fn dialogs_accept_policy_reports_text_and_effect() {
         "page unblocked"
     );
 
-    // confirm under accept answers true.
     let cf = c.call("click", json!({"element": "#confirm2"}));
     assert!(cf.get("isError").is_none(), "confirm click ok: {cf}");
     assert!(
@@ -218,7 +215,6 @@ fn dialogs_accept_policy_reports_text_and_effect() {
         "accept effect"
     );
 
-    // prompt with configured prompt text.
     let set = c.call(
         "dialog",
         json!({"action": "policy", "accept": true, "promptText": "TYPED_X"}),
@@ -231,8 +227,6 @@ fn dialogs_accept_policy_reports_text_and_effect() {
         "prompt text: {pr}"
     );
 
-    // dialog get reports the last dialog plus the live policy (checked
-    // before any evaluate drains the record).
     let g = c.call("dialog", json!({"action": "get"}));
     let gobj = content_obj(&g);
     assert_eq!(
@@ -276,7 +270,6 @@ fn dialogs_dismiss_policy_observably_refuses() {
     let set = c.call("dialog", json!({"action": "policy", "accept": false}));
     assert!(set.get("isError").is_none(), "dismiss policy ok: {set}");
 
-    // confirm under dismiss answers false; prompt returns null.
     let cf = c.call("click", json!({"element": "#confirm2"}));
     assert!(cf.get("isError").is_none(), "confirm click ok: {cf}");
     assert!(
@@ -290,7 +283,6 @@ fn dialogs_dismiss_policy_observably_refuses() {
         "dismiss prompt effect"
     );
 
-    // policy without accept is a typed missing-arg; unknown action is typed.
     let noacc = c.call("dialog", json!({"action": "policy"}));
     assert!(
         noacc.get("isError").is_some(),
@@ -321,9 +313,6 @@ fn dialogs_beforeunload_never_deadlocks() {
     let nav = c.call("navigate", json!({"url": url}));
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // A second session on the page target for trusted input (activation).
-    // `Input` is session-scoped; the active session's id is not exposed, so
-    // attach explicitly and drive it through the `cdp` escape hatch.
     let listed = content_obj(&c.call("targets", json!({})));
     let page_id = listed
         .get("targets")
@@ -346,17 +335,11 @@ fn dialogs_beforeunload_never_deadlocks() {
         .unwrap_or("")
         .to_string();
     assert!(!sid.is_empty(), "second session: {attached}");
-    // Trusted click on empty page area: sticky activation, no navigation.
     assert!(press(&mut c, &sid, "mousePressed").get("isError").is_none());
     assert!(press(&mut c, &sid, "mouseReleased")
         .get("isError")
         .is_none());
 
-    // Arm beforeunload and leave via an in-page navigation under accept.
-    // Needs sticky activation (trusted click above): without it the engine
-    // fires nothing and the leave just proceeds. The dialog carries an empty
-    // message on this engine (Chrome shows its own generic text instead of
-    // the page's string), so the proof is the type + the blocking behavior.
     let arm = c.call("evaluate", json!({"expression": "window.onbeforeunload = (e) => { e.preventDefault(); e.returnValue = 'DLG2_before-leave'; return 'DLG2_before-leave'; }; 'armed'"}));
     assert!(arm.get("isError").is_none(), "arm ok: {arm}");
     let go = c.call(
@@ -386,8 +369,6 @@ fn dialogs_beforeunload_never_deadlocks() {
         "beforeunload url: {g}"
     );
 
-    // Same under dismiss: the dialog fires, the policy refuses, and the
-    // navigation is cancelled - the page stays.
     let back = c.call("navigate", json!({"url": url}));
     assert!(back.get("isError").is_none(), "back ok: {back}");
     assert!(press(&mut c, &sid, "mousePressed").get("isError").is_none());

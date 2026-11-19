@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// Structural check, not a YAML parser. Behavioral validation lives in the handoff tests.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 const index = process.argv.indexOf("--file");

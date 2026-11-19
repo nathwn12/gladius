@@ -33,8 +33,6 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
-        // resolves from its versioned cache with no env override.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -168,10 +166,6 @@ fn find_ref(snap: &str, needle: &str) -> String {
 
 #[test]
 fn default_snapshot_hides_hidden_old_ref_stales() {
-    // G3b hidden/ignored-node semantics: the default (AX) snapshot carries
-    // no node line for display:none or aria-hidden subtrees (the legacy
-    // path still stamps both), and a ref to such a node from an older table
-    // fails as a typed stale_ref - never a silent main-frame click.
     let mut c = launch_on_fixture();
     let def = content_text(&c.call("snapshot", json!({})));
     for needle in ["HIDDEN", "ARIA_HIDDEN_PROBE_XYZ"] {
@@ -186,8 +180,6 @@ fn default_snapshot_hides_hidden_old_ref_stales() {
         "legacy still stamps the hidden node:\n{leg}"
     );
     let rhid = find_ref(&leg, "\"HIDDEN\"");
-    // A fresh default snapshot replaces the ref table: the legacy hidden
-    // ref is gone with the old table.
     let _ = c.call("snapshot", json!({}));
     for (tool, args) in [
         ("click", json!({"element": rhid})),
@@ -201,7 +193,6 @@ fn default_snapshot_hides_hidden_old_ref_stales() {
             "{tool} old hidden ref is a typed stale_ref: {r}"
         );
     }
-    // A visible-but-disabled node is still listed (typed, not dropped).
     assert!(
         node_lines(&def).iter().any(|l| l.contains("DISABLED_BTN")),
         "disabled button still listed:\n{def}"
@@ -213,7 +204,6 @@ fn default_snapshot_hides_hidden_old_ref_stales() {
 fn click_refuses_hidden_and_disabled() {
     let mut c = launch_on_fixture();
 
-    // G-1: display:none element errors and the click never lands.
     let hid = c.call("click", json!({"element": "#hidden-box"}));
     assert!(is_error(&hid), "click hidden isError: {hid}");
     let msg = content_text(&hid);
@@ -239,8 +229,6 @@ fn click_refuses_hidden_and_disabled() {
         content_text(&landed)
     );
 
-    // Click on a visible-but-disabled button errors (programmatic
-    // el.click() would otherwise fire through the disabled state).
     let dis = c.call("click", json!({"element": "#disabled-btn"}));
     assert!(is_error(&dis), "click disabled isError: {dis}");
     assert!(
@@ -257,7 +245,6 @@ fn click_refuses_hidden_and_disabled() {
         content_text(&dlanded)
     );
 
-    // GLADIUS_NOTFOUND behavior is untouched.
     let miss = c.call("click", json!({"element": "#no-such-element-xyz"}));
     assert!(is_error(&miss), "click missing isError: {miss}");
     assert!(
@@ -265,7 +252,6 @@ fn click_refuses_hidden_and_disabled() {
         "not-found message kept: {miss}"
     );
 
-    // Positive control: a visible button still clicks.
     let ok = c.call("click", json!({"element": "#toggle"}));
     assert!(!is_error(&ok), "click visible ok: {ok}");
     let toggled = c.call(
@@ -285,7 +271,6 @@ fn click_refuses_hidden_and_disabled() {
 fn type_refuses_disabled_and_readonly() {
     let mut c = launch_on_fixture();
 
-    // G-2: disabled input errors and the value is never written.
     let dis = c.call(
         "type",
         json!({"element": "#disabled-input", "text": "nope-probe"}),
@@ -305,7 +290,6 @@ fn type_refuses_disabled_and_readonly() {
         content_text(&val)
     );
 
-    // readOnly input likewise errors and keeps its value.
     let ro = c.call(
         "type",
         json!({"element": "#readonly-input", "text": "ro-probe"}),
@@ -325,7 +309,6 @@ fn type_refuses_disabled_and_readonly() {
         content_text(&rval)
     );
 
-    // GLADIUS_NOTFOUND behavior is untouched.
     let miss = c.call("type", json!({"element": "#no-such-input", "text": "x"}));
     assert!(is_error(&miss), "type missing isError: {miss}");
     assert!(
@@ -333,7 +316,6 @@ fn type_refuses_disabled_and_readonly() {
         "not-found message kept: {miss}"
     );
 
-    // Positive control: a visible, enabled input still takes text.
     let ok = c.call("type", json!({"element": "#name", "text": "hello-42"}));
     assert!(!is_error(&ok), "type visible ok: {ok}");
     let v = c.call(
@@ -353,7 +335,6 @@ fn type_refuses_disabled_and_readonly() {
 fn hover_refuses_hidden() {
     let mut c = launch_on_fixture();
 
-    // G-3: display:none element errors instead of driving the pointer to (0,0).
     let hid = c.call("hover", json!({"element": "#hidden-box"}));
     assert!(is_error(&hid), "hover hidden isError: {hid}");
     let msg = content_text(&hid);
@@ -364,7 +345,6 @@ fn hover_refuses_hidden() {
     );
     assert!(!msg.contains("not found"), "distinct from not-found: {msg}");
 
-    // GLADIUS_NOTFOUND behavior is untouched.
     let miss = c.call("hover", json!({"element": "#no-such-element-xyz"}));
     assert!(is_error(&miss), "hover missing isError: {miss}");
     assert!(
@@ -372,7 +352,6 @@ fn hover_refuses_hidden() {
         "not-found message kept: {miss}"
     );
 
-    // Positive control: a visible element still hovers (real mouse move).
     let ok = c.call("hover", json!({"element": "#hover-target"}));
     assert!(!is_error(&ok), "hover visible ok: {ok}");
     let got = c.call(

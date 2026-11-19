@@ -36,8 +36,6 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
-        // resolves from its versioned cache with no env override.
         for (k, v) in env_extra {
             cmd.env(k, v);
         }
@@ -313,7 +311,6 @@ fn text_refs(t: &str) -> Vec<String> {
 fn error_codes_stale_ref() {
     let mut c = launch_on_fixture();
 
-    // Unknown ref: never issued (no snapshot taken on this client yet).
     let unk = c.call("click", json!({"element": "@e99999"}));
     assert!(is_error(&unk), "unknown ref isError: {unk}");
     assert_eq!(
@@ -328,7 +325,6 @@ fn error_codes_stale_ref() {
         "unknown code"
     );
 
-    // Node gone: remove the stamped node, keep the URL.
     let snap = content_text(&c.call("snapshot", json!({})));
     let r = find_ref(&snap, "CLICK_ME");
     let id = r.trim_start_matches('@').to_string();
@@ -350,7 +346,6 @@ fn error_codes_stale_ref() {
         "node-gone code"
     );
 
-    // Page navigated: fresh snapshot, then leave the page.
     let nav = c.call("navigate", json!({"url": fixture_url()}));
     assert!(!is_error(&nav), "re-navigate ok: {nav}");
     let snap2 = content_text(&c.call("snapshot", json!({})));
@@ -380,7 +375,6 @@ fn error_codes_stale_ref() {
     );
     assert_eq!(sc.get("ref"), Some(&json!(r2)), "navigated ref: {st}");
 
-    // Back on the fixture for a clean close.
     let back = c.call("navigate", json!({"url": fixture_url()}));
     assert!(!is_error(&back), "navigate back ok: {back}");
     finish(c);
@@ -390,7 +384,6 @@ fn error_codes_stale_ref() {
 fn error_codes_not_actionable() {
     let mut c = launch_on_fixture();
 
-    // Click hidden (selector path).
     let hid = c.call("click", json!({"element": "#hidden-box"}));
     assert!(is_error(&hid), "click hidden isError: {hid}");
     assert_eq!(
@@ -405,7 +398,6 @@ fn error_codes_not_actionable() {
         "click-hidden code"
     );
 
-    // Click disabled (selector path).
     let dis = c.call("click", json!({"element": "#disabled-btn"}));
     assert!(is_error(&dis), "click disabled isError: {dis}");
     assert_eq!(
@@ -420,7 +412,6 @@ fn error_codes_not_actionable() {
         "click-disabled code"
     );
 
-    // Type disabled / readonly (selector paths).
     let td = c.call("type", json!({"element": "#disabled-input", "text": "x"}));
     assert!(is_error(&td), "type disabled isError: {td}");
     assert_eq!(
@@ -448,7 +439,6 @@ fn error_codes_not_actionable() {
         "type-readonly code"
     );
 
-    // Hover hidden (selector path).
     let hov = c.call("hover", json!({"element": "#hidden-box"}));
     assert!(is_error(&hov), "hover hidden isError: {hov}");
     assert_eq!(
@@ -463,10 +453,6 @@ fn error_codes_not_actionable() {
         "hover-hidden code"
     );
 
-    // Ref paths (G3b AX semantics): the default snapshot stamps no hidden
-    // node, so the hidden ref comes from the legacy table; a fresh default
-    // snapshot drops that table and the old ref is a typed stale_ref.
-    // Non-select select still types not_select.
     let snap = content_text(&c.call("snapshot", json!({})));
     assert!(
         !snap
@@ -511,7 +497,6 @@ fn error_codes_not_actionable() {
         "select-not-select code"
     );
 
-    // Option not found (selector path).
     let noopt = c.call(
         "select",
         json!({"element": "#color", "value": "no-such-opt-xyz"}),
@@ -529,7 +514,6 @@ fn error_codes_not_actionable() {
         "select-noopt code"
     );
 
-    // Upload with a missing local file: path context, not an element.
     let nf = c.call(
         "upload",
         json!({"element": "#file", "paths": ["C:/no-such-gladius-file-xyz.txt"]}),
@@ -554,7 +538,6 @@ fn error_codes_not_actionable() {
 fn snapshot_structured_blocks() {
     let mut c = launch_on_fixture();
 
-    // Normal page: two blocks, text first and unchanged, nodes one-for-one.
     let snap = c.call("snapshot", json!({}));
     assert!(!is_error(&snap), "snapshot ok: {snap}");
     let blocks = snap
@@ -613,7 +596,6 @@ fn snapshot_structured_blocks() {
         }
     }
 
-    // Truncated page: footer announced, truncated true, still one-for-one.
     c.call(
         "evaluate",
         json!({"expression": "let h=''; for (let i=0;i<800;i++) h+=`<button id=\"bulk-${i}\">BULK_BUTTON_${i}_WITH_A_LONG_LABEL</button>`; document.body.insertAdjacentHTML('beforeend', h); 'bulked'"}),
@@ -664,7 +646,6 @@ fn snapshot_structured_blocks() {
         let r = n.get("ref").and_then(|x| x.as_str()).unwrap_or("");
         assert_eq!(format!("@{r}"), brefs[i], "truncated node {i} ref matches");
     }
-    // The footer names more nodes than the structured block carries.
     let total: usize = btext
         .lines()
         .rev()
@@ -682,7 +663,6 @@ fn snapshot_structured_blocks() {
         bnodes.len()
     );
 
-    // Text mode: legacy single block, no second block.
     let txt = c.call("snapshot", json!({"mode": "text"}));
     assert!(!is_error(&txt), "text snapshot ok: {txt}");
     let tblocks = txt
@@ -702,8 +682,6 @@ fn snapshot_structured_blocks() {
 
 #[test]
 fn capabilities_manifest() {
-    // Default backend: exact tools-only capabilities; count 25, nothing
-    // gated under serverInfo; backend/caps extras remain in serverInfo.
     let mut c = Client::spawn();
     let init = c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     assert_eq!(
@@ -748,7 +726,6 @@ fn capabilities_manifest() {
     );
     shutdown(c);
 
-    // dom-only backend: screenshot gated, and the refusal is typed.
     let mut d = Client::spawn_extra(&[("GLADIUS_BACKEND_CAPS", "dom-only")]);
     let init2 = d.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     assert_eq!(
@@ -795,12 +772,8 @@ fn capabilities_manifest() {
 
 #[test]
 fn error_sites_caller_payload() {
-    // Caller-controlled payload must not steer classification: each site
-    // mints its own code/reason, so a selector/path/option name containing
-    // a marker word keeps the site's type.
     let mut c = launch_on_fixture();
 
-    // A missing selector containing "readonly" is a miss, not a readonly node.
     let miss = c.call("click", json!({"element": "#readonly-does-not-exist"}));
     assert!(is_error(&miss), "readonly-named miss isError: {miss}");
     assert_eq!(
@@ -815,7 +788,6 @@ fn error_sites_caller_payload() {
         "readonly-named miss code"
     );
 
-    // A missing option literally named "is disabled" is a miss, not a disabled node.
     let opt = c.call(
         "select",
         json!({"element": "#color", "value": "is disabled"}),
@@ -833,7 +805,6 @@ fn error_sites_caller_payload() {
         "disabled-named option code"
     );
 
-    // A missing file with "readonly" in its name is a missing path.
     let f = c.call(
         "upload",
         json!({"element": "#file", "paths": ["C:/not-existing/readonly.txt"]}),
@@ -856,11 +827,8 @@ fn error_sites_caller_payload() {
 
 #[test]
 fn error_context_exact_args() {
-    // Context carries the real argument value whole: no invented refs, no
-    // truncation at ": ".
     let mut c = launch_on_fixture();
 
-    // A missing selector containing "@e42" reports the selector, not a ref.
     let miss = c.call("click", json!({"element": "[data-test=\"@e42\"]"}));
     assert!(is_error(&miss), "at-ref selector miss isError: {miss}");
     assert_eq!(
@@ -879,7 +847,6 @@ fn error_context_exact_args() {
         "no invented ref: {miss}"
     );
 
-    // A missing file containing "@e42" reports the path whole, with no ref.
     let f = c.call(
         "upload",
         json!({"element": "#file", "paths": ["C:/not-existing/@e42.txt"]}),
@@ -898,7 +865,6 @@ fn error_context_exact_args() {
     );
     assert!(structured(&f).get("ref").is_none(), "no invented ref: {f}");
 
-    // A missing option containing ": " reports the whole want value.
     let opt = c.call(
         "select",
         json!({"element": "#color", "value": "alpha: beta"}),
@@ -921,9 +887,6 @@ fn error_context_exact_args() {
 
 #[test]
 fn error_typed_arg_failures() {
-    // Every typed argument-failure site carries its better code - none falls
-    // back to the generic `{"code":"error"}`. None of these touches the
-    // browser except the out-of-range tab select at the end.
     let mut c = Client::spawn();
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
 
@@ -1020,7 +983,6 @@ fn error_typed_arg_failures() {
         "unknown-tool code"
     );
 
-    // Out-of-range tab index (engine-raised, integer suffix): still typed.
     let far = c.call("tabs", json!({"action": "select", "index": 99}));
     assert!(is_error(&far), "tabs far-index isError: {far}");
     assert_eq!(
@@ -1039,8 +1001,6 @@ fn error_typed_arg_failures() {
 
 #[test]
 fn capabilities_invalid_caps() {
-    // An invalid/unusable caps value gates the render-dependent tools
-    // instead of declaring none gated while `screenshot` refuses.
     let mut c = Client::spawn_extra(&[("GLADIUS_BACKEND_CAPS", "invalid")]);
     let init = c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     assert_eq!(
@@ -1078,9 +1038,6 @@ fn capabilities_invalid_caps() {
 
 #[test]
 fn upload_ref_disabled_reports_ref() {
-    // AX-ref upload to a disabled element: the typed not_actionable/disabled
-    // error names the ref in `ref`, never the selector-shaped `element`.
-    // The selector path keeps `element`; prose is byte-identical either way.
     let mut c = launch_on_fixture();
     let existing = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")).replace('\\', "/");
     let snap = content_text(&c.call("snapshot", json!({})));
@@ -1156,8 +1113,6 @@ fn serve_once(body: &'static str) -> u16 {
 
 #[test]
 fn success_close_fetch_browser_free() {
-    // No browser needed: close works with no engine, fetch_text uses a
-    // loopback HTTP server (plain HTTP, no browser).
     let mut c = Client::spawn();
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     let schemas = schemas_map(&mut c);
@@ -1229,7 +1184,6 @@ fn success_snapshot_structured_equals_block2() {
         );
     }
     assert_required("snapshot", &structured(&snap), &schemas["snapshot"]);
-    // Text mode: single prose block + structured {mode,text}.
     let txt = c.call("snapshot", json!({"mode": "text"}));
     assert!(!is_error(&txt), "text snapshot ok: {txt}");
     let tblocks = txt
@@ -1293,7 +1247,6 @@ fn success_screenshot_image_text_structured() {
 fn success_shapes_validate_errors_clean() {
     let mut c = launch_on_fixture();
     let schemas = schemas_map(&mut c);
-    // Every JSON-text success parses and its structuredContent equals it.
     for (name, args) in [
         ("navigate", json!({"url": fixture_url()})),
         ("history", json!({"action": "reload"})),
@@ -1318,7 +1271,6 @@ fn success_shapes_validate_errors_clean() {
         );
         assert_required(name, &structured(&r), &schemas[name]);
     }
-    // upload success shape (fixture has no file input; add one live).
     let existing = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")).replace('\\', "/");
     c.call("evaluate", json!({"expression": "document.body.insertAdjacentHTML('beforeend', '<input type=file id=upfile>'); 'added'"}));
     let up = c.call("upload", json!({"element": "#upfile", "paths": [existing]}));
@@ -1328,7 +1280,6 @@ fn success_shapes_validate_errors_clean() {
     assert_eq!(structured(&up), uparsed, "upload structured equals text");
     assert_eq!(uparsed.get("ok"), Some(&json!(true)), "upload ok");
     assert_required("upload", &structured(&up), &schemas["upload"]);
-    // Errors never gain success keys.
     let bad = c.call("no-such-tool-xyz", json!({}));
     assert!(is_error(&bad), "unknown tool isError");
     assert_no_success_keys(&bad);
@@ -1344,7 +1295,6 @@ fn success_interaction_tools_structured() {
     let mut c = launch_on_fixture();
     let schemas = schemas_map(&mut c);
 
-    // click on the fixture toggle.
     let clk = c.call("click", json!({"element": "#toggle"}));
     assert!(!is_error(&clk), "click ok: {clk}");
     assert_eq!(
@@ -1357,7 +1307,6 @@ fn success_interaction_tools_structured() {
     assert!(is_error(&clk_miss), "click miss isError: {clk_miss}");
     assert_no_success_keys(&clk_miss);
 
-    // type into the fixture input.
     let typ = c.call("type", json!({"element": "#name", "text": "hello-42"}));
     assert!(!is_error(&typ), "type ok: {typ}");
     assert_eq!(
@@ -1373,7 +1322,6 @@ fn success_interaction_tools_structured() {
     assert!(is_error(&typ_miss), "type miss isError: {typ_miss}");
     assert_no_success_keys(&typ_miss);
 
-    // hover the fixture toggle (visible target).
     let hov = c.call("hover", json!({"element": "#toggle"}));
     assert!(!is_error(&hov), "hover ok: {hov}");
     assert_eq!(
@@ -1391,7 +1339,6 @@ fn success_interaction_tools_structured() {
     );
     assert_no_success_keys(&hov_hid);
 
-    // select the Green option by value.
     let sel = c.call("select", json!({"element": "#color", "value": "g"}));
     assert!(!is_error(&sel), "select ok: {sel}");
     assert_eq!(
@@ -1412,7 +1359,6 @@ fn success_interaction_tools_structured() {
     );
     assert_no_success_keys(&sel_bad);
 
-    // key press on the focused element (Escape is a safe no-op here).
     let key = c.call("key", json!({"key": "Escape"}));
     assert!(!is_error(&key), "key ok: {key}");
     assert_eq!(
@@ -1430,7 +1376,6 @@ fn success_interaction_tools_structured() {
     );
     assert_no_success_keys(&key_bad);
 
-    // cdp escape hatch on a read-only browser-level method.
     let cdp = c.call("cdp", json!({"method": "Browser.getVersion"}));
     assert!(!is_error(&cdp), "cdp ok: {cdp}");
     assert_eq!(
@@ -1448,10 +1393,6 @@ fn success_interaction_tools_structured() {
 
 #[test]
 fn upload_ref_notfile_reports_ref() {
-    // AX-ref upload to an enabled non-file element: the typed
-    // invalid_target/not_file error names the ref in `ref`, never the
-    // selector-shaped `element`. The selector path keeps `element`; prose
-    // is byte-identical either way.
     let mut c = launch_on_fixture();
     let existing = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")).replace('\\', "/");
     let snap = content_text(&c.call("snapshot", json!({})));
@@ -1565,8 +1506,6 @@ fn success_keys_are_all_declared() {
                  additionalProperties:false): {sc}"
             );
         }
-        // And every declared key that IS present has a compatible type,
-        // including the nullable ones.
         for (key, val) in obj {
             let Some(want) = declared.get(key).and_then(|d| d.get("type")) else {
                 continue;
@@ -1602,7 +1541,6 @@ fn visual_compare_changed_and_size_mismatch_shapes() {
     let save = c.call("visual", json!({"action": "save", "name": "shape"}));
     assert!(!is_error(&save), "baseline saved: {save}");
 
-    // 1. Changed image: repaint the page, then compare.
     let repaint = c.call(
         "evaluate",
         json!({"expression": "document.body.style.background = '#102030'; 'repainted'"}),
@@ -1655,7 +1593,6 @@ fn visual_compare_changed_and_size_mismatch_shapes() {
         "ratio in (0,1]: {sc}"
     );
 
-    // 2. Size mismatch: baseline at 640x480, compare at 900x700.
     let small = c.call(
         "viewport",
         json!({"width": 640, "height": 480, "deviceScaleFactor": 1}),
@@ -1698,7 +1635,6 @@ fn visual_compare_changed_and_size_mismatch_shapes() {
         "every pixel of the compared image counts: {ms}"
     );
 
-    // Both replies still match the published schema exactly.
     for r in [&changed, &mismatch] {
         let sc = structured(r);
         let declared = schemas["visual"]
@@ -1747,7 +1683,6 @@ fn http_get(port: u16, path: &str) -> Option<String> {
         match s.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => raw.extend_from_slice(&buf[..n]),
-            // A read timeout after the body arrived is still an answer.
             Err(_) => break,
         }
     }
@@ -1880,8 +1815,6 @@ fn transport_and_js_failures_are_typed() {
         "and its reason distinguishes it from a throw: {undefined}"
     );
 
-    // An explicit null is still a VALUE, not an error: the distinction the
-    // code exists to keep.
     let explicit_null = c.call("evaluate", json!({"expression": "null"}));
     assert!(
         !is_error(&explicit_null),
@@ -1920,7 +1853,6 @@ fn transport_and_js_failures_are_typed() {
         "the prose names the recovery: {dead}"
     );
 
-    // The three codes are distinct, and none of them is the residue.
     for (name, reply) in [
         ("throw", &thrown),
         ("undefined", &undefined),

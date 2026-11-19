@@ -70,8 +70,6 @@ impl Client {
     }
 
     fn spawn() -> Self {
-        // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
-        // resolves from its versioned cache with no env override.
         Self::spawn_with_env(&[])
     }
 
@@ -152,7 +150,6 @@ fn notifications_get_no_reply() {
     let pong = c.result("ping", json!({}));
     assert_eq!(pong, json!({}), "ping replies {{}}");
 
-    // Id-less requests for every request-method must stay silent.
     c.notify_raw("ping", json!({}));
     c.notify_raw("tools/list", json!({}));
     c.notify_raw("tools/call", json!({"name": "snapshot", "arguments": {}}));
@@ -163,7 +160,6 @@ fn notifications_get_no_reply() {
         Err(e) => panic!("stdout closed unexpectedly: {e}"),
     }
 
-    // Server still alive: a real (id-bearing) ping answers.
     let pong2 = c.result("ping", json!({}));
     assert_eq!(pong2, json!({}), "ping replies {{}}");
     shutdown(c);
@@ -174,7 +170,6 @@ fn evaluate_distinguishes_null_from_undefined() {
     let mut c = Client::spawn();
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
 
-    // Explicit JS null -> {"value":null}.
     let null_ev = c.call("evaluate", json!({"expression": "null"}));
     assert!(
         null_ev.get("isError").is_none(),
@@ -188,7 +183,6 @@ fn evaluate_distinguishes_null_from_undefined() {
         "explicit null preserved: {null_text}"
     );
 
-    // JS undefined (CDP omits `value`) -> explicit tool error, NOT null.
     let undef = c.call("evaluate", json!({"expression": "undefined"}));
     assert!(
         undef.get("isError").is_some(),
@@ -210,7 +204,6 @@ fn snapshot_caps_huge_page_at_source() {
     let mut c = Client::spawn();
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
 
-    // ~400KB body: would balloon memory if transferred whole.
     let dir = std::env::temp_dir().join(format!(
         "gladius-snapcap-{}-{}",
         std::process::id(),
@@ -329,8 +322,6 @@ fn password_value_masked_in_snapshot() {
         "••••",
         "autocomplete=current-password masked"
     );
-    // An unlabeled text input is named from its value, so the live value is
-    // what proves the mask is not blanket.
     assert!(
         nodes.iter().any(|n| n
             .get("value")
@@ -365,8 +356,6 @@ fn strict_allow_ignored_aa_fails_a_two_pixel_edge_diff() {
     let mut c = Client::spawn_with_env(&[("GLADIUS_VISUAL_DIR", &vdir_s)]);
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
 
-    // Absolute 10x10 black block on white, no margin: pixel (9,4) is the
-    // last black column, an edge in both images.
     let page = dir.join("aa.html");
     std::fs::write(
         &page,
@@ -387,16 +376,12 @@ fn strict_allow_ignored_aa_fails_a_two_pixel_edge_diff() {
     let saved = c.call("visual", json!({"action": "save", "name": "aa"}));
     assert!(saved.get("isError").is_none(), "visual save: {saved}");
 
-    // Two pixels change, each still on an edge in both images: #808080 over
-    // the black block's edge column.
     let painted = c.call(
         "evaluate",
         json!({"expression": "const d=document.createElement('div'); d.id='aa'; d.style='position:absolute;left:9px;top:4px;width:1px;height:2px;background:#808080'; document.body.appendChild(d); 'painted'"}),
     );
     assert!(painted.get("isError").is_none(), "evaluate: {painted}");
 
-    // The AA rule is re-admitted only when asked for explicitly (0.8.0:
-    // strictness is the default, S1.2).
     let loose = c.call(
         "visual",
         json!({"action": "compare", "name": "aa", "allowIgnoredAA": true}),
@@ -457,7 +442,6 @@ fn wait_for_hard_deadline() {
     let mut c = Client::spawn();
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
 
-    // ms:0 is a no-op success: immediate, even for a missing selector.
     let t0 = Instant::now();
     let z = c.call(
         "wait_for",
@@ -470,8 +454,6 @@ fn wait_for_hard_deadline() {
         "ms:0 returns immediately, took {d0:?}"
     );
 
-    // Missing selector with a 1.5s budget: timeout error AT the budget,
-    // far under any per-await CDP timeout.
     let t1 = Instant::now();
     let w = c.call(
         "wait_for",
@@ -486,7 +468,6 @@ fn wait_for_hard_deadline() {
     );
     assert!(d1 < Duration::from_secs(8), "hard deadline, took {d1:?}");
 
-    // Over-max budget clamps to 15s, never beyond.
     let t2 = Instant::now();
     let w2 = c.call(
         "wait_for",

@@ -62,8 +62,6 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
-        // resolves from its versioned cache with no env override.
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -184,7 +182,6 @@ fn finish(mut c: Client) {
     assert!(closed.get("isError").is_none(), "close ok: {closed}");
     drop(c.stdin);
     let mut child = c.child;
-    // `c.err_rx` borrows nothing; just drop the receiver via Client drop.
     let mut exited = false;
     for _ in 0..100 {
         match child.try_wait() {
@@ -294,7 +291,6 @@ fn json_version(port: u16) -> Option<Value> {
     }
     let head_end = raw.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
     let body = String::from_utf8_lossy(&raw[head_end..]).into_owned();
-    // Chromium may chunk or length-frame; find the JSON object span.
     let start = body.find('{')?;
     let end = body.rfind('}')?;
     serde_json::from_str(&body[start..=end]).ok()
@@ -350,7 +346,6 @@ fn headless_owned_e2e_navigate_snapshot_screenshot() {
         "snapshot returns a non-empty tree with the marker"
     );
 
-    // The shell artifact proves itself in the UA string.
     let ua = content_text(&c.call(
         "evaluate",
         json!({"expression": "navigator.userAgent"}),
@@ -411,11 +406,9 @@ fn headless_json_version_advertises_loopback_ws_for_our_port() {
     );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // The server logs its owned port at launch; find it on stderr.
     let mut port: Option<u16> = None;
     for _ in 0..50 {
         for l in c.stderr_drain() {
-            // "[gladius] backend: chromium <path> (port <N>)"
             if let Some(i) = l.rfind("(port ") {
                 let rest = &l[i + 6..];
                 if let Some(end) = rest.find(')') {
@@ -463,10 +456,6 @@ fn headless_browser_has_no_visible_window() {
     );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // OS-level assertion (CDP cannot observe window visibility): poll until
-    // the shell processes are visible to the OS, then require zero visible
-    // top-level windows. The non-empty process list is the positive control
-    // (an empty list would prove nothing).
     let mut wins = Vec::new();
     for _ in 0..50 {
         wins = shell_windows();
@@ -508,7 +497,6 @@ fn headless_profile_is_private_and_swept() {
     );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // Private to the instance: exactly our server pid's dir(s), under TEMP.
     let dirs = profile_dirs(spid);
     assert!(
         !dirs.is_empty(),
@@ -523,7 +511,6 @@ fn headless_profile_is_private_and_swept() {
     }
     eprintln!("[headless-profile] private dirs: {dirs:?}");
 
-    // A clean close sweeps it: gone after the tree is reaped.
     let closed = c.call("close", json!({}), Duration::from_secs(30));
     assert!(closed.get("isError").is_none(), "close ok: {closed}");
     let mut gone = false;
@@ -563,7 +550,6 @@ fn headless_second_instance_runs_concurrently() {
     );
     assert!(nb.get("isError").is_none(), "B navigate ok: {nb}");
 
-    // Distinct private profiles for the two instances.
     let da = profile_dirs(a.pid());
     let db = profile_dirs(b.pid());
     assert!(!da.is_empty() && !db.is_empty(), "both own profiles");
@@ -572,7 +558,6 @@ fn headless_second_instance_runs_concurrently() {
         "profiles are private per instance: {da:?} vs {db:?}"
     );
 
-    // Both respond over their own CDP sessions.
     let sa = content_text(&a.call("snapshot", json!({}), Duration::from_secs(30)));
     let sb = content_text(&b.call("snapshot", json!({}), Duration::from_secs(30)));
     assert!(
@@ -586,16 +571,6 @@ fn headless_second_instance_runs_concurrently() {
 
 #[test]
 fn headless_occupied_profile_does_not_disturb_first_browser() {
-    // MEASURED (this build, this machine): two `chrome-headless-shell`
-    // processes CAN share one profile dir when their debug ports differ -
-    // each binds its own port and answers `/json/version` independently.
-    // The shell does NOT enforce profile exclusivity across distinct ports,
-    // which is exactly why production always mints a FRESH unique profile
-    // per instance (never relying on a lock the shell does not enforce).
-    // This negative companion therefore proves the fail-safe direction:
-    // a second instance pointed at an OCCUPIED profile never disturbs the
-    // first browser - the first endpoint keeps answering and keeps driving
-    // exactly its own targets (no hijack in either direction).
     let exe = pinned_chromium_exe();
     assert!(exe.is_file(), "pinned chromium missing: {}", exe.display());
     let profile = std::env::temp_dir().join(format!(
@@ -635,8 +610,6 @@ fn headless_occupied_profile_does_not_disturb_first_browser() {
         let _ = c.wait();
     }
 
-    // First instance takes the profile; wait until it is controllable and
-    // record its identity (browser ws URL + page target ids).
     let port_a = free_port();
     let mut first = launch_shell(&exe, &profile, port_a);
     let t0 = Instant::now();
@@ -661,9 +634,6 @@ fn headless_occupied_profile_does_not_disturb_first_browser() {
         .to_string();
     assert!(!ws_a.is_empty(), "first has a ws url");
 
-    // Second instance on the SAME profile with its own port: observe what
-    // happens (up to 15s), then put BOTH shells down BEFORE asserting, so
-    // no orphan survives any outcome.
     let port_b = free_port();
     let mut second = launch_shell(&exe, &profile, port_b);
     let t1 = Instant::now();
@@ -682,13 +652,11 @@ fn headless_occupied_profile_does_not_disturb_first_browser() {
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    // First endpoint state while the second is (or was) around.
     let ver_a_after = json_version(port_a);
     stop(second);
     stop(first);
     std::fs::remove_dir_all(&profile).ok();
 
-    // The first browser is undisturbed: same ws URL still advertised...
     let ver_a_after = ver_a_after.expect("first endpoint answers with second around");
     assert_eq!(
         ver_a_after
@@ -698,9 +666,6 @@ fn headless_occupied_profile_does_not_disturb_first_browser() {
         ws_a,
         "first keeps its own endpoint (no hijack)"
     );
-    // ...and it is a DIFFERENT browser from any second that came up (the
-    // shell permits sharing, so production never shares: fresh profile per
-    // instance, always).
     if !second_exited {
         let vb = ver_b.expect("second endpoint answered");
         let ws_b = vb
@@ -732,9 +697,6 @@ fn headless_console_log_leg_is_live() {
     );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // A fetch to a refused loopback port fails at the network layer:
-    // Chromium reports it through `Log.entryAdded` ("Failed to load
-    // resource"), the leg the old engine never emitted.
     let port = free_port();
     let fired = content_text(&c.call(
         "evaluate",
@@ -759,8 +721,6 @@ fn headless_console_log_leg_is_live() {
 
 #[test]
 fn headless_headed_request_fails_closed() {
-    // A headed request launches NOTHING: the tool error is the headless-only
-    // refusal and no profile dir ever appears.
     let mut c = Client::spawn_with_env(&[("GLADIUS_HEADED", "1")]);
     let spid = c.pid();
     c.result(
@@ -789,7 +749,6 @@ fn headless_headed_request_fails_closed() {
     );
     shutdown(c);
 
-    // The headed CLI flag exits 2 without starting a browser.
     let bin = env!("CARGO_BIN_EXE_gladius");
     let mut cmd = Command::new(bin);
     cmd.arg("mcp")

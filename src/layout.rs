@@ -165,15 +165,8 @@ async fn resolve(browser: &Browser, tool: &str, specs: &[Spec]) -> Result<Vec<No
     let mut out: Vec<Node> = Vec::new();
     for spec in specs {
         if let Spec::Ref(id) = spec {
-            // Same guard the action tools run: an unissued ref or one from
-            // before a navigation is a typed `stale_ref`, never a silent
-            // `exists:false` that reads as "the element is not there".
             crate::tools::guard_ref(browser, tool, "", id).await?;
             if let Some(object_id) = crate::tools::resolve_ref_object(browser, tool, id).await? {
-                // A removed node keeps a detached JS wrapper, so resolving the
-                // object does not prove the ref still names a node in the
-                // document. Liveness is the same `isConnected` test the action
-                // preflights run, so a stale ref is typed here too.
                 let live = crate::tools::call_on_object(browser, &object_id, LIVE_FN, vec![])
                     .await?
                     .as_bool()
@@ -216,10 +209,6 @@ async fn resolve(browser: &Browser, tool: &str, specs: &[Spec]) -> Result<Vec<No
             .unwrap_or_default();
         let many = ids.len() > 1;
         if ids.is_empty() {
-            // Zero matches from the page realm is not proof of absence: a
-            // closed shadow root is invisible to `querySelectorAll`, and
-            // reporting `exists:false` for an element that IS there is the
-            // lie S2.5 removes.
             if crate::tools::closed_shadow_hit(browser, &selector).await {
                 return Err(crate::tools::shadow_closed(tool, &spec.label()));
             }
@@ -287,7 +276,6 @@ async fn box_geom(browser: &Browser, node_id: i64) -> Result<Option<(Rect, i64)>
         .await
     {
         Ok(v) => v,
-        // The engine's own words for "this node has no box".
         Err(e)
             if e.contains("Could not compute box model")
                 || e.contains("no layout object")
@@ -584,9 +572,6 @@ pub async fn assert_layout(
         )
         .await;
     }
-    // Apply the freeze inside the caller's critical section, measure, restore.
-    // The restore must run whatever the checks do, so the outcome is captured
-    // in a value and the restore happens before it is returned.
     let _ = crate::capture::apply_freeze(browser).await;
     let outcome = assert_layout_inner(
         browser,
@@ -617,9 +602,6 @@ async fn assert_layout_inner(
         .map(|m| m.keys().cloned().collect())
         .unwrap_or_default();
 
-    // Requested targets in request order. A spec that resolved to nothing
-    // becomes its own slot, so a missing element is a FAILING CHECK (with
-    // expected/actual) rather than an error.
     enum Slot {
         Missing(String),
         Node(usize),
@@ -648,8 +630,6 @@ async fn assert_layout_inner(
         let node = match slot {
             Slot::Node(i) => Some(&nodes[*i]),
             Slot::Missing(label) => {
-                // Absent: the exists check answers for it, and nothing else
-                // can be measured. `exists:false` turns this into a pass.
                 push(
                     &mut results,
                     label,
@@ -697,7 +677,6 @@ async fn assert_layout_inner(
         });
         let doc_rect = geom.map(|(r, _)| r);
         let quads = geom.map(|(_, q)| q).unwrap_or(0);
-        // Viewport coordinates from the engine's own box model.
         let box_rect = doc_rect.map(|r| Rect {
             x: r.x - scroll_x,
             y: r.y - scroll_y,
@@ -714,7 +693,6 @@ async fn assert_layout_inner(
             "viewport": viewport,
         }));
 
-        // exists: found at all (a node id and a JS handle both resolved).
         push(
             &mut results,
             &label,
@@ -725,7 +703,6 @@ async fn assert_layout_inner(
             None,
         );
 
-        // visible: a real box, not display:none/visibility:hidden, opacity>0.
         if wanted.visible {
             let vis = visible_of(&info, has_box);
             push(
@@ -742,7 +719,6 @@ async fn assert_layout_inner(
             );
         }
 
-        // box: viewport-relative CSS px, per-component tolerance.
         if let Some(spec) = &wanted.expected_box {
             let tol = spec
                 .get("tolerance")
@@ -781,7 +757,6 @@ async fn assert_layout_inner(
             );
         }
 
-        // stableFrames: identical bbox across N animation frames.
         if let Some(n) = wanted.stable_frames {
             let samples = stable_sample(browser, node, n).await?;
             let mut delta = 0.0f64;
@@ -814,8 +789,6 @@ async fn assert_layout_inner(
             );
         }
 
-        // hitTarget: the topmost element at the centre is the target or a
-        // descendant of it (the same guard `click` uses).
         if wanted.hit_target {
             let hit = info.get("hit").cloned().unwrap_or(Value::Null);
             let same = hit.get("self").and_then(|b| b.as_bool()).unwrap_or(false);
@@ -836,7 +809,6 @@ async fn assert_layout_inner(
             );
         }
 
-        // computed: requested subset of getComputedStyle, string-exact.
         if let Some(want) = &wanted.computed {
             let extra = info.get("extra").cloned().unwrap_or(Value::Null);
             let mut actual = serde_json::Map::new();
@@ -864,7 +836,6 @@ async fn assert_layout_inner(
             );
         }
 
-        // noOverflow: scroll size within the client size (+ tolerance).
         if let Some(tol) = wanted.no_overflow {
             let s = info.get("scroll").cloned().unwrap_or(Value::Null);
             let sw = num(&s, "width").unwrap_or(0.0);
@@ -885,7 +856,6 @@ async fn assert_layout_inner(
             );
         }
 
-        // inViewport: the whole box lies inside the visual viewport.
         if wanted.in_viewport {
             let vw = num(&viewport, "width").unwrap_or(0.0);
             let vh = num(&viewport, "height").unwrap_or(0.0);
@@ -965,10 +935,6 @@ pub async fn layout(
     let nodes = resolve(browser, "layout", specs).await?;
     let mut elements: Vec<Value> = Vec::new();
     let mut rects: Vec<(String, Rect, bool)> = Vec::new();
-    // The viewport size is reported even when nothing matched: the schema
-    // promises an object, and "no elements" still has a viewport. Scroll is
-    // read PER ELEMENT below - a page that scrolls between measurements must
-    // not mix a stale offset into one box and a fresh one into the next.
     let viewport = match browser
         .eval("[window.innerWidth, window.innerHeight]")
         .await

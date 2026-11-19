@@ -132,7 +132,6 @@ fn cdp_browser_level_and_session_scoped() {
     let nav = c.call("navigate", json!({"url": fixture_url()}));
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // Browser-level: no session. Browser.getVersion names the product.
     let ver = c.call("cdp", json!({"method": "Browser.getVersion"}));
     assert!(ver.get("isError").is_none(), "getVersion ok: {ver}");
     let vobj = content_obj(&ver);
@@ -145,7 +144,6 @@ fn cdp_browser_level_and_session_scoped() {
         "chromium product: {vobj}"
     );
 
-    // Browser-level target query reaches every target.
     let tgt = c.call("cdp", json!({"method": "Target.getTargets"}));
     assert!(tgt.get("isError").is_none(), "getTargets ok: {tgt}");
     assert!(
@@ -157,8 +155,6 @@ fn cdp_browser_level_and_session_scoped() {
         "targetInfos: {tgt}"
     );
 
-    // Attach a second session to the page and evaluate on it: the raw
-    // session route, distinct from the tracked active session.
     let listed = content_obj(&c.call("targets", json!({})));
     let page_id = listed
         .get("targets")
@@ -197,7 +193,6 @@ fn cdp_browser_level_and_session_scoped() {
         "raw result: {ev}"
     );
 
-    // Unknown methods and bad sessions are tool errors, never protocol errors.
     let bad = c.call("cdp", json!({"method": "Nope.nope"}));
     assert!(
         bad.get("isError").is_some(),
@@ -219,7 +214,6 @@ fn cdp_browser_level_and_session_scoped() {
         "bad session isError: {badsess}"
     );
 
-    // Missing method and non-object params are typed argument errors.
     let nomethod = c.call("cdp", json!({}));
     assert!(
         nomethod.get("isError").is_some(),

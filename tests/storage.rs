@@ -176,7 +176,6 @@ fn launch_on_storage() -> (Client, String) {
 #[test]
 fn set_get_roundtrip_with_redact() {
     let (mut c, _url) = launch_on_storage();
-    // Set cookies + web-storage items across all scopes.
     let ok = c.call(
         "storage",
         json!({"action": "set", "scope": "all",
@@ -191,7 +190,6 @@ fn set_get_roundtrip_with_redact() {
         Some(&json!({"cookies": 2, "localStorage": 2, "sessionStorage": 2})),
         "set counts (items land in both storage scopes): {ok}"
     );
-    // Get everything back.
     let got = c.call("storage", json!({"action": "get", "scope": "all"}));
     assert!(!is_error(&got), "storage get ok: {got}");
     let g = structured(&got);
@@ -215,7 +213,6 @@ fn set_get_roundtrip_with_redact() {
         Some(&json!({"cookies": 2, "localStorage": 2, "sessionStorage": 2})),
         "get counts: {got}"
     );
-    // Redacted get masks every value and says so.
     let red = c.call(
         "storage",
         json!({"action": "get", "scope": "all", "redact": true}),
@@ -272,13 +269,11 @@ fn save_load_roundtrip_across_sessions() {
         s.get("bytes").and_then(|v| v.as_i64()).unwrap_or(0) > 0,
         "save bytes: {saved}"
     );
-    // The reply carries counts/bytes/origin only - never values.
     let text = content_text(&saved);
     for secret in ["ck-sekret-1", "lk-sekret-2", "sk-sekret-3"] {
         assert!(!text.contains(secret), "save reply leaks {secret}: {saved}");
     }
     finish(c);
-    // Fresh server process = fresh browser profile: nothing survives.
     let mut c2 = Client::spawn();
     c2.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     let nav = c2.call("navigate", json!({"url": url}));
@@ -351,7 +346,6 @@ fn save_file_shape_and_no_values_in_reply() {
         json!({"action": "save", "scope": "all", "path": pstr, "overwrite": true}),
     );
     assert!(!is_error(&saved), "save ok: {saved}");
-    // The file itself is versioned JSON with values (it is the backup).
     let raw = std::fs::read_to_string(&path).expect("read save file");
     let doc: Value = serde_json::from_str(&raw).expect("save file is JSON");
     assert_eq!(
@@ -376,7 +370,6 @@ fn save_file_shape_and_no_values_in_reply() {
             .contains("127.0.0.1"),
         "file origin: {doc}"
     );
-    // The reply (both blocks) carries counts/bytes/origin only - never values.
     let text = content_text(&saved);
     let sc = structured(&saved);
     for secret in ["sh-sekret-9", "k-sekret-8"] {
@@ -518,7 +511,6 @@ fn invalid_inputs_change_nothing() {
             "{label} reason: {r}"
         );
     }
-    // No-clobber: save once, save again without overwrite fails, with it works.
     let s1 = c.call(
         "storage",
         json!({"action": "save", "path": shape_pstr, "overwrite": true}),
@@ -536,7 +528,6 @@ fn invalid_inputs_change_nothing() {
         json!({"action": "save", "path": shape_pstr, "overwrite": true}),
     );
     assert!(!is_error(&s3), "overwrite save ok: {s3}");
-    // State is untouched by every failure above.
     let after = structured(&c.call("storage", json!({"action": "get", "scope": "all"})));
     assert_eq!(
         after.get("counts"),
@@ -566,7 +557,6 @@ fn two_origins_page_scoped_vs_allsites() {
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     let url_a = format!("http://127.0.0.1:{port}/storage.html");
     let url_b = format!("http://localhost:{port}/storage.html");
-    // Distinct values on origin A (127.0.0.1).
     let nav = c.call("navigate", json!({"url": url_a}));
     assert!(nav.get("isError").is_none(), "navigate A ok: {nav}");
     let ok = c.call(
@@ -576,7 +566,6 @@ fn two_origins_page_scoped_vs_allsites() {
                "items": {"ia": "iva"}}),
     );
     assert!(!is_error(&ok), "set A ok: {ok}");
-    // Distinct values on origin B (localhost): same server, other hostname.
     let nav = c.call("navigate", json!({"url": url_b}));
     assert!(nav.get("isError").is_none(), "navigate B ok: {nav}");
     let ok = c.call(
@@ -586,7 +575,6 @@ fn two_origins_page_scoped_vs_allsites() {
                "items": {"ib": "ivb"}}),
     );
     assert!(!is_error(&ok), "set B ok: {ok}");
-    // On B, plain get is page-scoped: only B's own cookie.
     let got = c.call("storage", json!({"action": "get", "scope": "cookies"}));
     let g = structured(&got);
     assert!(
@@ -597,7 +585,6 @@ fn two_origins_page_scoped_vs_allsites() {
         cookie_by_name(&g, "ca").is_none(),
         "other origin cookie hidden page-scoped: {got}"
     );
-    // allSites widens the cookie read to every site.
     let all = c.call(
         "storage",
         json!({"action": "get", "scope": "cookies", "allSites": true}),
@@ -612,7 +599,6 @@ fn two_origins_page_scoped_vs_allsites() {
         Some(&json!(2)),
         "allSites count: {all}"
     );
-    // Web Storage stays page-scoped even under allSites (cookies-only widening).
     let ls = c.call(
         "storage",
         json!({"action": "get", "scope": "localStorage", "allSites": true}),
@@ -652,7 +638,6 @@ fn session_cleared_new_tab_local_persists_with_note() {
             .contains("tab-scoped"),
         "lifetime note present: {got}"
     );
-    // A new tab is a new session: sessionStorage is empty, localStorage kept.
     let nt = c.call("tabs", json!({"action": "new", "url": url}));
     assert!(nt.get("isError").is_none(), "new tab ok: {nt}");
     let got = c.call("storage", json!({"action": "get", "scope": "all"}));
@@ -687,7 +672,6 @@ fn attach_clear_confirm_optional() {
         eprintln!("NOTE: no attach rig (GLADIUS_CDP_URL unset); skipping");
         return;
     }
-    // Against an attached engine, a browser-wide cookie wipe needs confirm.
     let mut c = Client::spawn();
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     let r = c.call(
@@ -708,9 +692,6 @@ fn attach_clear_confirm_optional() {
 
 #[test]
 fn set_cookie_with_other_path_roundtrip() {
-    // A cookie stored under a non-current path must not be reported as
-    // rejected: the read-back has to see the whole jar, not just the
-    // current page URL. allSites get shows it; page-scoped get does not.
     let (mut c, _url) = launch_on_storage();
     let ok = c.call(
         "storage",
@@ -749,8 +730,6 @@ fn set_cookie_with_other_path_roundtrip() {
 
 #[test]
 fn proto_key_roundtrip_both_storages() {
-    // "__proto__" is a real key, not a prototype mutation: it must survive
-    // the JS bridge in both directions and count like any other key.
     let (mut c, _url) = launch_on_storage();
     let ok = c.call(
         "storage",
@@ -779,7 +758,6 @@ fn proto_key_roundtrip_both_storages() {
         Some(&json!({"cookies": 0, "localStorage": 2, "sessionStorage": 2})),
         "proto counts: {got}"
     );
-    // And it survives save/load.
     let path = std::env::temp_dir().join("gladius-g5-proto.json");
     let pstr = path.to_string_lossy().to_string();
     let saved = c.call(
@@ -807,8 +785,6 @@ fn proto_key_roundtrip_both_storages() {
 
 #[test]
 fn storage_schema_keys_and_order() {
-    // Contract: storage sits immediately after tabs (before close), and its
-    // outputSchema carries exactly the documented reply keys.
     let mut c = Client::spawn();
     let listed = c.result("tools/list", json!({}));
     let tools = listed
@@ -824,8 +800,6 @@ fn storage_schema_keys_and_order() {
         .position(|n| *n == "storage")
         .expect("storage listed");
     assert_eq!(names[pos - 1], "tabs", "storage follows tabs: {names:?}");
-    // The geometry/visual primitives ride between storage and close; close
-    // stays last so the shutdown tool is always the final entry.
     assert_eq!(
         &names[pos + 1..],
         &["assert_layout", "layout", "visual", "close"][..],

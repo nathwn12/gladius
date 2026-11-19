@@ -200,14 +200,12 @@ fn dead_engine_respawns_once_then_types_the_recovery() {
     a.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     let nav = a.call("navigate", json!({"url": fixture_url()}));
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
-    // A cold start is not a relaunch: the counter starts at zero.
     assert_eq!(
         a.relaunch_attempts(),
         0,
         "the first launch is a cold start, not a relaunch"
     );
 
-    // The owned engine tree under this server.
     let mut kids: Vec<u32> = engine_parentage()
         .iter()
         .filter(|(_, ppid)| *ppid == apid)
@@ -232,11 +230,6 @@ fn dead_engine_respawns_once_then_types_the_recovery() {
         kill_tree(*pid);
     }
 
-    // The first call that FINDS the engine dead relaunches it once and returns
-    // typed for what it was doing - the replacement never executes that call.
-    // (The call that first *observes* the death in flight is the one exception
-    // the spec allows: it already failed typed and is not resent, so the
-    // relaunch lands on the next call.)
     let mut answers: Vec<String> = Vec::new();
     let mut attempts = 0;
     let mut reason = String::new();
@@ -281,7 +274,6 @@ fn dead_engine_respawns_once_then_types_the_recovery() {
     );
 
     if reason == "respawn_failed" {
-        // The single attempt failed: the next call must NOT launch again.
         let s = a.call("snapshot", json!({}));
         assert!(
             s.get("isError").is_some(),
@@ -293,7 +285,6 @@ fn dead_engine_respawns_once_then_types_the_recovery() {
             1,
             "no second relaunch attempt after a failed one"
         );
-        // The prose's own recovery: `close`, then the next call launches.
         let closed = a.call("close", json!({}));
         assert!(closed.get("isError").is_none(), "close ok: {closed}");
         let nav2 = a.call("navigate", json!({"url": fixture_url()}));
@@ -307,7 +298,6 @@ fn dead_engine_respawns_once_then_types_the_recovery() {
             "an explicit close re-arms recovery; the fresh launch is a cold start"
         );
     } else {
-        // The single attempt succeeded: the FOLLOWING call works on it.
         let nav2 = a.call("navigate", json!({"url": fixture_url()}));
         assert!(
             nav2.get("isError").is_none(),
@@ -320,7 +310,6 @@ fn dead_engine_respawns_once_then_types_the_recovery() {
         );
     }
 
-    // The engine serving calls now is real: it renders the page.
     let snap = a.call("snapshot", json!({}));
     assert!(
         content_text(&snap).contains("GLADIUS_MARKER_hello-12345"),
@@ -328,7 +317,6 @@ fn dead_engine_respawns_once_then_types_the_recovery() {
         content_text(&snap).chars().take(200).collect::<String>()
     );
 
-    // Graceful close still succeeds after the recovery.
     let closed = a.call("close", json!({}));
     assert!(closed.get("isError").is_none(), "close ok: {closed}");
 }

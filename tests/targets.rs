@@ -219,7 +219,6 @@ fn realms_target_scoped_evaluate() {
     );
     assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
 
-    // Inject the cross-origin frame (different port = different origin).
     let inj = c.call(
         "evaluate",
         json!({"expression": format!(
@@ -228,7 +227,6 @@ fn realms_target_scoped_evaluate() {
     );
     assert!(inj.get("isError").is_none(), "iframe inject ok: {inj}");
 
-    // Worker + service worker settle (bounded by the tool's own 15s budget).
     let w = c.call(
         "wait_for",
         json!({"expression": "document.getElementById('worker-status').textContent.startsWith('WORKER:pong')", "ms": 10000}),
@@ -239,7 +237,6 @@ fn realms_target_scoped_evaluate() {
         json!({"expression": "document.getElementById('sw-status').textContent === 'SW:registered'", "ms": 10000}),
     );
     assert!(sw.get("isError").is_none(), "sw registered: {sw}");
-    // The SW target appears after activation; poll the targets list bounded.
     let mut listed = Value::Null;
     for _ in 0..50 {
         listed = c.call("targets", json!({}));
@@ -282,7 +279,6 @@ fn realms_target_scoped_evaluate() {
     let sw_id = swt.get("targetId").and_then(|v| v.as_str()).unwrap_or("");
     assert!(!sw_id.is_empty(), "sw has a stable id");
 
-    // Frame tree: main + same-origin child + cross-origin child.
     let frames = obj
         .get("frames")
         .and_then(|f| f.as_array())
@@ -313,11 +309,9 @@ fn realms_target_scoped_evaluate() {
         "frames have stable ids"
     );
 
-    // Realm contrast: top page is a Window.
     let top = ev(&mut c, json!({"expression": "globalThis.constructor.name"}));
     assert_eq!(top.get("value"), Some(&json!("Window")), "top realm: {top}");
 
-    // Dedicated worker realm via target=.
     let wv = ev(
         &mut c,
         json!({"expression": "globalThis.constructor.name", "target": worker_id}),
@@ -329,7 +323,6 @@ fn realms_target_scoped_evaluate() {
     );
     assert_ne!(wv, top, "target=<worker> differs from the no-target call");
 
-    // Service worker realm via target=.
     let sv = ev(
         &mut c,
         json!({"expression": "globalThis.constructor.name", "target": sw_id}),
@@ -340,8 +333,6 @@ fn realms_target_scoped_evaluate() {
         "sw realm: {sv}"
     );
 
-    // Same-origin iframe realm via frame= (isolated world: DOM is shared
-    // across worlds, main-world JS expandos are not).
     let fv = ev(
         &mut c,
         json!({"expression": "[globalThis.constructor.name, document.querySelector('h1').textContent]", "frame": same_id}),
@@ -352,7 +343,6 @@ fn realms_target_scoped_evaluate() {
         "same-origin frame realm: {fv}"
     );
 
-    // Cross-origin iframe realm via frame= (isolated world, no DOM access needed).
     let xv = ev(
         &mut c,
         json!({"expression": "[globalThis.constructor.name, document.querySelector('h1').textContent]", "frame": x_id}),
@@ -371,8 +361,6 @@ fn unknown_arguments_are_rejected_loudly() {
     let mut c = Client::spawn();
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
 
-    // The exact hazard from the brief: `target` on the OLD shape would have
-    // been silently ignored; after the fix every unknown key is typed.
     for (tool, args) in [
         ("evaluate", json!({"expression": "1+1", "bogus": 1})),
         ("evaluate", json!({"expression": "1+1", "contextId": 7})),
@@ -410,7 +398,6 @@ fn unknown_arguments_are_rejected_loudly() {
         );
     }
 
-    // And the known keys still work (no false rejection).
     let nav = c.call("navigate", json!({"url": "about:blank"}));
     assert!(nav.get("isError").is_none(), "known args pass: {nav}");
     let shot = c.call("screenshot", json!({}));
@@ -447,11 +434,9 @@ fn targets_select_pages_and_refuses_workers() {
         .to_string();
     assert!(!page_id.is_empty(), "page id present: {obj}");
 
-    // Selecting the current page by id is a no-op success with the tabs shape.
     let sel = c.call("targets", json!({"action": "select", "target": page_id}));
     assert!(sel.get("isError").is_none(), "select page ok: {sel}");
 
-    // Unknown action / missing target / unknown id are typed.
     let bad_act = c.call("targets", json!({"action": "bogus"}));
     assert!(bad_act.get("isError").is_some(), "bad action: {bad_act}");
     let no_tgt = c.call("targets", json!({"action": "select"}));

@@ -238,7 +238,6 @@ fn age_out_diffs() {
         return;
     }
     diffs.sort_by(|a, b| a.0.cmp(&b.0));
-    // Leave room for the write that is about to happen.
     let excess = diffs.len() as i64 - cap + 1;
     for (_, path) in diffs.into_iter().take(excess.max(0) as usize) {
         eprintln!(
@@ -338,9 +337,6 @@ pub struct EnvMeta {
     pub settled: Option<bool>,
     /// Which settle waits lost, when the sidecar records it.
     pub settle_timeouts: Option<Vec<String>>,
-    // The 0.8.0 fingerprint (S1.8). Every one is `Option` because a 0.7.x
-    // sidecar has none of them: a missing axis is UNKNOWN, and the compare says
-    // so instead of letting the baseline match silently.
     /// Full engine version string (`156.0.8078.80`), not just the major.
     pub full_version: Option<String>,
     /// `navigator.platform`.
@@ -374,9 +370,6 @@ impl EnvMeta {
         m.insert("url".to_string(), json!(self.url));
         m.insert("checksum".to_string(), json!(self.checksum));
         m.insert("createdAt".to_string(), json!(self.created_at));
-        // A baseline cannot lie about its own capture: the settle state rides
-        // in the sidecar, so `compare` can report an unsettled baseline even
-        // when the current capture settled perfectly.
         if let Some(s) = self.settled {
             m.insert("settled".to_string(), json!(s));
         }
@@ -411,8 +404,6 @@ impl EnvMeta {
             url: v.get("url")?.as_str()?.to_string(),
             checksum: v.get("checksum")?.as_str()?.to_string(),
             created_at: v.get("createdAt")?.as_str()?.to_string(),
-            // Optional by design: a 0.7.x sidecar has neither key, and that is
-            // recorded as unknown rather than assumed settled.
             settled: v.get("settled").and_then(|s| s.as_bool()),
             settle_timeouts: v.get("settleTimeouts").and_then(|t| t.as_array()).map(|a| {
                 a.iter()
@@ -707,8 +698,6 @@ async fn current_environment(browser: &Browser, cap: &capture::Capture) -> EnvMe
         forced_colors: axes.get("forcedColors").and_then(|b| b.as_bool()),
         contrast: text("contrast"),
         reduced_motion: text("reducedMotion"),
-        // The same FNV-1a the capture checksum uses: cheap, dependency free,
-        // and enough to catch a font set that changed under a baseline.
         font_count_hash: Some(capture::checksum(font_keys.as_bytes())),
         scrollbar_width: axes.get("scrollbarWidth").and_then(|n| n.as_i64()),
     }
@@ -809,8 +798,6 @@ pub fn list() -> Result<Value, String> {
                 }
                 let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
                 let name = fname.trim_end_matches(".png").to_string();
-                // The settle state travels with the baseline, so `list` can
-                // report it too; a 0.7.x sidecar has none and stays null.
                 let settled = match read_meta(&name).recorded().and_then(|m| m.settled) {
                     Some(s) => json!(s),
                     None => Value::Null,
@@ -1023,7 +1010,6 @@ function load(src) {{
     g.drawImage(b, 0, 0);
     const db = g.getImageData(0, 0, w, h).data;
 
-    // Luminance per pixel (integer 0..255) for the edge test.
     const lumA = new Uint8Array(n), lumB = new Uint8Array(n);
     for (let p = 0, i = 0; p < n; p++, i += 4) {{
       lumA[p] = (0.2126 * da[i] + 0.7152 * da[i + 1] + 0.0722 * da[i + 2]) | 0;
@@ -1031,10 +1017,6 @@ function load(src) {{
     }}
 
     const thr = Math.max(0, Math.min(1, OPT.threshold || 0)) * 255;
-    // Mask accounting (S1.3): every requested rect is clipped to the image
-    // bounds and rounded to whole device pixels; a rect that is degenerate
-    // after clipping is dropped and counted, never silently treated as a mask.
-    // The covered pixels are a UNION: overlapping rects are not double counted.
     const applied = [];
     let dropped = 0;
     const maskedPx = new Uint8Array(n);
@@ -1059,7 +1041,6 @@ function load(src) {{
     let maskedCount = 0;
     for (let p = 0; p < n; p++) if (maskedPx[p]) maskedCount++;
 
-    // 1. Candidates: channel delta above threshold, outside every mask rect.
     const mask = new Uint8Array(n);
     const delta = new Uint8Array(n);
     for (let y = 0; y < h; y++) {{
@@ -1075,8 +1056,6 @@ function load(src) {{
       }}
     }}
 
-    // 2. AA eligibility: a high-contrast 3x3 luminance neighbourhood in BOTH
-    //    images (edge in the baseline AND in the capture).
     const edgeContrast = OPT.edgeContrast == null ? 32 : OPT.edgeContrast;
     function onEdge(lum, x, y) {{
       let mn = 255, mx = 0;
@@ -1092,8 +1071,6 @@ function load(src) {{
       return (mx - mn) >= edgeContrast;
     }}
 
-    // 3. 4-connected components of candidates; ignore a component only when
-    //    antialias is on, every pixel is AA-eligible, and it is small.
     const aaOn = OPT.antialias !== false;
     const minCluster = Math.max(0, OPT.minDiffCluster == null ? 2 : OPT.minDiffCluster | 0);
     const counted = new Uint8Array(n);
@@ -1140,7 +1117,6 @@ function load(src) {{
       }}
     }}
 
-    // 4. Diff image: counted pixels red, ignored AA pixels amber.
     let diffPng = null;
     const out = g.createImageData(w, h);
     if (diff > 0) {{
@@ -1187,10 +1163,6 @@ pub async fn png_diff(
     let b_b64 = base64::engine::general_purpose::STANDARD.encode(current);
     std::fs::write(&page, harness_html(&a_b64, &b_b64, opts))
         .map_err(|e| ToolErr::fallback(format!("visual: scratch page: {e}")))?;
-    // Background target ONLY: the scratch tab must never become the active
-    // tab. An engine that cannot honour `background:true` is refused with a
-    // typed error - never retried in the foreground, which would activate a
-    // tab on an engine we do not own.
     if test_reject_background() {
         return Err(scratch_background_unsupported(
             "engine rejected Target.createTarget background:true (injected by GLADIUS_TEST_SCRATCH_REJECT_BACKGROUND)",
@@ -1231,13 +1203,8 @@ pub async fn png_diff(
     };
     let mut value: Option<Value> = None;
     let mut last: Option<String> = None;
-    // Test-only: widen the window in which the scratch target is open, so a
-    // cancellation test can cancel while it exists and assert it is closed.
     crate::capture::maybe_test_delay().await;
     if let Some(sid) = sid.clone() {
-        // Navigate explicitly on the scratch session: the created target can
-        // race its own initial load, and an explicit navigate reports the
-        // engine's errorText instead of leaving us staring at about:blank.
         match browser
             .cdp_raw(
                 "Page.navigate",
@@ -1275,7 +1242,6 @@ pub async fn png_diff(
                         }
                         last = Some("result is null (page still loading)".to_string());
                     } else {
-                        // `undefined`: the harness script has not run yet.
                         last = Some(format!(
                             "undefined (page url now {})",
                             v.get("result")
@@ -1296,8 +1262,6 @@ pub async fn png_diff(
         last = Some("could not attach to the scratch target".to_string());
     }
     if value.is_none() {
-        // One diagnostic read on the scratch page itself: what the target
-        // actually shows when the harness result never appeared.
         if let Ok(v) = browser
             .cdp_raw(
                 "Runtime.evaluate",
@@ -1317,10 +1281,6 @@ pub async fn png_diff(
             ));
         }
     }
-    // Close the scratch target on every path; a failure here must not mask
-    // the diff result (the target is a by-product, never the answer) but it
-    // must not vanish either: a target we cannot close leaks a tab, so it is
-    // reported on stderr.
     if let Err(e) = browser
         .cdp_raw("Target.closeTarget", json!({"targetId": tid}), None)
         .await
@@ -1418,10 +1378,6 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
     let baseline = std::fs::read(&base)
         .map_err(|e| ToolErr::fallback(format!("visual: read {}: {e}", base.display())))?;
     let meta_state = read_meta(&safe);
-    // Unknown metadata (missing/malformed/unreadable sidecar) is NOT a match.
-    // With `requireEnvironmentMatch:true` it is a typed failure, because a
-    // strict gate must not pass without evidence; otherwise it warns and the
-    // pixels still decide.
     if opts.require_environment_match && meta_state.recorded().is_none() {
         return Err(ToolErr::typed(
             format!(
@@ -1449,9 +1405,6 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
     if opts.update {
         write_png(&base, &cap.bytes)?;
         write_json(&meta_path(&safe), &current_env.to_json())?;
-        // The baseline on disk IS this capture now, so the identity pair is
-        // stated about the file that was just written: same checksum, same
-        // bytes, within any tolerance by construction.
         return Ok(json!({
             "ok": true, "action": "compare", "name": safe, "updated": true,
             "pixelsIdentical": true, "passWithinTolerance": true, "pass": true,
@@ -1486,10 +1439,6 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
     if let Some(b64) = &diff.diff_png_base64 {
         if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
             let p = diff_path(&safe);
-            // `<stem>.diff.png` is also the path of a baseline literally named
-            // `<stem>.diff` (a name an older build accepted). A by-product
-            // never overwrites a stored baseline: that would be the silent
-            // eviction S2.4 forbids, and the note says why no diff was written.
             if is_baseline_png(&p) {
                 diff_write_note = Some(format!(
                     "diff_path_reserved: the by-product path {} is a stored baseline, so the \
@@ -1497,8 +1446,6 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
                     p.display()
                 ));
             } else {
-                // Diff images are the only by-products: age the oldest out so
-                // the store stays under its own cap (S2.4).
                 age_out_diffs();
                 if write_png(&p, &bytes).is_ok() {
                     wrote_diff = Some(p.to_string_lossy().to_string());
@@ -1507,16 +1454,9 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
         }
     }
 
-    // Environment check: a mismatch (or an unknown baseline environment) is a
-    // WARNING by default - the pixels still decide - and a failure only when
-    // the caller requires a match.
     let (env_known, env_match, mut notes, unknown_axes) = match meta_state.recorded() {
         Some(b) => {
             let (diffs, unknown) = b.differences(&current_env);
-            // An unsettled baseline is not a match: the artifact carries its
-            // own honesty, so a strict gate cannot pass on pixels that were
-            // captured mid-flight. `None` is a 0.7.x sidecar: unknown, never
-            // true.
             if b.settled == Some(false) && opts.require_environment_match {
                 return Err(ToolErr::typed(
                     format!(
@@ -1542,8 +1482,6 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
                     diffs.join("; ")
                 ));
             }
-            // An axis the sidecar does not record is UNKNOWN, and unknown is
-            // never a match: a 0.7.x baseline must not look clean by omission.
             if !unknown.is_empty() {
                 out.push(format!(
                     "baseline_environment_unknown_axes: the baseline records no {} (a 0.7.x \
@@ -1588,9 +1526,6 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
     if let Some(aa) = aa_warning(diff.ignored_pixels, diff.ignored_clusters) {
         notes.push(aa);
     }
-    // Mask accounting: a mask is a legitimate tool, an unmetered one is not.
-    // None of these is a failure - the counts are true either way - but the
-    // reply never lets a masked regression pass as an unexplained silence.
     if diff.mask_rects_dropped > 0 {
         notes.push(format!(
             "mask_rect_dropped: {} requested mask rect(s) were degenerate after clipping to \
@@ -1626,10 +1561,6 @@ pub async fn compare(browser: &Browser, name: &str, opts: &DiffOpts) -> Result<V
         && !diff.size_mismatch
         && diff.diff_pixels <= opts.max_diff_pixels
         && ratio <= opts.max_diff_ratio;
-    // Two questions, two booleans, no summary that can disagree with either:
-    // `pixels_identical` is a fact about the bytes, `pass_within_tolerance` is
-    // the judgement. `pass` is the 0.7.x name and is emitted as the alias, so
-    // it can never say something the judgement does not.
     let pixels_identical = baseline_checksum == cap.checksum;
     let pass_within_tolerance = pixel_pass && (env_match || !opts.require_environment_match);
     Ok(json!({
@@ -1684,9 +1615,7 @@ mod tests {
     fn civil_from_days_is_exact() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(1), (1970, 1, 2));
-        // 1700000000 s = 2023-11-14T22:13:20Z, a widely published value.
         assert_eq!(civil_from_days(1_700_000_000 / 86_400), (2023, 11, 14));
-        // Leap day.
         assert_eq!(civil_from_days(59), (1970, 3, 1));
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
     }
@@ -1720,7 +1649,6 @@ mod tests {
             Some(&json!(true)),
             "background:true is the only spelling we send"
         );
-        // A rejecting engine and a real error are told apart.
         assert!(background_param_unsupported(
             "Invalid parameters: Failed to deserialize params.background - BINDINGS: boolean value expected"
         ));

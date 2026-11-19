@@ -276,8 +276,6 @@ fn max_diff_pixels_boundary_flips_the_verdict() {
     );
     assert!(painted.get("isError").is_none(), "evaluate: {painted}");
 
-    // Read N off the engine rather than assuming it: the boundary is the
-    // claim, and the exact pixel count is the engine's business.
     let probe = c.call_ok(
         "visual",
         json!({"action": "compare", "name": "px", "maxDiffPixels": 100000, "maxDiffRatio": 1.0}),
@@ -401,8 +399,6 @@ fn mask_rects_hide_a_change_but_report_it() {
     );
     assert!(painted.get("isError").is_none(), "evaluate: {painted}");
 
-    // Control: unmasked and at the default pass bar, this is a large, failing
-    // change.
     let open_diff = c.call_ok("visual", json!({"action": "compare", "name": "mk"}));
     assert_eq!(
         flag(&open_diff, "passWithinTolerance"),

@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-// Transport local bytes as git blobs, without creating or moving a ref.
-// The staging workflow turns those exact blobs into an expiring run artifact.
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";

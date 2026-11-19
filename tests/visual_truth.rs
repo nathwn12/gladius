@@ -230,8 +230,6 @@ fn compare_separates_identity_from_tolerance() {
 
     c.call_ok("visual", json!({"action": "save", "name": "shift"}));
 
-    // Shift the text one whole pixel to the right (the clipping band carries
-    // the transform: CSS transforms do not apply to a non-replaced inline).
     let shifted = c.call(
         "evaluate",
         json!({"expression": "document.getElementById('t').style.transform='translateX(1px)'; 'shifted'"}),
@@ -298,7 +296,6 @@ fn aa_suppression_is_opt_in() {
     );
     assert!(painted.get("isError").is_none(), "evaluate: {painted}");
 
-    // No `allowIgnoredAA` argument: the default is strict.
     let cmp = c.call_ok("visual", json!({"action": "compare", "name": "aa"}));
     assert_eq!(
         num(&cmp, "ignoredPixels"),
@@ -316,7 +313,6 @@ fn aa_suppression_is_opt_in() {
         "the warning names the opt-in that would re-admit the rule: {cmp}"
     );
 
-    // The escape hatch still exists and is explicit.
     let loose = c.call_ok(
         "visual",
         json!({"action": "compare", "name": "aa", "allowIgnoredAA": true}),
@@ -363,7 +359,6 @@ fn mask_coverage_is_reported_and_warns() {
     goto(&mut c, &page, 800, 600);
     c.call_ok("visual", json!({"action": "save", "name": "masked"}));
 
-    // 800 x 90 = 72,000 px = 15 % of 800 x 600.
     let rect = json!({"x": 0, "y": 0, "w": 800, "h": 90});
     let cmp = c.call_ok(
         "visual",
@@ -402,8 +397,6 @@ fn mask_coverage_is_reported_and_warns() {
         "a 15 % mask is over the 10 % line and must say so: {cmp}"
     );
 
-    // A rect that clips away to nothing is dropped and named, never silently
-    // treated as a mask that covered something.
     let degenerate = c.call_ok(
         "visual",
         json!({"action": "compare", "name": "masked",
@@ -444,7 +437,6 @@ fn settle_timeout_is_a_field() {
     std::fs::create_dir_all(&vdir).expect("visual dir");
     let vdir_s = vdir.to_string_lossy().to_string();
 
-    // Accept and hold: never write a byte, so the image request hangs.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().expect("local addr").port();
     std::thread::spawn(move || {
@@ -515,9 +507,6 @@ fn settle_timeout_is_a_field() {
         "the lost race names itself: {meta}"
     );
 
-    // The artifact carries its own honesty: the sidecar records the settle
-    // state, and a compare against an unsettled baseline says so - as a typed
-    // failure under a strict environment gate.
     let saved = c.call_ok("visual", json!({"action": "save", "name": "unsettled"}));
     assert_eq!(
         flag(&saved, "settled"),
@@ -577,8 +566,6 @@ fn fonts_report_pending_not_silent() {
     std::fs::create_dir_all(&vdir).expect("visual dir");
     let vdir_s = vdir.to_string_lossy().to_string();
 
-    // Accept the request and stall well past the settle budget: the FontFace
-    // stays `loading`, which is exactly what must be reported.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let port = listener.local_addr().expect("local addr").port();
     std::thread::spawn(move || {
@@ -635,8 +622,6 @@ fn fonts_report_pending_not_silent() {
         "and the capture is honest about it: {meta}"
     );
 
-    // Clean path: a font that resolves at once leaves nothing pending and two
-    // captures of the same page are byte-identical.
     let fast = dir.join("fastfont.html");
     std::fs::write(
         &fast,
@@ -701,7 +686,6 @@ fn environment_fingerprint_names_every_axis() {
     goto(&mut c, &page, 400, 200);
     c.call_ok("visual", json!({"action": "save", "name": "env"}));
 
-    // The untouched compare: every axis is present and real.
     let clean = c.call_ok("visual", json!({"action": "compare", "name": "env"}));
     assert_eq!(
         clean
@@ -731,7 +715,6 @@ fn environment_fingerprint_names_every_axis() {
         );
     }
 
-    // Hand-edit the sidecar's platform: that alone must break the match.
     let meta_file = vdir.join("env.meta.json");
     let text = std::fs::read_to_string(&meta_file).expect("sidecar");
     let mut meta: Value = serde_json::from_str(&text).expect("sidecar json");
@@ -811,8 +794,6 @@ fn baselines_do_not_default_into_the_cwd() {
         "list reports its counts: {list}"
     );
     shutdown(c);
-    // Only after the server exits: on Windows a directory cannot be removed
-    // while it is a live process's working directory.
     std::fs::remove_dir_all(&cwd).ok();
 
     let dir = scratch("s24-cap");
@@ -836,7 +817,6 @@ fn baselines_do_not_default_into_the_cwd() {
     assert_eq!(num(&list, "cap"), Some(2), "the cap is reported: {list}");
     assert_eq!(num(&list, "count"), Some(2), "two baselines stored: {list}");
 
-    // A third baseline is refused, and the refusal names both levers.
     let refused = c.call("visual", json!({"action": "save", "name": "three"}));
     assert!(
         refused.get("isError").is_some(),
@@ -865,8 +845,6 @@ fn baselines_do_not_default_into_the_cwd() {
         !vdir.join("three.png").exists(),
         "a refused save writes nothing"
     );
-    // Overwriting an existing baseline does not grow the store, so it is
-    // still allowed at the cap.
     c.call_ok("visual", json!({"action": "save", "name": "one"}));
     let list = c.call_ok("visual", json!({"action": "list"}));
     assert_eq!(
@@ -875,8 +853,6 @@ fn baselines_do_not_default_into_the_cwd() {
         "an overwrite keeps the count: {list}"
     );
 
-    // A compare against the overwritten baseline still works, and its reply
-    // reports the cap alongside the counts.
     let cmp = c.call_ok("visual", json!({"action": "compare", "name": "one"}));
     assert_eq!(
         flag(&cmp, "pixelsIdentical"),
@@ -1012,13 +988,9 @@ fn a_baseline_in_the_byproduct_namespace_is_counted_and_never_aged_out() {
     .expect("write dark page");
 
     goto(&mut c, &white, 200, 120);
-    // `legacy` is the baseline whose by-product path the legacy baseline below
-    // occupies; `a` and `b` are ordinary baselines.
     c.call_ok("visual", json!({"action": "save", "name": "legacy"}));
     c.call_ok("visual", json!({"action": "save", "name": "a"}));
     c.call_ok("visual", json!({"action": "save", "name": "b"}));
-    // A baseline saved under a name that ends `.diff`, as an older build left
-    // it: the PNG and the sidecar move together, so it is a complete baseline.
     c.call_ok("visual", json!({"action": "save", "name": "planted"}));
     std::fs::rename(vdir.join("planted.png"), vdir.join("legacy.diff.png"))
         .expect("plant the legacy baseline png");
@@ -1029,20 +1001,15 @@ fn a_baseline_in_the_byproduct_namespace_is_counted_and_never_aged_out() {
     .expect("plant the legacy baseline sidecar");
     let planted_bytes = std::fs::read(vdir.join("legacy.diff.png")).expect("planted baseline");
 
-    // Four genuine by-products: a `.diff.png` with no sidecar is what `compare`
-    // writes. Their names are the by-products of `old1`..`old4`.
     for (i, aged) in [(1, 3 * 3600_u64), (2, 2 * 3600), (3, 3600), (4, 1800)] {
         let p = vdir.join(format!("old{i}.diff.png"));
         std::fs::write(&p, b"not decoded by age-out").expect("plant a by-product");
         age_file(&p, aged);
     }
-    // The legacy baseline is older than every by-product, so an age-out that
-    // classified it by its suffix would take it first.
     age_file(&vdir.join("legacy.diff.png"), 5 * 3600);
 
     let before = c.call_ok("visual", json!({"action": "list"}));
 
-    // One compare that mismatches runs the age-out pass before it writes.
     goto(&mut c, &dark, 200, 120);
     let cmp = c.call_ok("visual", json!({"action": "compare", "name": "a"}));
     assert_eq!(
@@ -1080,8 +1047,6 @@ fn a_baseline_in_the_byproduct_namespace_is_counted_and_never_aged_out() {
         "the baseline is still stored and still counted: {list}"
     );
 
-    // The by-product path of `legacy` is the stored baseline `legacy.diff`, so
-    // a mismatching compare of `legacy` must not write over it.
     let guard = c.call_ok("visual", json!({"action": "compare", "name": "legacy"}));
     assert_eq!(
         flag(&guard, "pixelsIdentical"),

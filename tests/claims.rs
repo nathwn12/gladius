@@ -19,10 +19,6 @@ fn markdown_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
-            // The frozen spec bundle is evidence, not product documentation:
-            // SPEC.md and the audit reports quote the unscoped claim as the
-            // defect under attack, and their hashes are recorded in FREEZE.md,
-            // so they cannot be reworded. Only the shipped docs are checked.
             if p.ends_with(Path::new("docs/specs")) {
                 continue;
             }
@@ -53,8 +49,6 @@ fn docs_scope_the_determinism_claim() {
     let mut offenders: Vec<String> = Vec::new();
     for f in &files {
         let text = read(f);
-        // Paragraph = blank-line separated block, which is the unit a reader
-        // takes as one claim.
         for para in text.split("\n\n") {
             let low = para.to_ascii_lowercase();
             let claims = low.contains("provably identical") || low.contains("byte-identical");
@@ -132,8 +126,6 @@ fn tools_list() -> Vec<String> {
         r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
     );
     drop(stdin);
-    // Bounded: a wedged server must not hang the suite. The same 10 s budget
-    // the other suites use for a clean EOF exit.
     let mut exited = false;
     for _ in 0..100 {
         match child.try_wait() {
@@ -274,7 +266,6 @@ fn countable_claims_match_the_binary() {
         offenders.join("\n")
     );
 
-    // The README capability list names the tools; every name must exist.
     let readme = read(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md"));
     let capability = readme
         .split("## Use it")
@@ -305,7 +296,6 @@ fn countable_claims_match_the_binary() {
         );
     }
 
-    // `navigate` reports `httpStatus` (S4.6), never a field called `status`.
     let mut wrong: Vec<String> = Vec::new();
     for f in &files {
         let text = read(f);
@@ -391,8 +381,6 @@ fn doctor_reports_the_commit_it_was_built_from() {
         "--doctor says where the commit came from: {report}"
     );
 
-    // The value the doctor reports is the manifest's, and the manifest is
-    // where the release workflow writes it.
     let man_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("npm/engine-manifest.json");
     let man: serde_json::Value =
         serde_json::from_str(&read(&man_path)).expect("engine-manifest.json is JSON");
@@ -402,8 +390,6 @@ fn doctor_reports_the_commit_it_was_built_from() {
         "--doctor reports the manifest's commit"
     );
 
-    // Local preparation fills the exact-HEAD commit. The publisher validates
-    // that identity against the receipt instead of printing it in the body.
     let prepare =
         read(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/prepare-release.mjs"));
     assert!(

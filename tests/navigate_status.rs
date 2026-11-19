@@ -25,8 +25,6 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
-        // Owned-engine resolution (see e2e_mcp.rs): the pinned Chromium
-        // resolves from its versioned cache with no env override.
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -111,7 +109,6 @@ fn serve_404() -> u16 {
             let mut s = s;
             let mut r = BufReader::new(s.try_clone().expect("clone socket"));
             let mut line = String::new();
-            // Consume the request head so Chrome's GET completes.
             loop {
                 line.clear();
                 match r.read_line(&mut line) {
@@ -131,7 +128,6 @@ fn serve_404() -> u16 {
             );
             let _ = s.write_all(resp.as_bytes());
             let _ = s.flush();
-            // `s` (and the buffered clone `r`) drop here: connection closes.
             let _ = r.into_inner();
         }
     });
