@@ -5,6 +5,13 @@ Chromium (`chrome-headless-shell`) over CDP, served over stdio. This package
 is a dependency-free Node launcher plus a pinned browser/runtime manifest —
 it contains no browser bytes and no server bytes.
 
+<p align="center">
+  <a href="https://www.npmjs.com/package/gladius-mcp"><img src="https://img.shields.io/npm/v/gladius-mcp" alt="npm version" /></a>
+  <img src="https://img.shields.io/badge/platform-windows%20x64-blue" alt="platform" />
+  <img src="https://img.shields.io/badge/tools-25-brightgreen" alt="25 tools" />
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT" />
+</p>
+
 ## Run
 
 ```sh
@@ -64,3 +71,8 @@ https://www.npmjs.com/package/gladius-mcp
 ## License
 
 MIT - see LICENSE.
+
+<p align="center">
+  <img src="signature.svg" width="120" alt="nathwn12 signature" />
+  <br />Built by nathwn12
+</p>
