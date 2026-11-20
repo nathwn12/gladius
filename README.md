@@ -1,8 +1,33 @@
 <p align="center">
   <img src="assets/icon.svg" width="120" height="120" alt="gladius icon" />
 </p>
+
 <h1 align="center">gladius</h1>
-<p align="center"><strong>An MCP server that gives your agent a real headless browser: one native Rust binary over stdio, driving a pinned Chromium directly over CDP.</strong></p>
+
+<p align="center"><strong>An MCP server that gives your agent a real headless browser, driven directly over CDP by one native binary.</strong></p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/nathwn12/gladius" alt="License" /></a>
+  <img src="https://img.shields.io/github/languages/top/nathwn12/gladius" alt="Language" />
+  <img src="https://img.shields.io/badge/platform-windows--64bit-2b3137?logo=windows&logoColor=white" alt="Platform" />
+  <img src="https://img.shields.io/badge/tools-25-brightgreen" alt="25 tools" />
+</p>
+
+One stdio connection. One native binary. One pinned browser.
+
+- **Browser**: navigate, snapshot, click, type, screenshot and assert layout over CDP.
+- **Agent-ready**: every tool carries a versioned output schema and typed annotations, so a code-mode host builds a typed API.
+- **Evidence, not vibes**: layout checks report measured boxes; deterministic screenshots carry a content checksum.
+
+## Why gladius
+
+Most browser MCPs wrap a heavyweight driver and leave the agent guessing about page state. gladius gives stable `@eN` refs, geometry checks and deterministic captures over one connection.
+
+- **No pointer steal.** Every action rides CDP: no OS cursor, no window, no foreground tab.
+- **Refs that fail typed.** `snapshot` returns stable `@eN` refs; a stale ref is a typed error, not a click on the wrong element.
+- **Proof in the result.** `assert_layout` measures boxes and geometry; `visual` diffs stored baselines by threshold.
+- **One binary, no sidecar.** The launcher provisions and sha256-verifies the pinned runtime and browser; later runs reuse them.
+- **Bring your own browser.** Set `GLADIUS_CDP_URL` to drive an engine you already run; `close` detaches and never kills it.
 
 ## Install
 
@@ -22,37 +47,43 @@ Add the server to your MCP client and restart it:
 }
 ```
 
-The client runs `npx -y gladius-mcp@latest` and speaks MCP over stdio, so that process is spawned by the client, not typed in a terminal. Your first tool call provisions the pinned server runtime and the pinned `chrome-headless-shell`, both sha256-verified before and after extraction, and later runs reuse and re-verify them. A global install is refused by the package's `preinstall` script.
+The client spawns npx, which runs the bundled binary and speaks MCP over stdio. The first tool call provisions the pinned runtime and browser; both are sha256-verified before and after extraction. A global install is refused by the package's `preinstall` script.
 
-Check the pin first: `npx -y gladius-mcp@latest --doctor` prints the manifest and the resolved cache paths, downloads nothing and exits 0.
+Check the pin without downloading anything: `npx -y gladius-mcp@latest --doctor` prints the manifest and resolved cache paths and exits 0.
 
-### Or let your AI install it
+## Use
 
-```text
-Install nathwn12/gladius (gladius-mcp) as a local stdio MCP server with npx -y gladius-mcp@latest, then prove it works.
-1. Run: npx -y gladius-mcp@latest
-2. First run: the client spawns that command, which provisions the pinned runtime and browser (both sha256-verified); it needs Windows x64 and Node 22.14 or newer.
-3. Done when: npx -y gladius-mcp@latest --doctor exits 0 and prints "serverVersion": "0.8.0" with the pinned browser version.
-If it fails, stop and paste the full output; do not improvise a fix.
+Ask the agent to open a page, take a snapshot, then act on a ref. The loop is the same for every task: navigate, snapshot, then a tool that acts on an `@eN` ref.
+
+```js
+await navigate({ url: "http://localhost:3000" });
+const snap = await snapshot();
+await click({ element: "@e12" });
+await wait_for({ selector: ".done" });
+const shot = await screenshot({ deterministic: true });
 ```
 
-## Use it
+## Tools
 
-Ask the agent to open a page, take a snapshot, then act on a ref. The loop is the same for every task: `navigate`, `snapshot`, then a tool that acts on an `@eN` ref.
+Twenty-five tools, each with a versioned output schema and `readOnly`/`destructive`/`idempotent`/`openWorld` annotations. Every failure returns a typed code beside the prose.
 
-- Session: `navigate`, `history`, `tabs`, `targets`, `viewport`, `dialog`, `close`.
-- Read: `snapshot` (the accessibility tree with stable `@eN` refs, pageable past 8000 chars), `evaluate`, `console`, `network`, `fetch_text`.
-- Act: `click`, `type`, `hover`, `select`, `key`, `upload` (trusted CDP input, `isTrusted:true`).
-- Wait and prove layout: `wait_for`, `assert_layout`, `layout` (boxes and geometry, no pixels).
-- Pixels: `screenshot` (deterministic, with a content checksum), `visual` (stored baselines, threshold diff).
-- State: `storage` (cookies and Web Storage, versioned save and load).
-- Escape hatch: `cdp` (raw `method` plus `params`).
-
-That is 25 tools. Each carries a versioned output schema and `readOnly`/`destructive`/`idempotent`/`openWorld` annotations, and every failure returns a typed code beside the prose.
+- Navigate and inspect: `navigate`, `history`, `tabs`, `targets`, `viewport`, `dialog`, `close`
+- Read: `snapshot` (the accessibility tree with stable `@eN` refs, pageable past 8000 chars), `evaluate`, `console`, `network`, `fetch_text`
+- Act: `click`, `type`, `hover`, `select`, `key`, `upload` (trusted CDP input, `isTrusted:true`)
+- Wait and prove: `wait_for` (selector, text, expression or network idle), `assert_layout`, `layout` (boxes and geometry, no pixels)
+- Pixels: `screenshot` (deterministic, with a content checksum), `visual` (stored baselines, threshold diff)
+- State: `storage` (cookies and Web Storage, versioned save and load)
+- Escape hatch: `cdp` (raw `method` plus `params`)
 
 Every argument, option and typed error: [docs/GUIDE.md](docs/GUIDE.md).
 
-## Configure it
+## Compatibility
+
+Any MCP client that speaks stdio can spawn gladius. The launcher is published as `gladius-mcp` on npm; the server binary is provisioned on first use.
+
+To drive a browser you already run, set `GLADIUS_CDP_URL` to its CDP endpoint. gladius attaches without launching or killing it, and `close` detaches only the session it opened. Headless only: gladius never opens a visible window.
+
+## Configure
 
 No flag serves MCP. The launcher's other flags are `--doctor`, `--print-manifest`, `--version` and `--help`.
 
@@ -77,7 +108,7 @@ Attach to a browser you run yourself, so the engine is yours and gladius only dr
 - Windows 10/11 x64. The server runtime runs on no other platform.
 - Node 22.14 or newer, for the `npx` launcher.
 - An MCP client that speaks stdio.
-- The first run downloads the pinned browser, about 118 MB, and the runtime bundle, and verifies both. There is no fully offline fresh install.
+- The first run downloads the pinned browser and runtime and verifies both. There is no fully offline fresh install.
 - Headless only: gladius never opens a visible window. To watch a real browser, start your own and attach with `GLADIUS_CDP_URL`.
 
 ## Development
@@ -102,3 +133,5 @@ The toolchain is pinned by `rust-toolchain.toml`. `cargo fmt --all --check` and 
 - [Publishing](docs/PUBLISHING.md)
 - [Third-party notices](THIRD-PARTY-NOTICES.md)
 - [MIT](LICENSE)
+
+Built by nathwn12
