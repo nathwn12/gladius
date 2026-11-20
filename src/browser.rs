@@ -4812,14 +4812,12 @@ mod tests {
                 let n = sid_ctr.fetch_add(1, Ordering::SeqCst);
                 json!({"sessionId": format!("S{n}")})
             }
-            "Runtime.evaluate" => {
-                escript
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .map(|v| json!({"result": {"type": "boolean", "value": v}}))
-                    .unwrap_or_else(|| json!({"result": {"type": "boolean", "value": false}}))
-            }
+            "Runtime.evaluate" => escript
+                .lock()
+                .unwrap()
+                .pop_front()
+                .map(|v| json!({"result": {"type": "boolean", "value": v}}))
+                .unwrap_or_else(|| json!({"result": {"type": "boolean", "value": false}})),
             _ => json!({}),
         };
         let _ = sink

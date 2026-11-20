@@ -196,7 +196,6 @@ fn shot_meta(reply: &Value) -> Value {
     serde_json::from_str(text).unwrap_or_else(|_| panic!("screenshot meta is not json: {text}"))
 }
 
-
 /// SPEC.md S1.1: identity and tolerance are two questions with two booleans.
 ///
 /// The fixture is one text glyph (`H`, 20 px monospace) inside a 1 px-tall
@@ -332,7 +331,6 @@ fn aa_suppression_is_opt_in() {
     shutdown(c);
 }
 
-
 /// SPEC.md S1.3: a mask is metered, not an invisible hole.
 ///
 /// One rect covering 15 % of an 800x600 capture must be counted (union, not
@@ -422,7 +420,6 @@ fn mask_coverage_is_reported_and_warns() {
     std::fs::remove_dir_all(&dir).ok();
     shutdown(c);
 }
-
 
 /// SPEC.md S1.4 / D3: a settle timeout is a field, not a stderr line.
 ///
@@ -550,7 +547,6 @@ fn settle_timeout_is_a_field() {
     shutdown(c);
 }
 
-
 /// SPEC.md S1.7: font readiness is a status, not a race.
 ///
 /// `document.fonts.ready` resolves when the CURRENT loads finish, so a
@@ -659,7 +655,6 @@ fn fonts_report_pending_not_silent() {
     shutdown(c);
 }
 
-
 /// SPEC.md S1.8: the environment fingerprint covers the axes that differ.
 ///
 /// A baseline saved on another machine used to match, because only browser
@@ -742,7 +737,6 @@ fn environment_fingerprint_names_every_axis() {
     std::fs::remove_dir_all(&dir).ok();
     shutdown(c);
 }
-
 
 /// SPEC.md S2.4: baselines stop landing in the caller's repo, and the store
 /// stops growing without a bound.

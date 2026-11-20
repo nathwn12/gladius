@@ -316,7 +316,6 @@ fn write_json(path: &std::path::Path, v: &Value) -> Result<(), String> {
     std::fs::write(path, text).map_err(|e| format!("visual: write {}: {e}", path.display()))
 }
 
-
 /// The recorded environment of a baseline. This is what catches
 /// browser-update rot: the same DOM rendered by Chrome 155 and Chrome 156 is
 /// not the same baseline, and a silently accepted drift hides a real change
@@ -735,7 +734,6 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-
 /// Capture deterministically and store the PNG plus its environment sidecar.
 ///
 /// The cap is checked BEFORE the capture: a refused save costs no capture and
@@ -855,7 +853,6 @@ pub fn delete(name: &str) -> Result<Value, String> {
     }
     Ok(json!({"ok": true, "action": "delete", "name": safe, "deleted": deleted}))
 }
-
 
 /// Compare tuning. `threshold` is a per-channel fraction of the 0..255 range
 /// (0.1 means a channel must move by more than 25.5 levels to count).

@@ -148,7 +148,6 @@ fn shot_meta(reply: &Value) -> Value {
     serde_json::from_str(text).unwrap_or_else(|_| panic!("screenshot meta is not json: {text}"))
 }
 
-
 /// SPEC.md S1.5 / D2: the freeze reaches what actually moves.
 ///
 /// The fixture carries every motion source the stylesheet alone cannot stop:
@@ -235,7 +234,6 @@ fn freeze_reaches_shadow_waapi_smil_and_media() {
     shutdown(c);
 }
 
-
 /// SPEC.md S3.1: the repo's headline claim - two deterministic captures are
 /// byte-identical - asserted, on a page that is actually moving.
 ///
@@ -301,7 +299,6 @@ fn two_deterministic_captures_have_equal_checksums() {
 
     shutdown(c);
 }
-
 
 /// SPEC.md S1.6: the freeze and the measurement agree.
 ///

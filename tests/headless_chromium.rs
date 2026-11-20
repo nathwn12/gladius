@@ -38,7 +38,6 @@ mod common;
 use common::pinned_chromium_exe;
 use serde_json::{json, Value};
 
-
 fn fixture(name: &str) -> String {
     let p = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
     let p = p.replace(std::path::MAIN_SEPARATOR, "/");
@@ -302,7 +301,6 @@ fn free_port() -> u16 {
     drop(l);
     p
 }
-
 
 #[test]
 fn headless_owned_e2e_navigate_snapshot_screenshot() {

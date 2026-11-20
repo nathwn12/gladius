@@ -1653,7 +1653,6 @@ fn visual_compare_changed_and_size_mismatch_shapes() {
     finish(c);
 }
 
-
 /// An externally started engine the TEST owns, so "the engine died" is a fact
 /// the test controls instead of a race it hopes to win. Same resolution as
 /// production (`GLADIUS_CHROMIUM`, else the versioned cache).

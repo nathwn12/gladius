@@ -190,7 +190,6 @@ fn ratio(v: &Value, key: &str) -> f64 {
     v.get(key).and_then(|x| x.as_f64()).unwrap_or(-1.0)
 }
 
-
 /// SPEC.md S3.2 case 1: `threshold` flips the verdict.
 ///
 /// The page is one flat block repainted from `rgb(100,100,100)` to

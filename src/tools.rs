@@ -3885,9 +3885,7 @@ async fn tool_console(
     let lim = limit.unwrap_or(100).clamp(1, 200) as usize;
     match action {
         "get" => Ok(ok_text(browser.console_get(lim).await.to_string())),
-        "drain" => {
-            Ok(ok_text(browser.console_drain(lim).await.to_string()))
-        }
+        "drain" => Ok(ok_text(browser.console_drain(lim).await.to_string())),
         "clear" => {
             let n = browser.console_clear().await;
             Ok(ok_text(

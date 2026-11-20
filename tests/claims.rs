@@ -82,7 +82,6 @@ fn docs_scope_the_determinism_claim() {
     );
 }
 
-
 /// A minimal MCP client: `claims.rs` needs the LIVE `tools/list`, and that is
 /// answered without launching an engine, so no browser is involved here.
 fn tools_list() -> Vec<String> {
@@ -317,7 +316,6 @@ fn countable_claims_match_the_binary() {
         wrong.join("\n")
     );
 }
-
 
 /// Run the shipped launcher's diagnostic and parse its JSON report.
 fn doctor_report() -> serde_json::Value {
