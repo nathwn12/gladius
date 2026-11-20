@@ -7,10 +7,10 @@
 <p align="center"><strong>An MCP server that gives your agent a real headless browser, driven directly over CDP by one native binary.</strong></p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/nathwn12/gladius" alt="License" /></a>
-  <img src="https://img.shields.io/github/languages/top/nathwn12/gladius" alt="Language" />
-  <img src="https://img.shields.io/badge/platform-windows--64bit-2b3137?logo=windows&logoColor=white" alt="Platform" />
+  <a href="https://www.npmjs.com/package/gladius-mcp"><img src="https://img.shields.io/npm/v/gladius-mcp" alt="npm version" /></a>
+  <img src="https://img.shields.io/badge/platform-windows%20x64-blue" alt="platform" />
   <img src="https://img.shields.io/badge/tools-25-brightgreen" alt="25 tools" />
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT" />
 </p>
 
 One stdio connection. One native binary. One pinned browser.
