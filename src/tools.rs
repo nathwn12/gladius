@@ -3146,15 +3146,9 @@ fn split_selector(selector: &str) -> Option<Vec<(Vec<String>, Vec<char>)>> {
                         _ => break,
                     }
                 }
-                if hex == 0 {
+                if hex == 0 || matches!(it.peek(), Some(c) if c.is_whitespace()) {
                     if let Some(c) = it.next() {
                         cur.push(c);
-                    }
-                } else {
-                    if matches!(it.peek(), Some(c) if c.is_whitespace()) {
-                        if let Some(w) = it.next() {
-                            cur.push(w);
-                        }
                     }
                 }
             }

@@ -208,10 +208,8 @@ async fn resolve(browser: &Browser, tool: &str, specs: &[Spec]) -> Result<Vec<No
             .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
             .unwrap_or_default();
         let many = ids.len() > 1;
-        if ids.is_empty() {
-            if crate::tools::closed_shadow_hit(browser, &selector).await {
-                return Err(crate::tools::shadow_closed(tool, &spec.label()));
-            }
+        if ids.is_empty() && crate::tools::closed_shadow_hit(browser, &selector).await {
+            return Err(crate::tools::shadow_closed(tool, &spec.label()));
         }
         for (i, id) in ids.into_iter().enumerate() {
             out.push(Node {
