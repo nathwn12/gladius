@@ -51,7 +51,7 @@ The client spawns npx, which runs the bundled binary and speaks MCP over stdio. 
 
 Check the pin without downloading anything: `npx -y gladius-mcp@latest --doctor` prints the manifest and resolved cache paths and exits 0.
 
-## Use
+## Use it
 
 Ask the agent to open a page, take a snapshot, then act on a ref. The loop is the same for every task: navigate, snapshot, then a tool that acts on an `@eN` ref.
 
@@ -83,7 +83,7 @@ Any MCP client that speaks stdio can spawn gladius. The launcher is published as
 
 To drive a browser you already run, set `GLADIUS_CDP_URL` to its CDP endpoint. gladius attaches without launching or killing it, and `close` detaches only the session it opened. Headless only: gladius never opens a visible window.
 
-## Configure
+## Configure it
 
 No flag serves MCP. The launcher's other flags are `--doctor`, `--print-manifest`, `--version` and `--help`.
 
