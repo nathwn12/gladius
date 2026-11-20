@@ -266,11 +266,20 @@ fn countable_claims_match_the_binary() {
     );
 
     let readme = read(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md"));
-    let capability = readme
-        .split("## Use it")
+    let tools_section = readme
+        .split("## Tools")
         .nth(1)
-        .and_then(|rest| rest.split("That is ").next())
-        .expect("README has a capability list between 'Use it' and 'That is'");
+        .and_then(|rest| rest.split("## Compatibility").next())
+        .expect("README has a '## Tools' section");
+    let capability: String = tools_section
+        .lines()
+        .filter(|line| line.starts_with("- "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !capability.is_empty(),
+        "the README '## Tools' section names tools in backticks"
+    );
     let mut mentioned: Vec<String> = Vec::new();
     for line in capability.lines() {
         for tok in backticked(&without_parentheses(line)) {
