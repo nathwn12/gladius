@@ -73,6 +73,6 @@ https://www.npmjs.com/package/gladius-mcp
 MIT - see LICENSE.
 
 <p align="center">
-  <img src="signature.svg" width="120" alt="nathwn12 signature" />
+  <img src="signature-glyph.svg" width="120" alt="nathwn12 signature" />
   <br />Built by nathwn12
 </p>
