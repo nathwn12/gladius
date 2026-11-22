@@ -1,0 +1,13 @@
+---
+project: gladius
+one_line: Give your AI agent a real headless browser to test, screenshot, and check layout.
+stack: [Rust]
+status: draft
+since: 2026-10
+capabilities: []
+limits: []
+updated: 2026-11-22
+draft: true
+---
+
+One stdio connection. One native binary. One pinned browser.
