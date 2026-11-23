@@ -15,7 +15,7 @@
 npx gladius-mcp@latest
 ```
 
-A global install is refused. To pin an exact build, use the version number instead of `latest`.
+With no arguments this starts the long-lived stdio server. `--doctor` and `--version` are one-shot offline checks that exit; they do not start the server. Global installs are refused; pin an exact build by replacing `latest` with a version.
 
 ### Or let your AI install it
 
@@ -49,7 +49,7 @@ The `-y` flag keeps the non-interactive spawn from prompting. Any stdio MCP clie
 
 ### Offline or pinned
 
-Pin an exact build with `npx gladius-mcp@0.8.0`. A pinned version fetches its runtime from that version's GitHub release; published release assets are retained, not deleted. The package ships no browser or server bytes, so a fresh run still needs network. `npx gladius-mcp@latest --doctor` and `--version` are offline. Set `GLADIUS_CHROMIUM` to an existing `chrome-headless-shell` binary to skip browser provisioning.
+Pin the npm package with `npx gladius-mcp@0.8.0`. That pins the package version; the bundled `engine-manifest.json` records the runtime asset the launcher fetches. For the published 0.8.0 build that record points under the `gladius` release tag to `gladius-v0.8.0-windows-x86_64.zip`. The release workflow performs no deletion; both the `gladius` and `v0.7.1` releases are present. The package ships no browser or server bytes, so a fresh run still needs network. Set `GLADIUS_CHROMIUM` to an existing `chrome-headless-shell` binary to skip browser provisioning.
 
 ## Capabilities
 
