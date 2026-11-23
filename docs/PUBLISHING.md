@@ -48,12 +48,14 @@ gh run list --workflow stage-release.yml --limit 1
 Before any upload or dispatch, `--upload` runs a read-only preflight against the
 receipt's commit. It reads live `main` and the `gladius` tag, then refuses with
 `landed mismatch` when `main` is not that commit, or with `blocked shared tag`
-when the tag binds a different commit. Both refusals are made before the local
-artifact hashing, blob upload and staging dispatch, so a plan that the publisher
-would reject costs no build, upload or rehearsal. The publisher still repeats the
-tag check at publish time; this only moves the same refusal earlier. An absent
-tag, or a tag already bound to the planned commit, passes. The preflight creates
-no ref and writes no release, asset or registry entry.
+when the tag binds a different commit. Both refusals happen before artifact
+hashing, blob upload and staging dispatch. A plan the publisher would reject
+therefore costs no upload and no rehearsal. It does not save the local build:
+`prepare-release.mjs` has already built the candidate before staging begins.
+The publisher repeats the tag check at publish time; this check surfaces the same
+refusal in the staging step. An absent tag, or a tag already bound to the planned
+commit, passes. The preflight creates no ref and writes no release, asset or
+registry entry.
 
 The staging command uploads public, credential-free git blobs without creating
 or moving a ref. They contain only the already public release artifacts. A
