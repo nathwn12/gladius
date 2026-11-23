@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { verifyReceipt, requiredChecks, verifyArtifacts, validateBlobMap, releaseIdentity, releaseEnvironment, assembleRuntime, releasePreflight, resolveTagCommit } from "./release-handoff.mjs";
+import { verifyReceipt, requiredChecks, verifyArtifacts, validateBlobMap, releaseIdentity, releaseEnvironment, assembleRuntime, releasePreflight, resolveTagCommit, OfflineRefusal } from "./release-handoff.mjs";
 import { mkdirSync, cpSync, existsSync, readdirSync } from "node:fs";
 
 test("handoff accepts exact bytes and refuses corruption, stale identity and incomplete gates", () => {
@@ -69,7 +69,7 @@ test("artifact contract rejects a mutable archive name before publication", () =
 test("local preparation refuses a different commit before producing a receipt", () => {
   const dir = mkdtempSync(join(tmpdir(), "gladius-prepare-"));
   try {
-    const r = spawnSync(process.execPath, ["scripts/prepare-release.mjs", "--commit", "0".repeat(40), "--out", join(dir, "release")], { encoding: "utf8", windowsHide: true });
+    const r = spawnSync(process.execPath, ["scripts/prepare-release.mjs", "--commit", "0".repeat(40), "--out", join(dir, "release")], { encoding: "utf8", windowsHide: true, env: { ...process.env, OC_NO_NETWORK: "1" } });
     assert.notEqual(r.status, 0);
     assert.match(r.stderr, /exact HEAD/);
     assert.throws(() => readFileSync(join(dir, "release", "release-receipt.json")));
@@ -96,7 +96,7 @@ test("publishing workflow never rebuilds, deletes history or forces a shared tag
 test("publisher refuses a local or wrong-ref invocation before network access", () => {
   const r = spawnSync(process.execPath, ["scripts/publish-release.mjs", "--prepare"], {
     encoding: "utf8", windowsHide: true,
-    env: { ...process.env, GITHUB_REPOSITORY: "nathwn12/gladius", GITHUB_REF: "refs/heads/not-main" },
+    env: { ...process.env, OC_NO_NETWORK: "1", GITHUB_REPOSITORY: "nathwn12/gladius", GITHUB_REF: "refs/heads/not-main" },
   });
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /exact main workflow dispatch/);
@@ -140,7 +140,7 @@ test("assembled ZIP provisions through the actual launcher without a browser dow
     writeFileSync(join(pkg, "engine-manifest.json"), JSON.stringify(manifest));
     const cache = join(dir, "engine");
     const result = spawnSync(process.execPath, [join(pkg, "bin/gladius-mcp.js")], {
-      env: { ...releaseEnvironment(null), GLADIUS_ENGINE_CACHE: cache, GLADIUS_ENGINE_BUNDLE: zip },
+      env: { ...releaseEnvironment(null), OC_NO_NETWORK: "1", GLADIUS_ENGINE_CACHE: cache, GLADIUS_ENGINE_BUNDLE: zip },
       input: "", encoding: "utf8", windowsHide: true, timeout: 10000,
     });
     assert.equal(result.status, 1, result.stderr);
@@ -182,4 +182,29 @@ test("publisher still refuses shared-tag movement; preflight mirrors that contra
   assert.match(text, /git\/ref\/tags\/gladius/);
   assert.match(text, /tagCommit\(ref\) === env\.COMMIT/);
   assert.match(text, /product tag movement requires a specific safety approval/);
+});
+
+test("OC_NO_NETWORK refusal is typed and names the guard", () => {
+  const refusal = new OfflineRefusal("npm publish");
+  assert.equal(refusal.name, "OfflineRefusal");
+  assert.equal(refusal.code, "OC_NO_NETWORK");
+  assert.match(refusal.message, /OC_NO_NETWORK guard: refused network call to npm publish/);
+});
+
+test("OC_NO_NETWORK stops the upload route before any gh call, blob write or dispatch", () => {
+  const dir = mkdtempSync(join(tmpdir(), "gladius-offline-"));
+  try {
+    writeFileSync(join(dir, "release-receipt.json"), JSON.stringify({ commit: "a".repeat(40) }));
+    const child = spawnSync(process.execPath, ["scripts/stage-release.mjs", "--upload", dir], {
+      encoding: "utf8", windowsHide: true,
+      env: { ...process.env, OC_NO_NETWORK: "1" },
+    });
+    assert.notEqual(child.status, 0);
+    const lines = child.stderr.trim().split(/\r?\n/);
+    assert.equal(lines.length, 1, child.stderr);
+    assert.match(lines[0], /^stage-release: OC_NO_NETWORK guard: refused network call to gh api repos\/nathwn12\/gladius\/git\/ref\/heads\/main/);
+    assert.doesNotMatch(child.stdout, /Staging dispatched/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
