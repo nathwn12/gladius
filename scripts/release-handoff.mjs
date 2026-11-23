@@ -10,6 +10,18 @@ export const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex"
 export const need = (condition, message) => { if (!condition) throw new Error(message); };
 export const safeName = (name) => typeof name === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name) && name !== "." && name !== "..";
 
+export class OfflineRefusal extends Error {
+  constructor(route) {
+    super(`OC_NO_NETWORK guard: refused network call to ${route}`);
+    this.name = "OfflineRefusal";
+    this.code = "OC_NO_NETWORK";
+  }
+}
+
+export const assertNetworkAllowed = (route) => {
+  if (process.env.OC_NO_NETWORK === "1") throw new OfflineRefusal(route);
+};
+
 export function releaseEnvironment(cache, parent = process.env) {
   const env = Object.fromEntries(Object.entries(parent).filter(([name]) => !/^GLADIUS_/i.test(name)));
   if (cache) env.GLADIUS_CHROMIUM_CACHE = cache;

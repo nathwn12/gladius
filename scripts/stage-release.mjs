@@ -2,11 +2,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
-import { need, sha256, verifyReceipt, verifyArtifacts, validateBlobMap, releasePreflight } from "./release-handoff.mjs";
+import { need, sha256, verifyReceipt, verifyArtifacts, validateBlobMap, releasePreflight, assertNetworkAllowed } from "./release-handoff.mjs";
 
 const repo = "nathwn12/gladius";
-const gh = (args, input) => execFileSync("gh", args, { input, encoding: "utf8", windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+const gh = (args, input) => {
+  assertNetworkAllowed(`gh ${args.join(" ")}`);
+  return execFileSync("gh", args, { input, encoding: "utf8", windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+};
 const maybe = (suffix) => {
+  assertNetworkAllowed(`gh api repos/${repo}/${suffix}`);
   const r = spawnSync("gh", ["api", `repos/${repo}/${suffix}`], { encoding: "utf8", windowsHide: true });
   if (r.status === 0) return JSON.parse(r.stdout);
   need(/HTTP 404/.test(r.stderr), `GitHub lookup failed: ${suffix}: ${r.stderr}`);

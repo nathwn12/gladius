@@ -3,24 +3,32 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
-import { need, sha256, safeName, verifyReceipt, verifyArtifacts, releaseIdentity } from "./release-handoff.mjs";
+import { need, sha256, safeName, verifyReceipt, verifyArtifacts, releaseIdentity, assertNetworkAllowed } from "./release-handoff.mjs";
 import { publishAndVerify, verifyRegistry } from "./registry-verification.mjs";
 
 const repo = "nathwn12/gladius";
 const env = process.env;
-const gh = (args, input) => execFileSync("gh", args, { input, encoding: "utf8", windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+const gh = (args, input) => {
+  assertNetworkAllowed(`gh ${args.join(" ")}`);
+  return execFileSync("gh", args, { input, encoding: "utf8", windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+};
 const api = (suffix, data, method) => JSON.parse(gh(["api", `repos/${repo}/${suffix}`, ...(method ? ["--method", method] : []), ...(data ? ["--input", "-"] : [])], data ? JSON.stringify(data) : undefined));
 const maybe = (suffix) => {
+  assertNetworkAllowed(`gh api repos/${repo}/${suffix}`);
   const r = spawnSync("gh", ["api", `repos/${repo}/${suffix}`], { encoding: "utf8", windowsHide: true });
   if (r.status === 0) return JSON.parse(r.stdout);
   need(/HTTP 404/.test(r.stderr), `GitHub lookup failed: ${suffix}: ${r.stderr}`);
   return null;
 };
+const netFetch = (url, init) => {
+  assertNetworkAllowed(`fetch ${url}`);
+  return fetch(url, init);
+};
 const bytes = (file) => fs.readFileSync(file);
 const dir = "staged";
 const backupDir = "release-backup";
 async function download(url) {
-  const response = await fetch(url);
+  const response = await netFetch(url);
   need(response.ok, `download HTTP ${response.status}: ${url}`);
   return Buffer.from(await response.arrayBuffer());
 }
@@ -58,7 +66,7 @@ try {
   const tarball = path.resolve(dir, npmArtifact.name);
   const integrity = `sha512-${createHash("sha512").update(bytes(tarball)).digest("base64")}`;
   const registryUrl = `https://registry.npmjs.org/gladius-mcp/${env.VERSION}`;
-  const existing = await fetch(registryUrl);
+  const existing = await netFetch(registryUrl);
   need(existing.ok || existing.status === 404, `registry lookup HTTP ${existing.status}`);
   const published = existing.ok ? await existing.json() : null;
   if (published) need(published.dist?.integrity === integrity, "immutable npm version integrity conflict");
@@ -111,12 +119,13 @@ try {
     }
     for (const a of immutable) need(sha256(await download(`https://github.com/${repo}/releases/download/gladius/${a.name}`)) === a.sha256, `immutable asset fetch mismatch: ${a.name}`);
     const verify = () => verifyRegistry({
-      fetch, version: env.VERSION, integrity, download,
+      fetch: netFetch, version: env.VERSION, integrity, download,
       hash: (data) => `sha512-${createHash("sha512").update(data).digest("base64")}`,
     });
     if (published) await verify();
     else await publishAndVerify({
       publish: () => {
+        assertNetworkAllowed("npm publish");
         const command = `npm publish "${npmArtifact.name}" --ignore-scripts`;
         const result = spawnSync(command, { shell: true, cwd: path.resolve(dir), stdio: "inherit", windowsHide: true });
         need(result.status === 0, "npm publish did not confirm success; query registry integrity before any further attempt");
