@@ -161,31 +161,36 @@ fn engine_parentage() -> Vec<(u32, u32)> {
         .collect()
 }
 
-/// True while a process with this pid exists (read-only WMI probe; never
-/// kills anything).
+/// True while a process with this pid exists. Read-only: opens the process
+/// with query-limited access and reads its exit code, killing nothing.
+/// A spawn-per-probe WMI query returned false negatives under load here, so
+/// the native API is the oracle for process liveness in this fixture.
+#[cfg(windows)]
 fn process_alive(pid: u32) -> bool {
-    let mut q = Command::new("powershell");
-    q.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        &format!(
-            "Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\" | ForEach-Object {{ $_.ProcessId }}"
-        ),
-    ])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        q.creation_flags(0x08000000);
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn GetExitCodeProcess(handle: *mut c_void, exit_code: *mut u32) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
     }
-    let out = q.spawn().expect("spawn liveness query").wait_with_output();
-    match out {
-        Ok(o) => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
-        Err(_) => true, // any doubt keeps waiting, never declares dead
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        ok != 0 && code == STILL_ACTIVE
     }
+}
+
+#[cfg(not(windows))]
+fn process_alive(_pid: u32) -> bool {
+    true
 }
 
 /// EOF the server and require a clean exit (proves no hang, no orphan hold).
@@ -356,6 +361,59 @@ fn kill_tree(pid: u32) {
     let _ = cmd.spawn().and_then(|mut c| c.wait());
 }
 
+/// Parent process id from a native process snapshot. Read-only: this is how
+/// the fixture proves the engine in the record is its own disposable child
+/// before it hard-kills the server or cleans up a survivor.
+#[cfg(windows)]
+fn parent_pid(pid: u32) -> Option<u32> {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct Entry {
+        dw_size: u32,
+        cnt_usage: u32,
+        process_id: u32,
+        default_heap_id: usize,
+        module_id: u32,
+        cnt_threads: u32,
+        parent_process_id: u32,
+        base_priority: i32,
+        flags: u32,
+        exe_file: [u16; 260],
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut c_void;
+        fn Process32FirstW(snapshot: *mut c_void, entry: *mut Entry) -> i32;
+        fn Process32NextW(snapshot: *mut c_void, entry: *mut Entry) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+    const TH32CS_SNAPPROCESS: u32 = 0x2;
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap as isize == -1 {
+            return None;
+        }
+        let mut entry: Entry = std::mem::zeroed();
+        entry.dw_size = std::mem::size_of::<Entry>() as u32;
+        let mut ok = Process32FirstW(snap, &mut entry);
+        while ok != 0 {
+            if entry.process_id == pid {
+                let parent = entry.parent_process_id;
+                CloseHandle(snap);
+                return Some(parent);
+            }
+            ok = Process32NextW(snap, &mut entry);
+        }
+        CloseHandle(snap);
+        None
+    }
+}
+
+#[cfg(not(windows))]
+fn parent_pid(_pid: u32) -> Option<u32> {
+    None
+}
+
 /// S2.2: the job object is the primary reaper, but the launch path where job
 /// assignment FAILED has no cover at all. `GLADIUS_TEST_NO_JOB=1` reproduces
 /// that path honestly (no job is armed), so a hard-killed server leaves a
@@ -393,6 +451,13 @@ fn pid_file_reaps_a_jobless_orphan() {
     assert!(
         process_alive(engine_pid),
         "the recorded engine pid is alive before the kill"
+    );
+    // The record is only authority over a process we can prove is this
+    // fixture's own child. Never act on an unproven pid.
+    assert_eq!(
+        parent_pid(engine_pid),
+        Some(apid),
+        "the recorded engine is a child of this fixture server"
     );
 
     a.child.kill().expect("hard-kill server A");
