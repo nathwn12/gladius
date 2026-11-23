@@ -1,76 +1,78 @@
-# gladius-mcp
+<h1 align="center">gladius-mcp</h1>
 
-MCP browser-use server: a native Rust binary driving the owned pinned
-Chromium (`chrome-headless-shell`) over CDP, served over stdio. This package
-is a dependency-free Node launcher plus a pinned browser/runtime manifest —
-it contains no browser bytes and no server bytes.
+<p align="center"><strong>A stdio MCP server that drives a pinned headless browser over CDP with typed tools; the launcher provisions and verifies the runtime and browser on first run.</strong></p>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/gladius-mcp"><img src="https://img.shields.io/npm/v/gladius-mcp" alt="npm version" /></a>
-  <img src="https://img.shields.io/badge/platform-windows%20x64-blue" alt="platform" />
+  <img src="https://img.shields.io/badge/platform-windows--64bit-2b3137?logo=windows&logoColor=white" alt="Windows x64" />
   <img src="https://img.shields.io/badge/tools-25-brightgreen" alt="25 tools" />
-  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT" />
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license" />
 </p>
 
-## Run
+## Install
 
 ```sh
 npx gladius-mcp@latest
 ```
 
-Or pin it in an MCP client as a stdio server with command `npx` and args
-`["gladius-mcp@latest"]`.
+With no arguments this starts the long-lived stdio server. `--doctor` and `--version` are one-shot offline checks that exit; they do not start the server. Global installs are refused; pin an exact build by replacing `latest` with a version.
 
-First run provisions two things, both sha256-verified before and after
-extraction: the pinned server runtime from the tagged GitHub Release into
-`%LOCALAPPDATA%\gladius\engine\<serverVersion>-<bundleSha8>\`, and the
-pinned browser from Google's Chrome-for-Testing endpoint (~120 MB download)
-into `%LOCALAPPDATA%\gladius\chromium\<version>-<zipSha8>\`. Both are reused
-on later runs (re-verified each time); any mismatch refuses and writes
-nothing. An explicit `GLADIUS_CHROMIUM` binary wins instead: on that path no
-browser is provisioned at all. All launcher chatter goes to stderr; stdout
-belongs to the MCP channel.
+### Or let your AI install it
 
-## Diagnostics (no network)
-
-```sh
-npx gladius-mcp@latest --doctor
+```text
+Install nathwn12/gladius (gladius-mcp) with npx gladius-mcp@latest, then prove it works.
+1. Run: npx gladius-mcp@latest
+2. First run: provisions the pinned runtime and browser, verifies both, then serves MCP over stdio; needs Windows x64, Node >= 22.14.0 and network access.
+3. Done when: npx gladius-mcp@latest --doctor exits 0 and prints "network": "none: this diagnostic performs no fetch and exits before any download code".
+If it fails, stop and paste the full output; do not improvise a fix.
 ```
 
-Prints the pinned manifest and the resolved cache paths, exits 0, performs
-no fetch. `--print-manifest` is an alias.
+### Wire it yourself
 
-## Overrides
+Add the server to an OpenCode config and restart the client:
 
-Use `npx gladius-mcp@latest`; a pinned version is only installable while its
-GitHub release exists; the one-release policy deletes older releases.
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "gladius": {
+        "type": "local",
+        "command": ["cmd", "/c", "npx", "-y", "gladius-mcp@latest"]
+      }
+    }
+  }
+}
+```
+
+The `-y` flag keeps the non-interactive spawn from prompting. Any stdio MCP client can use the same command.
+
+### Offline or pinned
+
+Pin the npm package with `npx gladius-mcp@0.8.0`. That pins the package version; the bundled `engine-manifest.json` records the runtime asset the launcher fetches. For the published 0.8.0 build that record points under the `gladius` release tag to `gladius-v0.8.0-windows-x86_64.zip`. The release workflow performs no deletion; both the `gladius` and `v0.7.1` releases are present. The package ships no browser or server bytes, so a fresh run still needs network. Set `GLADIUS_CHROMIUM` to an existing `chrome-headless-shell` binary to skip browser provisioning.
+
+## Capabilities
+
+Twenty-five tools over one stdio connection: navigate, snapshot, click, type, screenshot and assert layout. Each tool returns a versioned schema with typed error codes; layout checks report measured boxes and deterministic captures carry a content checksum. The launcher verifies the pinned runtime and browser by sha256 before and after extraction and reuses both on later runs.
 
 ## Requirements
 
-- Windows x86_64. Any other platform refuses at startup
-  (override for diagnostics only: `GLADIUS_MCP_ALLOW_NON_WINDOWS=1`).
-- Node.js >= 22.14.0 (global `fetch` plus `crypto`/`zlib` builtins only;
-  zero dependencies).
+- Windows x64. Other platforms refuse at startup; `GLADIUS_MCP_ALLOW_NON_WINDOWS=1` bypasses the gate for diagnostics only.
+- Node.js >= 22.14.0 for the launcher; no package dependencies.
+- An MCP client that speaks stdio.
+- Network on first run to fetch the pinned runtime and browser. There is no fully offline fresh install; headless only.
 
-## Browser provenance
+## Status
 
-The browser is Chrome-for-Testing `chrome-headless-shell` `156.0.8078.80`
-(headless-only), fetched at provision time from
-`https://storage.googleapis.com/chrome-for-testing-public/156.0.8078.80/win64/chrome-headless-shell-win64.zip`.
-It is NEVER redistributed in our release assets or this package: our own
-manifest is the integrity root (CfT publishes no hashes), and the in-package
-manifest pins the archive hash, the extracted tree's file count + total size,
-and every per-file sha256. The runtime bundle carries the Chromium licence
-attribution copy (`THIRD-PARTY-LICENSES/LICENSE.headless_shell`).
+**Experimental** — pre-release; interfaces may change.
 
-## Full documentation
+## Links
 
-https://github.com/nathwn12/gladius/blob/main/README.md
-https://www.npmjs.com/package/gladius-mcp
-
-## License
-
-MIT - see LICENSE.
+- [Issues](https://github.com/nathwn12/gladius/issues)
+- [Releases](https://github.com/nathwn12/gladius/releases)
+- [Guide](https://github.com/nathwn12/gladius/blob/main/docs/GUIDE.md)
+- [npm package](https://www.npmjs.com/package/gladius-mcp)
+- [MIT](LICENSE)
 
 <p align="center">
   <img src="signature-glyph.svg" width="120" alt="nathwn12 signature" />

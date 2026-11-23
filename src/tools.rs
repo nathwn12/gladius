@@ -3,6 +3,11 @@ use serde_json::{json, Value};
 use crate::browser::Browser;
 use crate::fetch::fetch_text;
 
+/// Single source of truth for the tool inventory size. `list()` is the
+/// producer; the guard test fails if the two ever drift. The handshake uses
+/// this instead of constructing the whole catalog just to count tools.
+pub(crate) const TOOL_COUNT: usize = 25;
+
 pub fn list() -> Value {
     let mut listed = json!({"tools": [
         {"name": "navigate", "title": "Navigate",
@@ -2073,7 +2078,19 @@ fn unreadable_value(role: &str, ax_value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::unreadable_value;
+    use super::{list, unreadable_value, TOOL_COUNT};
+
+    /// The constant the handshake reads must never drift from the catalog the
+    /// tools/list method publishes. A wrong count changes the initialize and
+    /// server/discover wire response without changing any behaviour test.
+    #[test]
+    fn tool_count_matches_catalog() {
+        assert_eq!(
+            list()["tools"].as_array().map(|a| a.len()),
+            Some(TOOL_COUNT),
+            "TOOL_COUNT must equal the published tool inventory"
+        );
+    }
 
     /// The unreadable fallback is the ONE branch where the value comes from
     /// the AX tree instead of the live element, so it cannot consult the
