@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use futures_util::FutureExt;
@@ -121,7 +121,13 @@ fn capabilities() -> Value {
 }
 
 fn instructions() -> &'static str {
-    "Gladius is headless-only (no headed mode). Always start with snapshot to get stable @eN refs, then act with @eN refs or CSS selectors. All 25 tools report typed errors (structuredContent code/reason alongside the prose); tool failures are results, never protocol errors. Everything rides CDP: no OS cursor, no OS keyboard, no focus stealing, no visible window on the owned headless engine (an engine you attached with GLADIUS_CDP_URL is yours, and visual compare opens one scratch tab there). screenshot {deterministic:true}, assert_layout, layout and visual prove pixels and geometry without a foreground tab. deterministic captures are frozen for CSS/WAAPI/SMIL/media in the main document and same-process frames; canvas, WebGL and cross-process iframes are sampled."
+    static INSTRUCTIONS: LazyLock<String> = LazyLock::new(|| {
+        format!(
+            "Gladius is headless-only (no headed mode). Always start with snapshot to get stable @eN refs, then act with @eN refs or CSS selectors. All {TOOL_COUNT} tools report typed errors (structuredContent code/reason alongside the prose); tool failures are results, never protocol errors. Everything rides CDP: no OS cursor, no OS keyboard, no focus stealing, no visible window on the owned headless engine (an engine you attached with GLADIUS_CDP_URL is yours, and visual compare opens one scratch tab there). screenshot {{deterministic:true}}, assert_layout, layout and visual prove pixels and geometry without a foreground tab. deterministic captures are frozen for CSS/WAAPI/SMIL/media in the main document and same-process frames; canvas, WebGL and cross-process iframes are sampled.",
+            TOOL_COUNT = crate::tools::TOOL_COUNT
+        )
+    });
+    &INSTRUCTIONS
 }
 
 fn server_info() -> Value {
@@ -138,12 +144,7 @@ fn server_info() -> Value {
     if let Some(url) = info.get("cdpUrl") {
         m.insert("cdpUrl".to_string(), url.clone());
     }
-    let tool_count = crate::tools::list()
-        .get("tools")
-        .and_then(|t| t.as_array())
-        .map(|a| a.len())
-        .unwrap_or(21);
-    m.insert("count".to_string(), json!(tool_count));
+    m.insert("count".to_string(), json!(crate::tools::TOOL_COUNT));
     let mut gated = serde_json::Map::new();
     if info.get("caps").and_then(|c| c.as_str()) != Some("render") {
         gated.insert("screenshot".to_string(), json!("requires caps: render"));
