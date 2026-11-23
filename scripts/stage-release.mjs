@@ -1,11 +1,17 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
-import { need, sha256, verifyReceipt, verifyArtifacts, validateBlobMap } from "./release-handoff.mjs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { need, sha256, verifyReceipt, verifyArtifacts, validateBlobMap, releasePreflight } from "./release-handoff.mjs";
 
 const repo = "nathwn12/gladius";
 const gh = (args, input) => execFileSync("gh", args, { input, encoding: "utf8", windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+const maybe = (suffix) => {
+  const r = spawnSync("gh", ["api", `repos/${repo}/${suffix}`], { encoding: "utf8", windowsHide: true });
+  if (r.status === 0) return JSON.parse(r.stdout);
+  need(/HTTP 404/.test(r.stderr), `GitHub lookup failed: ${suffix}: ${r.stderr}`);
+  return null;
+};
 try {
   const download = process.argv[2] === "--download";
   const dir = path.resolve(process.argv[3] || "");
@@ -26,10 +32,15 @@ try {
   } else {
     const bytes = fs.readFileSync(path.join(dir, "release-receipt.json"));
     const receipt = JSON.parse(bytes);
+    releasePreflight({
+      commit: receipt.commit,
+      main: gh(["api", `repos/${repo}/git/ref/heads/main`, "--jq", ".object.sha"]).trim(),
+      tag: maybe("git/ref/tags/gladius"),
+      readTagObject: (sha) => JSON.parse(gh(["api", `repos/${repo}/git/tags/${sha}`])).object,
+    });
     const receiptSha256 = sha256(bytes);
     const r = verifyReceipt(dir, { commit: receipt.commit, version: receipt.version, receiptSha256 });
     verifyArtifacts(dir, r);
-    need(gh(["api", `repos/${repo}/git/ref/heads/main`, "--jq", ".object.sha"]).trim() === r.commit, "land the exact tested commit on main before staging");
     const blobs = {};
     for (const name of ["release-receipt.json", ...r.artifacts.map((a) => a.name)]) {
       const content = fs.readFileSync(path.join(dir, name)).toString("base64");

@@ -38,6 +38,23 @@ export function releaseIdentity(release) {
   return { id, tag_name, name, body, draft, prerelease, assets };
 }
 
+export function resolveTagCommit(ref, readTagObject) {
+  if (!ref) return null;
+  need(ref.object && typeof ref.object === "object", "malformed product tag ref");
+  let object = ref.object;
+  for (let i = 0; object.type === "tag" && i < 5; i++) object = readTagObject(object.sha);
+  need(object.type === "commit" && /^[0-9a-f]{40}$/.test(object.sha), "product tag is not a commit");
+  return object.sha;
+}
+
+export function releasePreflight({ commit, main, tag, readTagObject }) {
+  need(/^[0-9a-f]{40}$/.test(commit), "invalid planned commit");
+  need(/^[0-9a-f]{40}$/.test(main) && main === commit, "landed mismatch: live main is not the planned commit; land the exact tested commit on main before staging");
+  const bound = resolveTagCommit(tag, readTagObject);
+  need(!bound || bound === commit, "blocked shared tag: gladius binds another commit; publisher refuses to move it");
+  return { commit, main, tag: bound };
+}
+
 export function verifyReceipt(dir, expected) {
   need(/^[0-9a-f]{64}$/.test(expected.receiptSha256), "invalid receipt digest");
   const bytes = readFileSync(join(dir, "release-receipt.json"));

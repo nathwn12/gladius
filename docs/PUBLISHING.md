@@ -45,6 +45,16 @@ node scripts/stage-release.mjs --upload target/release-candidate
 gh run list --workflow stage-release.yml --limit 1
 ```
 
+Before any upload or dispatch, `--upload` runs a read-only preflight against the
+receipt's commit. It reads live `main` and the `gladius` tag, then refuses with
+`landed mismatch` when `main` is not that commit, or with `blocked shared tag`
+when the tag binds a different commit. Both refusals are made before the local
+artifact hashing, blob upload and staging dispatch, so a plan that the publisher
+would reject costs no build, upload or rehearsal. The publisher still repeats the
+tag check at publish time; this only moves the same refusal earlier. An absent
+tag, or a tag already bound to the planned commit, passes. The preflight creates
+no ref and writes no release, asset or registry entry.
+
 The staging command uploads public, credential-free git blobs without creating
 or moving a ref. They contain only the already public release artifacts. A
 read-only staging workflow verifies their receipt and produces the one-day
@@ -97,6 +107,29 @@ No workflow in this lane moves shared refs, deletes historical tags or removes
 historical release objects. Do not bypass that refusal with a force push.
 Version derivation reads the package version at the reachable product tag, while
 retaining legacy version tags as historical anchors.
+
+### Comparison: smallest immutable version-tag route (not implemented here)
+
+The publisher may create an absent `gladius` tag but never moves an existing one.
+With `gladius` bound to an older commit, every newer landed plan reaches that
+refusal. The smallest route that removes the repeated refusal keeps the shared
+name as a stable alias and makes each release's identity immutable:
+
+1. Tag each landed release once with `vX.Y.Z`. That tag never moves and becomes
+   the historical anchor version derivation reads instead of the shared tag.
+2. Keep `gladius` as the human-facing alias and the source of the stable download
+   URL. Move it only through the separately approved tag-movement operation;
+   the publisher never moves it.
+3. Keep the version-specific `gladius-vX.Y.Z-windows-x86_64.zip` assets and their
+   checksums accumulating under the `gladius` release, and keep
+   `gladius-windows-x86_64.zip` as the clobbered current alias. Published npm
+   versions pin the immutable asset, so they survive an alias move.
+
+Cost: one extra tag per release, a version-derivation source change and an
+approved alias-move step per release. Benefit: no shared-tag mismatch refusal on
+the normal path, and historical pins stay immutable. This slice only exposes the
+refusal earlier; it does not change tags, version derivation, asset names or the
+publish destination.
 
 ## First-cutover audit and backup
 

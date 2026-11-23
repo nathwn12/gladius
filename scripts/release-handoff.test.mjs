@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { verifyReceipt, requiredChecks, verifyArtifacts, validateBlobMap, releaseIdentity, releaseEnvironment, assembleRuntime } from "./release-handoff.mjs";
+import { verifyReceipt, requiredChecks, verifyArtifacts, validateBlobMap, releaseIdentity, releaseEnvironment, assembleRuntime, releasePreflight, resolveTagCommit } from "./release-handoff.mjs";
 import { mkdirSync, cpSync, existsSync, readdirSync } from "node:fs";
 
 test("handoff accepts exact bytes and refuses corruption, stale identity and incomplete gates", () => {
@@ -152,4 +152,34 @@ test("assembled ZIP provisions through the actual launcher without a browser dow
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("preflight returns red for a blocked shared tag and a landed mismatch, green for the planned route", () => {
+  const commit = "a".repeat(40);
+  const other = "b".repeat(40);
+  const readTagObject = () => ({ type: "commit", sha: commit });
+  const tagAt = (sha) => ({ object: { type: "commit", sha } });
+  assert.deepEqual(releasePreflight({ commit, main: commit, tag: null, readTagObject }), { commit, main: commit, tag: null });
+  assert.deepEqual(releasePreflight({ commit, main: commit, tag: tagAt(commit), readTagObject }), { commit, main: commit, tag: commit });
+  assert.deepEqual(releasePreflight({ commit, main: commit, tag: { object: { type: "tag", sha: "c".repeat(40) } }, readTagObject }), { commit, main: commit, tag: commit });
+  assert.throws(() => releasePreflight({ commit, main: commit, tag: tagAt(other), readTagObject }), /blocked shared tag/);
+  assert.throws(() => releasePreflight({ commit, main: other, tag: null, readTagObject }), /landed mismatch/);
+  assert.throws(() => releasePreflight({ commit: "short", main: commit, tag: null, readTagObject }), /invalid planned commit/);
+  assert.throws(() => resolveTagCommit({ object: { type: "tag", sha: "c".repeat(40) } }, () => ({ type: "blob", sha: other })), /product tag is not a commit/);
+});
+
+test("staging checks live main and tag before any blob upload or dispatch", () => {
+  const text = readFileSync("scripts/stage-release.mjs", "utf8");
+  const preflight = text.indexOf("releasePreflight(");
+  assert.ok(preflight > 0, "staging must call the read-only preflight");
+  assert.match(text, /git\/ref\/tags\/gladius/);
+  assert.ok(preflight < text.lastIndexOf("git/blobs"), "preflight must precede blob upload");
+  assert.ok(preflight < text.indexOf("dispatches"), "preflight must precede dispatch");
+});
+
+test("publisher still refuses shared-tag movement; preflight mirrors that contract", () => {
+  const text = readFileSync("scripts/publish-release.mjs", "utf8");
+  assert.match(text, /git\/ref\/tags\/gladius/);
+  assert.match(text, /tagCommit\(ref\) === env\.COMMIT/);
+  assert.match(text, /product tag movement requires a specific safety approval/);
 });
