@@ -11,7 +11,7 @@ const SELF_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 const CONVENTIONAL = /^([a-z]+)(?:\(([^()]*)\))?(!)?: (.+)$/;
 const TYPES = new Set([
-  "feat", "fix", "perf", "docs", "chore", "test", "build", "ci", "style", "refactor", "revert",
+  "feat", "fix", "perf", "docs", "chore", "test", "build", "ci", "check", "style", "refactor", "revert",
 ]);
 const BUMP = { feat: "minor", fix: "patch", perf: "patch" };
 const FILES = {
@@ -571,6 +571,7 @@ function runCheck() {
       record("refuse-empty-range-merge-only", ok, ok ? "refused empty-range" : `got ${got.ok ? got.result.version : got.code}`);
     }
     expect("refuse-only-chore", "1.0.0", [{ subject: "chore: deps" }, { subject: "docs: readme" }], { code: "no-release-type" });
+    expect("check-type-is-no-bump", "1.0.0", [{ subject: "check(stage): preflight main and tag" }], { code: "no-release-type" });
     expect("refuse-non-conventional", "1.0.0", [{ subject: "Fixed the thing" }], { code: "non-conventional" });
     expect("refuse-unknown-type", "1.0.0", [{ subject: "wip: half a feature" }], { code: "non-conventional" });
 
