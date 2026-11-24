@@ -1070,7 +1070,9 @@ async fn handle_fast(req: &Value, _browser: &Arc<Browser>) -> Option<Value> {
             "capabilities": capabilities(),
             "serverInfo": server_info(),
             "instructions": instructions(),
-            "resultType": "complete"
+            "resultType": "complete",
+            "ttlMs": 0,
+            "cacheScope": "private"
         }})),
         "notifications/initialized" => None, // notification: no reply
         "notifications/cancelled" => None,   // handled in the read loop; never a reply
@@ -1080,6 +1082,8 @@ async fn handle_fast(req: &Value, _browser: &Arc<Browser>) -> Option<Value> {
             if modern {
                 if let Some(obj) = result.as_object_mut() {
                     obj.insert("resultType".to_string(), json!("complete"));
+                    obj.insert("ttlMs".to_string(), json!(0));
+                    obj.insert("cacheScope".to_string(), json!("private"));
                 }
             }
             Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
