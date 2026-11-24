@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { verifyReceipt, requiredChecks, verifyArtifacts, validateBlobMap, releaseIdentity, releaseEnvironment, assembleRuntime, releasePreflight, resolveTagCommit, OfflineRefusal } from "./release-handoff.mjs";
+import { verifyReceipt, requiredChecks, verifyArtifacts, validateBlobMap, releaseIdentity, releaseEnvironment, assembleRuntime, releasePreflight, resolveTagCommit, OfflineRefusal, versionTagName, verifyReleaseAppend, releaseNotes } from "./release-handoff.mjs";
 import { mkdirSync, cpSync, existsSync, readdirSync } from "node:fs";
 
 test("handoff accepts exact bytes and refuses corruption, stale identity and incomplete gates", () => {
@@ -154,34 +154,68 @@ test("assembled ZIP provisions through the actual launcher without a browser dow
   }
 });
 
-test("preflight returns red for a blocked shared tag and a landed mismatch, green for the planned route", () => {
+test("preflight fails closed on a conflicting version tag and a landed mismatch", () => {
   const commit = "a".repeat(40);
   const other = "b".repeat(40);
   const readTagObject = () => ({ type: "commit", sha: commit });
   const tagAt = (sha) => ({ object: { type: "commit", sha } });
+  assert.equal(versionTagName("0.8.1"), "v0.8.1");
   assert.deepEqual(releasePreflight({ commit, main: commit, tag: null, readTagObject }), { commit, main: commit, tag: null });
   assert.deepEqual(releasePreflight({ commit, main: commit, tag: tagAt(commit), readTagObject }), { commit, main: commit, tag: commit });
   assert.deepEqual(releasePreflight({ commit, main: commit, tag: { object: { type: "tag", sha: "c".repeat(40) } }, readTagObject }), { commit, main: commit, tag: commit });
-  assert.throws(() => releasePreflight({ commit, main: commit, tag: tagAt(other), readTagObject }), /blocked shared tag/);
+  assert.throws(() => releasePreflight({ commit, main: commit, tag: tagAt(other), readTagObject }), /conflicting version tag/);
   assert.throws(() => releasePreflight({ commit, main: other, tag: null, readTagObject }), /landed mismatch/);
   assert.throws(() => releasePreflight({ commit: "short", main: commit, tag: null, readTagObject }), /invalid planned commit/);
   assert.throws(() => resolveTagCommit({ object: { type: "tag", sha: "c".repeat(40) } }, () => ({ type: "blob", sha: other })), /product tag is not a commit/);
 });
 
-test("staging checks live main and tag before any blob upload or dispatch", () => {
+test("staging checks live main and the version tag before any blob upload or dispatch", () => {
   const text = readFileSync("scripts/stage-release.mjs", "utf8");
   const preflight = text.indexOf("releasePreflight(");
   assert.ok(preflight > 0, "staging must call the read-only preflight");
-  assert.match(text, /git\/ref\/tags\/gladius/);
+  assert.match(text, /versionTagName\(receipt\.version\)/);
+  assert.doesNotMatch(text, /git\/ref\/tags\/gladius/);
   assert.ok(preflight < text.lastIndexOf("git/blobs"), "preflight must precede blob upload");
   assert.ok(preflight < text.indexOf("dispatches"), "preflight must precede dispatch");
 });
 
-test("publisher still refuses shared-tag movement; preflight mirrors that contract", () => {
+test("publisher keeps the gladius page, writes only the version tag, and never clobbers assets", () => {
   const text = readFileSync("scripts/publish-release.mjs", "utf8");
-  assert.match(text, /git\/ref\/tags\/gladius/);
+  assert.match(text, /versionTagName\(env\.VERSION\)/);
   assert.match(text, /tagCommit\(ref\) === env\.COMMIT/);
-  assert.match(text, /product tag movement requires a specific safety approval/);
+  assert.match(text, /conflicting version tag/);
+  assert.match(text, /releases\/tags\/gladius/);
+  assert.match(text, /verifyReleaseAppend\(/);
+  assert.doesNotMatch(text, /refs\/tags\/gladius/);
+  assert.doesNotMatch(text, /--clobber/);
+  assert.match(text, /sharedRef/);
+});
+
+test("release-page append preserves every old asset and proves the versioned asset landed", () => {
+  const old = { id: 7, tag_name: "gladius", name: "gladius 0.8.0", draft: false, prerelease: false, assets: [
+    { name: "gladius-v0.8.0-windows-x86_64.zip", size: 10, digest: "sha256:old" },
+    { name: "gladius-v0.8.0-windows-x86_64.zip.sha256", size: 11, digest: "sha256:oldsha" },
+  ] };
+  const appended = { name: "gladius-v0.8.1-windows-x86_64.zip", size: 20, digest: "sha256:new" };
+  const good = { ...old, name: "gladius 0.8.1", assets: [...old.assets, appended] };
+  assert.equal(verifyReleaseAppend(old, good, [appended]), good);
+
+  const changed = { ...good, assets: [old.assets[0], { ...old.assets[1], digest: "sha256:evil" }, appended] };
+  assert.throws(() => verifyReleaseAppend(old, changed, [appended]), /existing asset changed/);
+  const deleted = { ...good, assets: [old.assets[0], appended] };
+  assert.throws(() => verifyReleaseAppend(old, deleted, [appended]), /existing asset changed/);
+  const missingNew = { ...old, name: "gladius 0.8.1" };
+  assert.throws(() => verifyReleaseAppend(old, missingNew, [appended]), /versioned asset not appended/);
+  const wrongBytes = { ...good, assets: [...old.assets, { ...appended, digest: "sha256:wrong" }] };
+  assert.throws(() => verifyReleaseAppend(old, wrongBytes, [appended]), /versioned asset not appended/);
+  const pageSwapped = { ...good, id: 99, tag_name: "other" };
+  assert.throws(() => verifyReleaseAppend(old, pageSwapped, [appended]), /release page identity changed/);
+});
+
+test("release notes point at the immutable versioned asset, not the mutable alias", () => {
+  const notes = releaseNotes("0.8.1", "a".repeat(64));
+  assert.match(notes, /gladius-v0\.8\.1-windows-x86_64\.zip/);
+  assert.doesNotMatch(notes, /releases\/download\/gladius\/gladius-windows-x86_64\.zip/);
 });
 
 test("OC_NO_NETWORK refusal is typed and names the guard", () => {

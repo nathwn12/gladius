@@ -59,11 +59,33 @@ export function resolveTagCommit(ref, readTagObject) {
   return object.sha;
 }
 
+export const versionTagName = (version) => `v${version}`;
+
+/// Prove a release-page mutation only appended the versioned asset. Every
+/// pre-existing asset must survive byte-identical, and each expected new
+/// asset must land with the exact size and digest from the receipt. A missing
+/// asset or a changed byte fails closed instead of reading as a green publish.
+export function verifyReleaseAppend(before, after, appended) {
+  need(before && after, "release page missing before or after append");
+  need(before.id === after.id && before.tag_name === after.tag_name, "release page identity changed");
+  need(!after.draft && !after.prerelease, "release page is not a published page");
+  const now = new Map((after.assets ?? []).map((a) => [a.name, a]));
+  for (const old of before.assets ?? []) {
+    const kept = now.get(old.name);
+    need(kept && kept.size === old.size && kept.digest === old.digest, `existing asset changed or vanished: ${old.name}`);
+  }
+  for (const a of appended) {
+    const landed = now.get(a.name);
+    need(landed && landed.size === a.size && landed.digest === a.digest, `versioned asset not appended: ${a.name}`);
+  }
+  return after;
+}
+
 export function releasePreflight({ commit, main, tag, readTagObject }) {
   need(/^[0-9a-f]{40}$/.test(commit), "invalid planned commit");
   need(/^[0-9a-f]{40}$/.test(main) && main === commit, "landed mismatch: live main is not the planned commit; land the exact tested commit on main before staging");
   const bound = resolveTagCommit(tag, readTagObject);
-  need(!bound || bound === commit, "blocked shared tag: gladius binds another commit; publisher refuses to move it");
+  need(!bound || bound === commit, "conflicting version tag: it binds another commit; refusing to publish a different identity");
   return { commit, main, tag: bound };
 }
 
@@ -96,8 +118,8 @@ export function verifyReceipt(dir, expected) {
 }
 
 export function releaseNotes(version, hash) {
-  const stable = "gladius-windows-x86_64.zip";
-  return `gladius ${version}\n\nGladius provides headless browser tools over MCP.\n\nDownload: https://github.com/nathwn12/gladius/releases/download/gladius/${stable}\nSHA-256: ${hash} (${stable})\n`;
+  const asset = `gladius-v${version}-windows-x86_64.zip`;
+  return `gladius ${version}\n\nGladius provides headless browser tools over MCP.\n\nDownload: https://github.com/nathwn12/gladius/releases/download/gladius/${asset}\nSHA-256: ${hash} (${asset})\n`;
 }
 
 export function verifyArtifacts(dir, r) {
