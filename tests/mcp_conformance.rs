@@ -617,3 +617,62 @@ fn notification_silence_then_ping() {
     let pong = c.result("ping", json!({}));
     assert_eq!(pong, json!({}), "ping replies {{}}");
 }
+
+/// OpenCode 2.4.1 rejects a modern result that omits the cache directives.
+/// Contract (verified by Hand): modern `tools/list` and `server/discover`
+/// carry exactly `ttlMs: 0` and `cacheScope: "private"`. Legacy `tools/list`
+/// and `tools/call` keep their current shape.
+#[test]
+fn modern_cache_directives() {
+    let mut c = Client::spawn();
+
+    let modern = c.result(
+        "tools/list",
+        json!({"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}),
+    );
+    assert_eq!(
+        modern.get("ttlMs"),
+        Some(&json!(0)),
+        "modern tools/list ttlMs:0: {modern}"
+    );
+    assert_eq!(
+        modern.get("cacheScope"),
+        Some(&json!("private")),
+        "modern tools/list cacheScope:private: {modern}"
+    );
+
+    let discover = c.result("server/discover", json!({}));
+    assert_eq!(
+        discover.get("ttlMs"),
+        Some(&json!(0)),
+        "server/discover ttlMs:0: {discover}"
+    );
+    assert_eq!(
+        discover.get("cacheScope"),
+        Some(&json!("private")),
+        "server/discover cacheScope:private: {discover}"
+    );
+
+    let legacy = c.result("tools/list", json!({}));
+    assert!(
+        legacy.get("ttlMs").is_none(),
+        "legacy tools/list keeps no ttlMs: {legacy}"
+    );
+    assert!(
+        legacy.get("cacheScope").is_none(),
+        "legacy tools/list keeps no cacheScope: {legacy}"
+    );
+
+    let call = c.result(
+        "tools/call",
+        json!({"name": "close", "arguments": {}, "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}}),
+    );
+    assert!(
+        call.get("ttlMs").is_none(),
+        "tools/call keeps no ttlMs: {call}"
+    );
+    assert!(
+        call.get("cacheScope").is_none(),
+        "tools/call keeps no cacheScope: {call}"
+    );
+}

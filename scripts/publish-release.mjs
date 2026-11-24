@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
-import { need, sha256, safeName, verifyReceipt, verifyArtifacts, releaseIdentity, assertNetworkAllowed } from "./release-handoff.mjs";
+import { need, sha256, safeName, verifyReceipt, verifyArtifacts, releaseIdentity, verifyReleaseAppend, versionTagName, assertNetworkAllowed } from "./release-handoff.mjs";
 import { publishAndVerify, verifyRegistry } from "./registry-verification.mjs";
 
 const repo = "nathwn12/gladius";
@@ -70,8 +70,9 @@ try {
   need(existing.ok || existing.status === 404, `registry lookup HTTP ${existing.status}`);
   const published = existing.ok ? await existing.json() : null;
   if (published) need(published.dist?.integrity === integrity, "immutable npm version integrity conflict");
-  const ref = maybe("git/ref/tags/gladius");
-  need(!ref || tagCommit(ref) === env.COMMIT, "product tag movement requires a specific safety approval; publisher never force-moves refs");
+  const versionTag = versionTagName(env.VERSION);
+  const ref = maybe(`git/ref/tags/${versionTag}`);
+  need(!ref || tagCommit(ref) === env.COMMIT, `conflicting version tag ${versionTag}: it binds another commit; refusing to publish a different identity`);
   let release = maybe("releases/tags/gladius");
   if (release) need(!release.draft && !release.prerelease && /^gladius \d+\.\d+\.\d+$/.test(release.name), "unrelated product release collision");
   const immutable = receipt.artifacts.filter((a) => ["runtime", "checksum"].includes(a.role));
@@ -82,7 +83,8 @@ try {
   if (prepare) {
     fs.mkdirSync(backupDir);
     fs.mkdirSync(path.join(backupDir, "assets"));
-    fs.writeFileSync(path.join(backupDir, "state.json"), JSON.stringify({ ref, release }, null, 2));
+    const sharedRef = maybe("git/ref/tags/gladius");
+    fs.writeFileSync(path.join(backupDir, "state.json"), JSON.stringify({ ref, sharedRef, release }, null, 2));
     for (const a of release?.assets || []) {
       need(safeName(a.name), "unsafe existing asset name");
       const data = await download(a.browser_download_url);
@@ -100,24 +102,16 @@ try {
     }
     const backups = api(`actions/runs/${env.GITHUB_RUN_ID}/artifacts`).artifacts;
     need(backups.some((a) => a.name === "product-backup" && !a.expired), "verified backup was not uploaded");
-    if (!ref) api("git/refs", { ref: "refs/tags/gladius", sha: env.COMMIT });
+    if (!ref) api("git/refs", { ref: `refs/tags/${versionTag}`, sha: env.COMMIT });
     const notes = bytes(path.join(dir, "release-notes.md")).toString();
     if (!release) release = api("releases", { tag_name: "gladius", target_commitish: env.COMMIT, name: `gladius ${env.VERSION}`, body: notes, draft: false, prerelease: false });
+    const appended = [];
     for (const a of immutable) {
-      if (!release.assets.some((asset) => asset.name === a.name)) gh(["release", "upload", "gladius", path.join(dir, a.name), "--repo", repo]);
+      if (!release.assets.some((asset) => asset.name === a.name)) {
+        gh(["release", "upload", "gladius", path.join(dir, a.name), "--repo", repo]);
+        appended.push({ name: a.name, size: a.size, digest: `sha256:${a.sha256}` });
+      }
     }
-    const runtime = receipt.artifacts.find((a) => a.role === "runtime");
-    const stable = "gladius-windows-x86_64.zip";
-    const currentDir = "current-assets";
-    fs.mkdirSync(currentDir);
-    fs.copyFileSync(path.join(dir, runtime.name), path.join(currentDir, stable));
-    fs.copyFileSync(path.join(dir, "engine-manifest.json"), path.join(currentDir, "engine-manifest.json"));
-    fs.writeFileSync(path.join(currentDir, `${stable}.sha256`), `${runtime.sha256}  ${stable}\n`);
-    for (const name of [stable, `${stable}.sha256`, "engine-manifest.json"]) {
-      gh(["release", "upload", "gladius", path.join(currentDir, name), "--repo", repo, "--clobber"]);
-      need(sha256(await download(`https://github.com/${repo}/releases/download/gladius/${name}`)) === sha256(bytes(path.join(currentDir, name))), `published asset fetch mismatch: ${name}`);
-    }
-    for (const a of immutable) need(sha256(await download(`https://github.com/${repo}/releases/download/gladius/${a.name}`)) === a.sha256, `immutable asset fetch mismatch: ${a.name}`);
     const verify = () => verifyRegistry({
       fetch: netFetch, version: env.VERSION, integrity, download,
       hash: (data) => `sha512-${createHash("sha512").update(data).digest("base64")}`,
@@ -134,6 +128,11 @@ try {
     });
     const current = api(`releases/${release.id}`, { name: `gladius ${env.VERSION}`, body: notes, make_latest: "true" }, "PATCH");
     need(current.tag_name === "gladius" && current.name === `gladius ${env.VERSION}` && current.body === notes, "published release metadata mismatch");
+    const fresh = api("releases/tags/gladius");
+    verifyReleaseAppend(snapshot.release ?? { id: current.id, tag_name: "gladius", assets: [] }, fresh, appended);
+    const sharedNow = maybe("git/ref/tags/gladius");
+    need(JSON.stringify(sharedNow) === JSON.stringify(snapshot.sharedRef), "shared gladius tag changed during publish");
+    for (const a of immutable) need(sha256(await download(`https://github.com/${repo}/releases/download/gladius/${a.name}`)) === a.sha256, `immutable asset fetch mismatch: ${a.name}`);
     console.log(`VERIFIED gladius-mcp@${env.VERSION} ${integrity}; historical releases and tags untouched.`);
   }
 } catch (err) {

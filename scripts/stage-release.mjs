@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
-import { need, sha256, verifyReceipt, verifyArtifacts, validateBlobMap, releasePreflight, assertNetworkAllowed } from "./release-handoff.mjs";
+import { need, sha256, verifyReceipt, verifyArtifacts, validateBlobMap, releasePreflight, versionTagName, assertNetworkAllowed } from "./release-handoff.mjs";
 
 const repo = "nathwn12/gladius";
 const gh = (args, input) => {
@@ -39,7 +39,7 @@ try {
     releasePreflight({
       commit: receipt.commit,
       main: gh(["api", `repos/${repo}/git/ref/heads/main`, "--jq", ".object.sha"]).trim(),
-      tag: maybe("git/ref/tags/gladius"),
+      tag: maybe(`git/ref/tags/${versionTagName(receipt.version)}`),
       readTagObject: (sha) => JSON.parse(gh(["api", `repos/${repo}/git/tags/${sha}`])).object,
     });
     const receiptSha256 = sha256(bytes);
