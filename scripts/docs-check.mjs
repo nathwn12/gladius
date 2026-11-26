@@ -9,7 +9,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const SELF = fileURLToPath(import.meta.url);
-const CHECKER_VERSION = '0.1.0';
+const CHECKER_VERSION = '0.2.0';
 const DEFAULT_CONFIG = 'docs-check.json';
 
 const HELP = `docs-check (phase 1)
@@ -70,7 +70,8 @@ function parseArgs(argv) {
 }
 
 function sha256Of(file) {
-  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  const text = fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  return crypto.createHash('sha256').update(text, 'utf8').digest('hex');
 }
 
 function isPlainObject(value) {
