@@ -1,1 +1,5 @@
 * text=auto eol=lf
+# The strict docs gate pins the checker by SHA-256, so its bytes must be identical
+# in every checkout. Without this, a Windows checkout rewrites LF to CRLF and the
+# pin fails (run 45730818471).
+scripts/docs-check.mjs text eol=lf
