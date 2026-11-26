@@ -2885,7 +2885,7 @@ struct ClosedRoot {
 ///    there - `#container #inner`, `#first + #inner` - only this probe can see,
 ///    and dropping it turns a real target into a miss.
 /// 2. The selector's **leading part** against the host's real ancestor chain,
-///    with the tail inside the root. A closed root's subtree is sealed off from
+///    with the tail inside the root at ANY compound boundary. A closed subtree is sealed off from
 ///    the light DOM, so `#host #inner` can never match *as a whole* (the
 ///    selector engine walks real parents, and `#inner`'s parent is the root,
 ///    not `#host`): the two halves have to be proved separately.
@@ -2928,26 +2928,32 @@ pub(crate) async fn closed_shadow_hit(browser: &Browser, selector: &str) -> bool
             if parts.len() < 2 {
                 continue;
             }
-            let Some(tail) = parts.last() else {
-                continue;
-            };
-            let Some(boundary) = combs.last().copied() else {
-                continue;
-            };
-            if boundary == '+' || boundary == '~' {
-                continue;
-            }
-            let hits = query_all(browser, r.root, tail).await;
-            if hits.is_empty() {
-                continue;
-            }
-            if boundary == '>' && !hits.iter().any(|n| r.kids.contains(n)) {
-                continue;
-            }
-            let lead = &parts[..parts.len() - 1];
-            let inner = &combs[..combs.len() - 1];
-            if prefix_reaches_host(browser, r.host, lead, inner, boundary).await {
-                return true;
+            // The root can begin at any compound boundary, not only the last
+            // one: in `#host #container #inner` the host is in the light DOM
+            // while both `#container` and `#inner` live inside the root.
+            for (i, &boundary) in combs.iter().enumerate() {
+                if boundary == '+' || boundary == '~' {
+                    continue;
+                }
+                let mut tail = String::new();
+                for (k, part) in parts[i + 1..].iter().enumerate() {
+                    if k > 0 {
+                        tail.push(combs[i + k]);
+                    }
+                    tail.push_str(part);
+                }
+                let hits = query_all(browser, r.root, &tail).await;
+                if hits.is_empty() {
+                    continue;
+                }
+                if boundary == '>' && !hits.iter().any(|n| r.kids.contains(n)) {
+                    continue;
+                }
+                let lead = &parts[..=i];
+                let inner = &combs[..i];
+                if prefix_reaches_host(browser, r.host, lead, inner, boundary).await {
+                    return true;
+                }
             }
         }
     }
