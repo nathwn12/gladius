@@ -322,14 +322,7 @@ fn snapshot_redacts_password_and_autocomplete_values() {
     let mut c = Client::spawn();
     c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     let url = format!("http://127.0.0.1:{port}/");
-    let mut nav = c.call("navigate", json!({"url": url}));
-    if is_error(&nav) && nav.to_string().contains("net::ERR_ABORTED") {
-        nav = c.call("navigate", json!({"url": url}));
-        assert!(
-            !is_error(&nav),
-            "navigate retry after net::ERR_ABORTED: {nav}"
-        );
-    }
+    let nav = c.call("navigate", json!({"url": url}));
     assert!(!is_error(&nav), "navigate ok: {nav}");
 
     let snap = c.call("snapshot", json!({}));
