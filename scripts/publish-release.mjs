@@ -3,9 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
-import { need, sha256, safeName, verifyReceipt, verifyArtifacts, releaseIdentity, verifyReleaseAppend, versionTagName, assertNetworkAllowed } from "./release-handoff.mjs";
+import { need, verifyReceipt, verifyArtifacts, versionTagName, assertNetworkAllowed } from "./release-handoff.mjs";
 import { publishAndVerify, verifyRegistry } from "./registry-verification.mjs";
 
+// Zero GitHub Release pages: the version tag and the npm registry are the
+// only remote writes this publisher makes. Nothing creates, patches or
+// uploads a release page or a release asset, and no existing page is read.
 const repo = "nathwn12/gladius";
 const env = process.env;
 const gh = (args, input) => {
@@ -25,13 +28,12 @@ const netFetch = (url, init) => {
   return fetch(url, init);
 };
 const bytes = (file) => fs.readFileSync(file);
-const dir = "staged";
-const backupDir = "release-backup";
 async function download(url) {
   const response = await netFetch(url);
   need(response.ok, `download HTTP ${response.status}: ${url}`);
   return Buffer.from(await response.arrayBuffer());
 }
+const dir = "staged";
 function tagCommit(ref) {
   if (!ref) return null;
   let object = ref.object;
@@ -57,7 +59,7 @@ try {
   const npmVersion = execFileSync("npm --version", { shell: true, encoding: "utf8", windowsHide: true }).trim().split(".").map(Number);
   need(npmVersion[0] > 11 || (npmVersion[0] === 11 && (npmVersion[1] > 5 || (npmVersion[1] === 5 && npmVersion[2] >= 1))), "trusted publishing requires npm >= 11.5.1");
   if (prepare) {
-    need(!fs.existsSync(dir) && !fs.existsSync(backupDir), "handoff directories already exist");
+    need(!fs.existsSync(dir), "handoff directory already exists");
     gh(["run", "download", env.STAGING_RUN_ID, "--repo", repo, "--name", "release-handoff", "--dir", dir]);
   }
   const receipt = verifyReceipt(dir, { commit: env.COMMIT, version: env.VERSION, receiptSha256: env.RECEIPT_SHA256 });
@@ -73,45 +75,11 @@ try {
   const versionTag = versionTagName(env.VERSION);
   const ref = maybe(`git/ref/tags/${versionTag}`);
   need(!ref || tagCommit(ref) === env.COMMIT, `conflicting version tag ${versionTag}: it binds another commit; refusing to publish a different identity`);
-  let release = maybe("releases/tags/gladius");
-  if (release) need(!release.draft && !release.prerelease && /^gladius \d+\.\d+\.\d+$/.test(release.name), "unrelated product release collision");
-  const immutable = receipt.artifacts.filter((a) => ["runtime", "checksum"].includes(a.role));
-  for (const a of immutable) {
-    const found = release?.assets.find((asset) => asset.name === a.name);
-    if (found) need(found.size === a.size && found.digest === `sha256:${a.sha256}`, `immutable asset conflict: ${a.name}`);
-  }
   if (prepare) {
-    fs.mkdirSync(backupDir);
-    fs.mkdirSync(path.join(backupDir, "assets"));
-    const sharedRef = maybe("git/ref/tags/gladius");
-    fs.writeFileSync(path.join(backupDir, "state.json"), JSON.stringify({ ref, sharedRef, release }, null, 2));
-    for (const a of release?.assets || []) {
-      need(safeName(a.name), "unsafe existing asset name");
-      const data = await download(a.browser_download_url);
-      need(data.length === a.size && a.digest === `sha256:${sha256(data)}`, `backup mismatch: ${a.name}`);
-      fs.writeFileSync(path.join(backupDir, "assets", a.name), data);
-    }
     console.log(`PREPARED ${env.VERSION}: exact tarball integrity ${integrity}; dry_run=${env.DRY_RUN}`);
   } else {
     need(env.DRY_RUN === "false", "publish forbidden during dry run");
-    const snapshot = JSON.parse(bytes(path.join(backupDir, "state.json")));
-    need(JSON.stringify(snapshot.ref) === JSON.stringify(ref) && JSON.stringify(releaseIdentity(snapshot.release)) === JSON.stringify(releaseIdentity(release)), "remote state changed after backup");
-    for (const a of snapshot.release?.assets || []) {
-      const data = bytes(path.join(backupDir, "assets", a.name));
-      need(data.length === a.size && a.digest === `sha256:${sha256(data)}`, `backup changed: ${a.name}`);
-    }
-    const backups = api(`actions/runs/${env.GITHUB_RUN_ID}/artifacts`).artifacts;
-    need(backups.some((a) => a.name === "product-backup" && !a.expired), "verified backup was not uploaded");
     if (!ref) api("git/refs", { ref: `refs/tags/${versionTag}`, sha: env.COMMIT });
-    const notes = bytes(path.join(dir, "release-notes.md")).toString();
-    if (!release) release = api("releases", { tag_name: "gladius", target_commitish: env.COMMIT, name: `gladius ${env.VERSION}`, body: notes, draft: false, prerelease: false });
-    const appended = [];
-    for (const a of immutable) {
-      if (!release.assets.some((asset) => asset.name === a.name)) {
-        gh(["release", "upload", "gladius", path.join(dir, a.name), "--repo", repo]);
-        appended.push({ name: a.name, size: a.size, digest: `sha256:${a.sha256}` });
-      }
-    }
     const verify = () => verifyRegistry({
       fetch: netFetch, version: env.VERSION, integrity, download,
       hash: (data) => `sha512-${createHash("sha512").update(data).digest("base64")}`,
@@ -126,14 +94,7 @@ try {
       },
       verify,
     });
-    const current = api(`releases/${release.id}`, { name: `gladius ${env.VERSION}`, body: notes, make_latest: "true" }, "PATCH");
-    need(current.tag_name === "gladius" && current.name === `gladius ${env.VERSION}` && current.body === notes, "published release metadata mismatch");
-    const fresh = api("releases/tags/gladius");
-    verifyReleaseAppend(snapshot.release ?? { id: current.id, tag_name: "gladius", assets: [] }, fresh, appended);
-    const sharedNow = maybe("git/ref/tags/gladius");
-    need(JSON.stringify(sharedNow) === JSON.stringify(snapshot.sharedRef), "shared gladius tag changed during publish");
-    for (const a of immutable) need(sha256(await download(`https://github.com/${repo}/releases/download/gladius/${a.name}`)) === a.sha256, `immutable asset fetch mismatch: ${a.name}`);
-    console.log(`VERIFIED gladius-mcp@${env.VERSION} ${integrity}; historical releases and tags untouched.`);
+    console.log(`VERIFIED gladius-mcp@${env.VERSION} ${integrity}; no GitHub Release page was created or modified.`);
   }
 } catch (err) {
   console.error(`publish-release: ${err.message}`);

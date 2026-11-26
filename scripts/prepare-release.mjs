@@ -68,7 +68,9 @@ try {
   assembleRuntime(stage, path.join(out, bundle));
   const archive = read(path.join(out, bundle));
   manifest.commit = commit;
-  manifest.runtime.source = "https://github.com/nathwn12/gladius/releases/download/gladius";
+  // npm is the release: runtime.source is retained as a legacy URL marker only
+  // (the Releases page is empty, so it may 404), never written by this lane;
+  // current versions provision solely from the bundled zip.
   manifest.runtime.archive = { name: bundle, size: archive.length, sha256: sha256(archive) };
   const server = read("target/release/gladius.exe");
   manifest.runtime.server.sha256 = sha256(server);
@@ -78,6 +80,12 @@ try {
   const pkg = path.join(work, "npm");
   fs.cpSync("npm", pkg, { recursive: true });
   fs.copyFileSync(path.join(out, "engine-manifest.json"), path.join(pkg, "engine-manifest.json"));
+  // The tarball IS the release: stage the built zip into bin/ so the launcher
+  // provisions it locally with no GitHub Release page. bin/ is already in the
+  // package files whitelist. Prove the staged bytes match the built archive.
+  const stagedZip = path.join(pkg, "bin", bundle);
+  fs.copyFileSync(path.join(out, bundle), stagedZip);
+  need(fs.statSync(stagedZip).size === archive.length && sha256(read(stagedZip)) === sha256(archive), "staged runtime zip differs from the built archive");
   const packed = JSON.parse(execSync("npm pack --json ./npm", { cwd: work, windowsHide: true, encoding: "utf8" }));
   const entry = Array.isArray(packed) ? packed[0] : Object.values(packed)[0];
   need(entry.filename === `gladius-mcp-${version}.tgz`, "unexpected npm tarball name");
@@ -88,7 +96,10 @@ try {
       cwd: root, windowsHide: true, stdio: "inherit", env: { ...process.env, RELEASE_CHECK_TARBALL: tarball },
     });
   });
-  gate("cleanroom", () => run(process.execPath, ["scripts/cleanroom-check.mjs", "--tarball", tarball, "--bundle", path.join(out, bundle)], releaseEnvironment(null)));
+  // No --bundle on purpose: the built zip rides inside the staged tarball's
+  // bin/, so this is the exact shape a stranger installs from npm, with no
+  // GitHub Release in existence. The launcher still verifies size and sha256.
+  gate("cleanroom", () => run(process.execPath, ["scripts/cleanroom-check.mjs", "--tarball", tarball], releaseEnvironment(null)));
   fs.writeFileSync(path.join(out, "release-notes.md"), releaseNotes(version, sha256(archive)));
   need(capture("git", ["rev-parse", "HEAD"]) === commit && capture("git", ["status", "--porcelain"]) === "", "source changed during release gate");
   need(requiredChecks.every((name) => checks.some((c) => c.name === name)), "incomplete local gate");

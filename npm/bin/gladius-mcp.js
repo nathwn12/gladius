@@ -65,6 +65,23 @@ function shortHash(sha) {
   return isPlaceholderSha(sha) ? 'unpublished' : sha.toLowerCase().slice(0, 8);
 }
 
+// The built runtime zip is staged into bin/ before npm pack, and the package
+// files whitelist already includes bin/. A strict name check keeps this lookup
+// from ever escaping the package directory. null means a legacy pre-bundle
+// package: its manifest URL is a last-resort attempt at an empty Releases page
+// (may 404; unsupported), not a supported source.
+function bundledArchivePath(manifest) {
+  const arc = manifest && manifest.runtime && manifest.runtime.archive;
+  const name = arc && arc.name;
+  if (typeof name !== 'string' || !/^[A-Za-z0-9._-]+$/.test(name)) return null;
+  const p = path.join(PKG_DIR, 'bin', name);
+  try {
+    return fs.statSync(p).isFile() ? p : null;
+  } catch {
+    return null;
+  }
+}
+
 function resolveRuntimeDir(manifest) {
   const notes = [];
   let root = process.env[RUNTIME_CACHE_OVERRIDE_ENV];
@@ -125,11 +142,12 @@ function printDoctor(manifest) {
     runtimeCacheDir: runtime.dir,
     runtimeCacheOverridden: runtime.overridden,
     runtimeCacheNotes: runtime.notes,
+    runtimeBundle: bundledArchivePath(manifest),
     runtimeBundleOverride: {
       env: RUNTIME_BUNDLE_OVERRIDE_ENV,
       set: Boolean(process.env[RUNTIME_BUNDLE_OVERRIDE_ENV]),
       path: process.env[RUNTIME_BUNDLE_OVERRIDE_ENV] || null,
-      note: 'diagnostics only: the pre-publish cleanroom points this at the archive it just built; a normal run leaves it unset and downloads runtime.archive, whose size and sha256 are checked either way',
+      note: 'diagnostics only: a normal run leaves this unset and provisions from the zip bundled under bin/; legacy pre-bundle packages attempt the manifest URL (unsupported, may 404); size and sha256 are checked either way',
     },
     browserCacheDir: browser.dir,
     browserCacheOverridden: browser.overridden,
@@ -163,8 +181,9 @@ function usage(exitCode, stream) {
     '  --help, -h           print this usage',
     '',
     'runtime cache: ' + path.join('%LOCALAPPDATA%', 'gladius', 'engine', '<serverVersion>-<bundleSha8>') + ` (override: ${RUNTIME_CACHE_OVERRIDE_ENV})`,
-    `local bundle: unset by default; ${RUNTIME_BUNDLE_OVERRIDE_ENV} names a zip file to verify and extract`,
-    '              instead of downloading (pre-publish diagnostics only; size and sha256 are still checked)',
+    'runtime ships in the tarball under bin/; first run provisions it locally (no release page needed)',
+    `local bundle: unset by default; ${RUNTIME_BUNDLE_OVERRIDE_ENV} overrides the bundled zip with a file`,
+    '              to verify and extract (pre-publish diagnostics only; size and sha256 are still checked)',
     'browser cache: ' + path.join('%LOCALAPPDATA%', 'gladius', 'chromium', '<version>-<zipSha8>') + ` (override: ${BROWSER_CACHE_OVERRIDE_ENV})`,
     `explicit browser binary (skips browser provisioning): ${BROWSER_PATH_OVERRIDE_ENV}`,
     `platform: windows-x86_64 only (override: ${PLATFORM_OVERRIDE_ENV}=1, diagnostics only)`,
@@ -613,10 +632,16 @@ async function ensureRuntime(manifest, cacheDir) {
 }
 
 async function provisionRuntime(manifest, cacheDir, rt, lockDir) {
+  // Provisioning order: the explicit local-bundle override (diagnostics),
+  // then the zip bundled in this tarball (the normal, page-less path), then
+  // the legacy manifest URL (unsupported pre-bundle packages; the Releases
+  // page is empty and the URL may 404). The size and sha256 checks below stay
+  // unconditional: any source that disagrees with the manifest is refused.
   const localBundle = process.env[RUNTIME_BUNDLE_OVERRIDE_ENV];
-  const origin = localBundle ? 'local bundle' : 'download';
+  let origin = 'download';
   let data;
   if (localBundle) {
+    origin = 'local bundle';
     log(`provisioning runtime cache: ${cacheDir}`);
     log(`reading ${localBundle} (${RUNTIME_BUNDLE_OVERRIDE_ENV} set; pre-publish diagnostics only)`);
     try {
@@ -625,13 +650,25 @@ async function provisionRuntime(manifest, cacheDir, rt, lockDir) {
       throw new Error(`cannot read local bundle ${localBundle}: ${err.message}`);
     }
   } else {
-    const url = `${rt.source}/${rt.archive.name}`;
-    log(`provisioning runtime cache: ${cacheDir}`);
-    log(`downloading ${url} (${rt.archive.size} bytes)`);
-    try {
-      data = await downloadToMemory(url);
-    } catch (err) {
-      throw new Error(err.message);
+    const bundled = bundledArchivePath(manifest);
+    if (bundled) {
+      origin = 'npm tarball';
+      log(`provisioning runtime cache: ${cacheDir}`);
+      log(`reading bundled runtime ${bundled} (${rt.archive.size} bytes)`);
+      try {
+        data = fs.readFileSync(bundled);
+      } catch (err) {
+        throw new Error(`cannot read bundled runtime ${bundled}: ${err.message}`);
+      }
+    } else {
+      const url = `${rt.source}/${rt.archive.name}`;
+      log(`provisioning runtime cache: ${cacheDir}`);
+      log(`downloading ${url} (${rt.archive.size} bytes)`);
+      try {
+        data = await downloadToMemory(url);
+      } catch (err) {
+        throw new Error(err.message);
+      }
     }
   }
   heartbeatLock(lockDir);
