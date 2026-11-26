@@ -179,16 +179,13 @@ test("staging checks live main and the version tag before any blob upload or dis
   assert.ok(preflight < text.indexOf("dispatches"), "preflight must precede dispatch");
 });
 
-test("publisher keeps the gladius page, writes only the version tag, and never clobbers assets", () => {
+test("publisher creates no release page and writes only the version tag", () => {
   const text = readFileSync("scripts/publish-release.mjs", "utf8");
   assert.match(text, /versionTagName\(env\.VERSION\)/);
   assert.match(text, /tagCommit\(ref\) === env\.COMMIT/);
   assert.match(text, /conflicting version tag/);
-  assert.match(text, /releases\/tags\/gladius/);
-  assert.match(text, /verifyReleaseAppend\(/);
-  assert.doesNotMatch(text, /refs\/tags\/gladius/);
-  assert.doesNotMatch(text, /--clobber/);
-  assert.match(text, /sharedRef/);
+  assert.match(text, /api\("git\/refs"/);
+  assert.doesNotMatch(text, /releases\/tags|api\(\s*["']releases|release\s*["'],\s*["']upload|browser_download_url|product-backup|sharedRef|verifyReleaseAppend|refs\/tags\/gladius|--clobber/);
 });
 
 test("release-page append preserves every old asset and proves the versioned asset landed", () => {
