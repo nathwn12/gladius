@@ -1,7 +1,8 @@
 {
   "name": "gladius-mcp",
   "version": "0.8.1",
-  "description": "MCP browser-use server over stdio: a pinned headless browser and native engine, provisioned and verified on first run",
+  "description": "A stdio MCP server that drives a pinned headless browser over CDP with typed tools.",
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "browser-automation", "rust", "windows", "cdp", "headless-browser", "toolchain", "agent", "server", "browser"],
   "license": "MIT",
   "repository": {
     "type": "git",

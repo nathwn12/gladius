@@ -1,12 +1,11 @@
 <h1 align="center">gladius-mcp</h1>
-
-<p align="center"><strong>A stdio MCP server that drives a pinned headless browser over CDP with typed tools; the launcher provisions and verifies the runtime and browser on first run.</strong></p>
+<p align="center"><strong>A stdio MCP server that drives a pinned headless browser over CDP with typed tools.</strong></p>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/gladius-mcp"><img src="https://img.shields.io/npm/v/gladius-mcp" alt="npm version" /></a>
-  <img src="https://img.shields.io/badge/platform-windows--64bit-2b3137?logo=windows&logoColor=white" alt="Windows x64" />
+  <img src="https://img.shields.io/badge/platform-windows--64bit-2b3137" alt="Windows x64" />
   <img src="https://img.shields.io/badge/tools-25-brightgreen" alt="25 tools" />
-  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license" />
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT licence" />
 </p>
 
 ## Install
@@ -49,9 +48,9 @@ The `-y` flag keeps the non-interactive spawn from prompting. Any stdio MCP clie
 
 ### Offline or pinned
 
-Pin the npm package with `npx gladius-mcp@0.8.0`. That pins the package version; the bundled `engine-manifest.json` records the runtime asset the launcher fetches. For the published 0.8.0 build that record points under the `gladius` release tag to `gladius-v0.8.0-windows-x86_64.zip`. The release workflow performs no deletion; both the `gladius` and `v0.7.1` releases are present. The package ships no browser or server bytes, so a fresh run still needs network. Set `GLADIUS_CHROMIUM` to an existing `chrome-headless-shell` binary to skip browser provisioning.
+Pin the npm package with `npx gladius-mcp@0.8.1`. That pins the package version; the bundled `engine-manifest.json` records the runtime asset the launcher fetches. For the published 0.8.1 build that record points under the `gladius` release tag to `gladius-v0.8.1-windows-x86_64.zip`. The release workflow performs no deletion; both the `gladius` and `v0.7.1` releases are present. The package ships no browser or server bytes, so a fresh run still needs network. Set `GLADIUS_CHROMIUM` to an existing `chrome-headless-shell` binary to skip browser provisioning.
 
-## Capabilities
+## Tools
 
 Twenty-five tools over one stdio connection: navigate, snapshot, click, type, screenshot and assert layout. Each tool returns a versioned schema with typed error codes; layout checks report measured boxes and deterministic captures carry a content checksum. The launcher verifies the pinned runtime and browser by sha256 before and after extraction and reuses both on later runs.
 
@@ -70,11 +69,5 @@ Twenty-five tools over one stdio connection: navigate, snapshot, click, type, sc
 
 - [Issues](https://github.com/nathwn12/gladius/issues)
 - [Releases](https://github.com/nathwn12/gladius/releases)
-- [Guide](https://github.com/nathwn12/gladius/blob/main/docs/GUIDE.md)
 - [npm package](https://www.npmjs.com/package/gladius-mcp)
-- [MIT](LICENSE)
-
-<p align="center">
-  <img src="signature-glyph.svg" width="120" alt="nathwn12 signature" />
-  <br />Built by nathwn12
-</p>
+- [MIT licence](LICENSE)
