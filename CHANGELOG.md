@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A hard-killed server's stale profile is swept even when Windows still holds a lock on a file in it: `sweep_stale_profiles` now uses the same bounded `sweep_profile_dir` retries as `close()`, so a job-reaped browser whose pid reads dead no longer leaves its profile behind for the next launch's recovery check.
+
 ## [0.8.2] - 2026-11-26
 
 ### Changed

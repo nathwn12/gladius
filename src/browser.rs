@@ -3437,7 +3437,7 @@ async fn launch_owned_chromium() -> Result<Inner, String> {
 async fn launch_owned_chromium_once() -> Result<Inner, String> {
     let deadline = startup_timeout();
     sweep_stale_records().await;
-    sweep_stale_profiles();
+    sweep_stale_profiles().await;
     let profile = ProfileDir::create()?;
     let chromium = find_chromium()?;
     let port = {
@@ -3956,8 +3956,11 @@ fn profile_arg(v: &str) -> String {
 /// Runs at every owned launch: the recovery path for hard-killed servers
 /// whose graceful cleanup never ran. Conservative: our prefix only, never
 /// our own pid, and only provably-dead owners (any doubt keeps the dir, so
-/// a live server's profile is never swept).
-fn sweep_stale_profiles() {
+/// a live server's profile is never swept). Use the same bounded sweep as
+/// `close()`: a job-reaped browser can be gone (so its pid reads dead) while
+/// Windows still holds a file lock in its profile, and one `remove_dir_all`
+/// then fails with os error 32 and leaves the stale dir behind.
+async fn sweep_stale_profiles() {
     let rd = match std::fs::read_dir(std::env::temp_dir()) {
         Ok(r) => r,
         Err(_) => return,
@@ -3982,7 +3985,9 @@ fn sweep_stale_profiles() {
             "[gladius] sweep: removing stale profile {}",
             e.path().display()
         );
-        let _ = std::fs::remove_dir_all(e.path());
+        if let Err(err) = sweep_profile_dir(&e.path()).await {
+            eprintln!("[gladius] sweep: {err}");
+        }
     }
 }
 
