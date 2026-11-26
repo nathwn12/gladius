@@ -192,6 +192,11 @@ fn closed_shadow_target_is_typed_not_not_found() {
             "#host #inner (click)",
         ),
         (
+            "click",
+            json!({"element": "#host #container #inner"}),
+            "#host #container #inner (click)",
+        ),
+        (
             "layout",
             json!({"selector": "#host > #direct"}),
             "#host > #direct (layout)",
