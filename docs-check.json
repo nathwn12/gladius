@@ -1,0 +1,17 @@
+{
+  "versions": [
+    {
+      "name": "gladius",
+      "sources": [
+        "Cargo.toml",
+        "npm/package.json#version"
+      ]
+    }
+  ],
+  "forbidden": [],
+  "generated": [],
+  "checker": {
+    "version": "0.1.0",
+    "sha256": "de1fbf6861618f0651949e43b7cd0e5ceef5e89ce32a005ab7e883a8ec8ebe36"
+  }
+}
