@@ -188,6 +188,8 @@ test("publisher creates no release page and writes only the version tag", () => 
   assert.doesNotMatch(text, /releases\/tags|api\(\s*["']releases|release\s*["'],\s*["']upload|browser_download_url|product-backup|sharedRef|verifyReleaseAppend|refs\/tags\/gladius|--clobber/);
 });
 
+// Historical fixture test: the append helper is unused by the current lane;
+// keep the proof that it would be safe if legacy pages were ever inspected.
 test("release-page append preserves every old asset and proves the versioned asset landed", () => {
   const old = { id: 7, tag_name: "gladius", name: "gladius 0.8.0", draft: false, prerelease: false, assets: [
     { name: "gladius-v0.8.0-windows-x86_64.zip", size: 10, digest: "sha256:old" },

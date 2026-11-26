@@ -25,7 +25,7 @@ const checks = [
   ["zero-release-pages", noPages(text) && noPages(publishText) && noPages(stageText)],
   ["runtime-ships-in-npm", (() => {
     const zipStaged = prepText.includes('path.join(pkg, "bin", bundle)') && /sha256\(read\(stagedZip\)\)/.test(prepText);
-    const fallbackOnly = !/manifest\.runtime\.source\s*=/.test(prepText) && prepText.includes("pre-bundle fallback");
+    const fallbackOnly = !/manifest\.runtime\.source\s*=/.test(prepText) && prepText.includes("legacy URL marker only");
     const cleanroomFromTarball = !/cleanroom-check\.mjs[^)]*--bundle/.test(prepText) && /cleanroom-check\.mjs", "--tarball", tarball\]/.test(prepText);
     return zipStaged && fallbackOnly && cleanroomFromTarball;
   })()],

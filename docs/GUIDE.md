@@ -29,7 +29,7 @@ refuses and writes nothing.
 
 | Artifact | Source | Cache location |
 |---|---|---|
-| Server runtime bundle | the runtime zip bundled inside this npm tarball under `bin/` (npm is the release; no GitHub Release page exists). Versions published before the tarball carried the zip fall back to the tagged Release URL in the manifest. | `%LOCALAPPDATA%\gladius\engine\<serverVersion>-<bundleSha8>\` |
+| Server runtime bundle | the runtime zip bundled inside this npm tarball under `bin/` (npm is the release and the only supported source; no GitHub Release page exists). Pre-bundle versions are legacy and unsupported: their manifest URL points at an empty Releases page and may 404. | `%LOCALAPPDATA%\gladius\engine\<serverVersion>-<bundleSha8>\` |
 | `chrome-headless-shell` `156.0.8078.80` | Google's Chrome-for-Testing endpoint (~120 MB) | `%LOCALAPPDATA%\gladius\chromium\<version>-<zipSha8>\` |
 
 Both are reused on later runs and re-verified each time. `--doctor` and
@@ -130,7 +130,9 @@ force failure paths so the suite can hit them deterministically.
 
 Use `@latest`. A pinned version stays usable because its runtime zip ships
 inside that version's tarball, so no GitHub Release page is needed. Version
-tags (`vX.Y.Z`) are history markers only; npm is the release. Global installs
+tags (`vX.Y.Z`) are history markers only; npm is the release. Versions
+published before the tarball carried a zip are legacy and unsupported: their
+manifest URL points at an empty Releases page and may 404. Global installs
 are refused by the package's `preinstall` script.
 
 ### Fresh installs are offline for the runtime
@@ -350,10 +352,12 @@ rather than the chat - STDOUT belongs to the protocol.
   performed and no canvas is read back.
 - **No PDF generation, no fleet or cloud operation, no in-server planning or LLM
   calls.** gladius is the fast local minimum underneath those systems.
-- **No fully offline fresh install.** The first run always downloads the pinned
-  runtime and browser.
-- **Pinned versions are not a long-term install.** The one-release policy deletes
-  older GitHub releases, so only `@latest` is supported.
+- **The runtime is offline; the browser is not.** The server runtime ships in
+  the npm tarball and provisions without network. The browser comes from
+  Google on first run.
+- **Only bundled tarballs are supported.** Pre-bundle versions are legacy: their
+  manifest URL points at an empty Releases page and may 404. Use `@latest` or a
+  pinned version whose tarball contains the runtime zip.
 - **One page per connection.** Each stdio client gets its own browser context and
   page; contexts never leak across connections.
 

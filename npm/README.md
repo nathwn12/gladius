@@ -48,7 +48,7 @@ The `-y` flag keeps the non-interactive spawn from prompting. Any stdio MCP clie
 
 ### Offline or pinned
 
-Pin the npm package with `npx gladius-mcp@0.8.1`. npm is the release: that version's tarball carries its runtime zip under `bin/`, and the launcher provisions from it with no GitHub Release page. Version tags are history markers only, so a pinned version stays usable. Versions published before the tarball carried a zip fall back to the tagged Release URL recorded in `engine-manifest.json`. The package ships the server runtime but not the browser, so a fresh run still fetches `chrome-headless-shell` from Google; set `GLADIUS_CHROMIUM` to an existing binary to skip that.
+Pin the npm package with `npx gladius-mcp@0.8.1`. npm is the release: that version's tarball carries its runtime zip under `bin/`, and the launcher provisions from it with no GitHub Release page. Version tags are history markers only, so a bundled pinned version stays usable. Versions published before the tarball carried a zip are legacy and unsupported: the URL recorded in `engine-manifest.json` points at a GitHub Releases page that is empty, so that fallback may 404. The package ships the server runtime but not the browser, so a fresh run still fetches `chrome-headless-shell` from Google; set `GLADIUS_CHROMIUM` to an existing binary to skip that.
 
 ## Tools
 

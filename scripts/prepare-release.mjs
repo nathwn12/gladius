@@ -68,8 +68,9 @@ try {
   assembleRuntime(stage, path.join(out, bundle));
   const archive = read(path.join(out, bundle));
   manifest.commit = commit;
-  // npm is the release: runtime.source stays the committed v<version> URL as
-  // an explicit pre-bundle fallback only; this lane never writes it.
+  // npm is the release: runtime.source is retained as a legacy URL marker only
+  // (the Releases page is empty, so it may 404), never written by this lane;
+  // current versions provision solely from the bundled zip.
   manifest.runtime.archive = { name: bundle, size: archive.length, sha256: sha256(archive) };
   const server = read("target/release/gladius.exe");
   manifest.runtime.server.sha256 = sha256(server);

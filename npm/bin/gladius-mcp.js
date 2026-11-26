@@ -67,8 +67,9 @@ function shortHash(sha) {
 
 // The built runtime zip is staged into bin/ before npm pack, and the package
 // files whitelist already includes bin/. A strict name check keeps this lookup
-// from ever escaping the package directory. null means "an older published
-// version that has no bundled zip", whose manifest URL is the fallback.
+// from ever escaping the package directory. null means a legacy pre-bundle
+// package: its manifest URL is a last-resort attempt at an empty Releases page
+// (may 404; unsupported), not a supported source.
 function bundledArchivePath(manifest) {
   const arc = manifest && manifest.runtime && manifest.runtime.archive;
   const name = arc && arc.name;
@@ -146,7 +147,7 @@ function printDoctor(manifest) {
       env: RUNTIME_BUNDLE_OVERRIDE_ENV,
       set: Boolean(process.env[RUNTIME_BUNDLE_OVERRIDE_ENV]),
       path: process.env[RUNTIME_BUNDLE_OVERRIDE_ENV] || null,
-      note: 'diagnostics only: a normal run leaves this unset and provisions from the zip bundled under bin/ (older published versions fall back to the runtime.archive URL); size and sha256 are checked either way',
+      note: 'diagnostics only: a normal run leaves this unset and provisions from the zip bundled under bin/; legacy pre-bundle packages attempt the manifest URL (unsupported, may 404); size and sha256 are checked either way',
     },
     browserCacheDir: browser.dir,
     browserCacheOverridden: browser.overridden,
@@ -633,9 +634,9 @@ async function ensureRuntime(manifest, cacheDir) {
 async function provisionRuntime(manifest, cacheDir, rt, lockDir) {
   // Provisioning order: the explicit local-bundle override (diagnostics),
   // then the zip bundled in this tarball (the normal, page-less path), then
-  // the manifest URL (only for versions published before the tarball carried
-  // a bundle). The size and sha256 checks below stay unconditional: any
-  // source that disagrees with the manifest is refused the same way.
+  // the legacy manifest URL (unsupported pre-bundle packages; the Releases
+  // page is empty and the URL may 404). The size and sha256 checks below stay
+  // unconditional: any source that disagrees with the manifest is refused.
   const localBundle = process.env[RUNTIME_BUNDLE_OVERRIDE_ENV];
   let origin = 'download';
   let data;

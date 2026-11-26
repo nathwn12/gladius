@@ -43,6 +43,8 @@ export function validateBlobMap(text) {
   return map;
 }
 
+// Historical only: the release-page helpers below are retained for reading old
+// fixtures. No lane here creates, patches or uploads a GitHub Release page.
 export function releaseIdentity(release) {
   if (!release) return null;
   const { id, tag_name, name, body, draft, prerelease } = release;
@@ -135,7 +137,7 @@ export function verifyArtifacts(dir, r) {
   const manifest = JSON.parse(readFileSync(join(dir, "engine-manifest.json")));
   need(JSON.stringify(JSON.parse(packed("package/engine-manifest.json"))) === JSON.stringify(manifest), "packaged manifest mismatch");
   need(pkg.name === "gladius-mcp" && pkg.version === r.version && manifest.serverVersion === r.version && manifest.commit === r.commit, "package identity mismatch");
-  need(manifest.runtime.source === `https://github.com/nathwn12/gladius/releases/download/v${r.version}`, "runtime pre-bundle fallback URL mismatch");
+  need(manifest.runtime.source === `https://github.com/nathwn12/gladius/releases/download/v${r.version}`, "runtime legacy URL marker mismatch");
   need(manifest.runtime.archive.name === runtime.name && manifest.runtime.archive.size === runtime.size && manifest.runtime.archive.sha256 === runtime.sha256, "manifest archive mismatch");
   // npm is the release: the runtime zip must ride inside the tarball under
   // bin/, byte-identical to the staged runtime artifact.
