@@ -1214,15 +1214,63 @@ pub async fn call(name: &str, args: &Value, browser: &Browser) -> Value {
     }
 }
 
+/// Chromium's `Page.navigate` may answer `net::ERR_ABORTED` for a navigation
+/// that never failed: `page_handler.cc` reports that error when a newer
+/// NavigationRequest was created before the acknowledged one started. On a
+/// freshly launched browser the `about:blank` positional URL can still be
+/// in flight when the first tool navigation arrives, so the ack is for the
+/// superseded load while the requested URL commits. The committed URL is the
+/// authority: an ERR_ABORTED ack is benign only when the live page is at the
+/// requested URL; a real abort still fails loud.
+fn navigate_committed(err: &str, wanted: &str, actual: &str) -> bool {
+    err == "net::ERR_ABORTED"
+        && (actual == wanted || (!wanted.ends_with('/') && actual == format!("{wanted}/")))
+}
+
+#[cfg(test)]
+mod navigate_commit_tests {
+    use super::navigate_committed;
+
+    #[test]
+    fn aborted_ack_on_a_committed_page_is_not_a_failure() {
+        assert!(navigate_committed(
+            "net::ERR_ABORTED",
+            "http://127.0.0.1:9/frames.html",
+            "http://127.0.0.1:9/frames.html"
+        ));
+        assert!(navigate_committed(
+            "net::ERR_ABORTED",
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9/"
+        ));
+    }
+
+    #[test]
+    fn a_superseded_load_that_never_committed_stays_fatal() {
+        assert!(!navigate_committed(
+            "net::ERR_ABORTED",
+            "http://127.0.0.1:9/frames.html",
+            "about:blank"
+        ));
+        assert!(!navigate_committed(
+            "net::ERR_CONNECTION_REFUSED",
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9/"
+        ));
+    }
+}
+
 async fn tool_navigate(browser: &Browser, url: &str) -> Result<Value, ToolErr> {
     browser.command("Page.enable", json!({}), true).await?;
     let nav = browser
         .command("Page.navigate", json!({"url": url}), true)
         .await?;
-    if let Some(err) = nav.get("errorText").and_then(|v| v.as_str()) {
-        if !err.is_empty() {
-            return Err(ToolErr::fallback(format!("navigate: {err}")));
-        }
+    let err = nav
+        .get("errorText")
+        .and_then(|v| v.as_str())
+        .filter(|e| !e.is_empty());
+    if let Some(err) = err.filter(|e| *e != "net::ERR_ABORTED") {
+        return Err(ToolErr::fallback(format!("navigate: {err}")));
     }
     browser
         .wait_for_load(std::time::Duration::from_secs(10))
@@ -1237,8 +1285,15 @@ async fn tool_navigate(browser: &Browser, url: &str) -> Result<Value, ToolErr> {
         .eval("window.location.href")
         .await?
         .as_str()
-        .unwrap_or(url)
+        .unwrap_or("")
         .to_string();
+    if let Some(err) = err {
+        if !navigate_committed(err, url, &cur) {
+            return Err(ToolErr::fallback(format!(
+                "navigate: {err} (requested URL did not commit: {cur})"
+            )));
+        }
+    }
     if !title.is_empty() || cur.is_empty() || cur == "about:blank" {
         return Ok(ok_text(json!({"url": cur, "title": title}).to_string()));
     }

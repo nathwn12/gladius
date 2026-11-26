@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 - A hard-killed server's stale profile is swept even when Windows still holds a lock on a file in it: `sweep_stale_profiles` now uses the same bounded `sweep_profile_dir` retries as `close()`, so a job-reaped browser whose pid reads dead no longer leaves its profile behind for the next launch's recovery check.
+- `navigate` no longer fails on CDP's `net::ERR_ABORTED` ack when the requested URL actually committed. Chromium reports that error for a superseded navigation (a fresh browser's `about:blank` load racing the first tool navigation); the tool now verifies `window.location.href` and fails loud only when the requested URL did not commit. The one-shot retry in `tests/safety.rs` is gone.
 
 ## [0.8.2] - 2026-11-26
 
@@ -262,6 +263,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `net::ERR_ABORTED` (a CDP abort while the browser attaches, observed in
   one of three release runs). Any other error stays fatal and verbatim; the
   retry is asserted, and every redaction/leak assertion is untouched.
+  SUPERSEDED in Unreleased: `navigate` now checks the committed URL, and the
+  retry workaround was removed.
 - Cleanroom CI: the released tarball is resolved from `npm pack --json`
   output by node instead of PowerShell, so both shapes are read —
   `ConvertFrom-Json` unrolls a single-element array into an object, which made
