@@ -14,7 +14,7 @@
 npx gladius-mcp@latest
 ```
 
-With no arguments this starts the long-lived stdio server. `--doctor` and `--version` are one-shot offline checks that exit; they do not start the server. Global installs are refused; pin an exact build by replacing `latest` with a version.
+With no arguments this starts the long-lived stdio server. `--doctor` and `--version` are one-shot offline checks that exit; they do not start the server. Global installs are refused. Use `@latest`: only a tarball that actually contains the runtime zip under `bin/` is supported, so verify that before pinning an exact version.
 
 ### Or let your AI install it
 
@@ -48,7 +48,7 @@ The `-y` flag keeps the non-interactive spawn from prompting. Any stdio MCP clie
 
 ### Offline or pinned
 
-Pin the npm package with `npx gladius-mcp@0.8.1`. npm is the release: that version's tarball carries its runtime zip under `bin/`, and the launcher provisions from it with no GitHub Release page. Version tags are history markers only, so a bundled pinned version stays usable. Versions published before the tarball carried a zip are legacy and unsupported: the URL recorded in `engine-manifest.json` points at a GitHub Releases page that is empty, so that fallback may 404. The package ships the server runtime but not the browser, so a fresh run still fetches `chrome-headless-shell` from Google; set `GLADIUS_CHROMIUM` to an existing binary to skip that.
+Use `npx gladius-mcp@latest`. npm is the release: the current release lane builds the runtime ZIP into the tarball under `bin/`, and the launcher provisions from it, so no GitHub Release page is involved. npm versions are immutable: versions published before that bundling do not contain a runtime zip and are legacy and unsupported - the URL recorded in `engine-manifest.json` points at an empty Releases page, so that fallback may 404 and is not a supported source. Before pinning any exact version, verify its published tarball actually contains `bin/gladius-v<version>-windows-x86_64.zip`; version tags are history markers only. The package ships the server runtime but not the browser, so a fresh run still fetches `chrome-headless-shell` from Google; set `GLADIUS_CHROMIUM` to an existing binary to skip that.
 
 ## Tools
 

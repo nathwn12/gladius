@@ -90,7 +90,10 @@ repeatedly rehearse or automatically retry an uncertain write.
 The `gladius-mcp@X.Y.Z` tarball is the release. It contains the launcher, the
 pinned manifest and the built runtime ZIP at `bin/gladius-vX.Y.Z-windows-x86_64.zip`.
 The launcher provisions that ZIP on first run with unconditional size and SHA-256
-verification, then verifies the extracted server. There is no current download
+verification, then verifies the extracted server. Only tarballs built by this
+lane after bundling contain that ZIP: npm versions are immutable, so versions
+published earlier cannot gain it, are legacy and unsupported, and consumers
+must verify a tarball's `bin/` contents before pinning it. There is no current download
 alias, no product page, no accumulating release assets and no backup workflow.
 
 The committed `runtime.source` URL in `engine-manifest.json` is a retained legacy

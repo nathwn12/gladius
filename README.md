@@ -51,7 +51,7 @@ The client spawns npx, which runs the bundled launcher and speaks MCP over stdio
 
 Check the pin without downloading anything: `npx -y gladius-mcp@latest --doctor` prints the manifest and resolved cache paths and exits 0.
 
-Only versions whose tarball carries the runtime zip under `bin/` are supported. Versions published before bundling are legacy: their manifest URL points at a GitHub Releases page that is empty, so that fallback may 404. Use `@latest` or a bundled pinned version.
+Use `@latest`. Only a published tarball that actually carries the runtime zip under `bin/` is supported; verify it before pinning an exact version. npm versions are immutable: versions published before bundling cannot gain the zip and are legacy and unsupported - their manifest URL points at an empty Releases page, so that fallback may 404.
 
 ## Use it
 

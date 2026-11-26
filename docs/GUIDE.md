@@ -128,12 +128,13 @@ force failure paths so the suite can hit them deterministically.
 
 ### Installing a version
 
-Use `@latest`. A pinned version stays usable because its runtime zip ships
-inside that version's tarball, so no GitHub Release page is needed. Version
-tags (`vX.Y.Z`) are history markers only; npm is the release. Versions
-published before the tarball carried a zip are legacy and unsupported: their
-manifest URL points at an empty Releases page and may 404. Global installs
-are refused by the package's `preinstall` script.
+Use `@latest`. Only a published tarball that actually carries the runtime zip
+under `bin/` is supported, so verify its contents before pinning an exact
+version. npm versions are immutable: versions published before bundling cannot
+gain the zip and are legacy and unsupported - their manifest URL points at an
+empty Releases page and may 404. Version tags (`vX.Y.Z`) are history markers
+only; npm is the release. Global installs are refused by the package's
+`preinstall` script.
 
 ### Fresh installs are offline for the runtime
 
@@ -355,9 +356,10 @@ rather than the chat - STDOUT belongs to the protocol.
 - **The runtime is offline; the browser is not.** The server runtime ships in
   the npm tarball and provisions without network. The browser comes from
   Google on first run.
-- **Only bundled tarballs are supported.** Pre-bundle versions are legacy: their
-  manifest URL points at an empty Releases page and may 404. Use `@latest` or a
-  pinned version whose tarball contains the runtime zip.
+- **Only bundled tarballs are supported.** Use `@latest`, and verify a tarball
+  contains `bin/gladius-v<version>-windows-x86_64.zip` before pinning it.
+  Pre-bundle versions are immutable, legacy and unsupported: their manifest URL
+  points at an empty Releases page and may 404.
 - **One page per connection.** Each stdio client gets its own browser context and
   page; contexts never leak across connections.
 
