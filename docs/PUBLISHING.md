@@ -4,6 +4,13 @@ Build and run the complete gate locally. GitHub Actions verifies the handoff and
 publishes those exact bytes through the existing `release.yml` npm trusted publisher.
 It does not compile, repack, provision a browser or rerun the suite.
 
+npm IS the release: the built runtime ZIP ships inside the npm tarball under
+`bin/`, and the launcher provisions that bundled copy on first run. No GitHub
+Release page exists; nothing creates, patches, uploads, backs up or deletes one.
+The `vX.Y.Z` tags are history markers only. Versions published before the
+tarball carried a ZIP are legacy and unsupported: their manifest URL points at
+an empty Releases page and may 404; it is not a supported source.
+
 Publication requires the owner's authorization. npm login, manual publishing and
 trusted-publisher configuration changes require the owner's physical passkey approval.
 Do not add a token or change the publisher identity to bypass that boundary.
@@ -24,16 +31,18 @@ Logs go to standard output; capture them outside the output directory if needed.
 The command checks history/version derivation, formatting, clippy, pinned browser
 provisioning and every provisioned browser file, locked release build and full tests,
 real-browser selftest, attribution, final tarball preflight and fresh-profile install/boot.
-It packs once and tests that exact tarball against the exact runtime ZIP.
-It does not edit tracked manifests or close the working tree's changelog.
+It packs once, stages the built runtime ZIP into the package's `bin/`, and tests that
+exact tarball against that exact ZIP. It does not edit tracked manifests or close the
+working tree's changelog.
 
 `release-receipt.json` records the exact commit, version, required passing checks,
 and artifact sizes and SHA-256 values. Retain its separately printed SHA-256.
 The receipt is a local assertion, not independent evidence that CI built the executable.
 The build provisions a fresh browser inside its owned work directory, never the
-shared cache. Ambient Gladius engine/browser overrides are scrubbed. The separate
-cleanroom fetches the browser from Google into its own fresh profile; it never
-inherits the build cache or bundles a browser.
+shared cache. Ambient Gladius engine/browser overrides are scrubbed. The cleanroom
+installs the staged tarball with no external bundle override, so it proves the
+bundled runtime provisions from the tarball a stranger receives; the browser is
+still fetched from Google into a fresh profile, and no browser bytes are bundled.
 
 ## Stage once, then rehearse once
 
@@ -46,121 +55,56 @@ gh run list --workflow stage-release.yml --limit 1
 ```
 
 Before any upload or dispatch, `--upload` runs a read-only preflight against the
-receipt's commit. It reads live `main` and the `gladius` tag, then refuses with
-`landed mismatch` when `main` is not that commit, or with `blocked shared tag`
+receipt's commit. It reads live `main` and the `vX.Y.Z` tag, and refuses with
+`landed mismatch` when `main` is not that commit or with `conflicting version tag`
 when the tag binds a different commit. Both refusals happen before artifact
-hashing, blob upload and staging dispatch. A plan the publisher would reject
-therefore costs no upload and no rehearsal. It does not save the local build:
-`prepare-release.mjs` has already built the candidate before staging begins.
-The publisher repeats the tag check at publish time; this check surfaces the same
-refusal in the staging step. An absent tag, or a tag already bound to the planned
-commit, passes. The preflight creates no ref and writes no release, asset or
-registry entry.
+hashing, blob upload and staging dispatch. An absent tag, or a tag already bound
+to the planned commit, passes. The preflight creates no ref, release page, asset
+or registry entry.
 
 The staging command uploads public, credential-free git blobs without creating
-or moving a ref. They contain only the already public release artifacts. A
+or moving a ref. They contain only the already public build artifacts (the runtime
+ZIP, the npm tarball with its bundled ZIP, the manifest, checksum and notes). A
 read-only staging workflow verifies their receipt and produces the one-day
 `release-handoff` workflow artifact. Git blobs are not a private or expiring store;
 the workflow artifact expires, but the uploaded blob objects may remain accessible.
 Never stage confidential material.
 
 Read the staging run's result and ID. Dispatch `release.yml` on `main` with
-`product_tag=gladius`, the exact `commit`, asserted `version`, `staging_run_id`,
-`receipt_sha256` and `dry_run=true`. Inputs are assertions, not build instructions.
-The publisher checks the staging workflow path, main branch, exact SHA, successful
-conclusion, receipt, every staged byte, packaged manifest and executable, notes,
-browser pin, registry integrity conflicts and existing product-tag binding.
+`product_tag=gladius` (an identity assertion only - it names no page), the exact
+`commit`, asserted `version`, `staging_run_id`, `receipt_sha256` and `dry_run=true`.
+Inputs are assertions, not build instructions. The publisher checks the staging
+workflow path, main branch, exact SHA, successful conclusion, receipt, every staged
+byte, packaged manifest and executable, the bundled runtime ZIP inside the tarball,
+notes, browser pin, registry integrity conflicts and existing version-tag binding.
 Its only npm dry run is `npm publish <exact-tarball> --dry-run --ignore-scripts`.
 
-A dry run makes no tag, release, asset or registry writes. It does not prove that
-npm will authenticate an actual OIDC publish, or that npm will issue attestations.
-Do not claim CI compiled a locally built executable. Inspect the one rehearsal
-before the authorized `dry_run=false` dispatch; do not repeatedly rehearse or
-automatically retry an uncertain write.
+A dry run makes no tag or registry writes; no GitHub Release page exists to touch.
+It does not prove that npm will authenticate an actual OIDC publish, or that npm
+will issue attestations. Do not claim CI compiled a locally built executable.
+Inspect the one rehearsal before the authorized `dry_run=false` dispatch; do not
+repeatedly rehearse or automatically retry an uncertain write.
 
-## Product release and immutable npm archives
+## npm is the only runtime source
 
-The product page is `/releases/tag/gladius`. Current human-facing downloads use:
+The `gladius-mcp@X.Y.Z` tarball is the release. It contains the launcher, the
+pinned manifest and the built runtime ZIP at `bin/gladius-vX.Y.Z-windows-x86_64.zip`.
+The launcher provisions that ZIP on first run with unconditional size and SHA-256
+verification, then verifies the extracted server. There is no current download
+alias, no product page, no accumulating release assets and no backup workflow.
 
-```text
-https://github.com/nathwn12/gladius/releases/download/gladius/gladius-windows-x86_64.zip
-```
+The committed `runtime.source` URL in `engine-manifest.json` is a retained legacy
+marker only. No lane writes it, and no Release page exists to serve it; for
+pre-bundle versions it may 404. It is not a supported fallback for current versions.
 
-That alias is mutable. Future npm tarballs instead pin the version-specific
-`gladius-vX.Y.Z-windows-x86_64.zip` asset under the `gladius` release and its exact
-size and SHA-256. These version-specific assets and their checksums accumulate
-in the same release and are never overwritten or removed. New npm versions
-therefore do not depend on mutable current bytes. Existing manifest sentinel
-URLs in the source tree remain derivation inputs; preparation fills the product
-URL only in the staged package, never repairs a source version.
-
-The publisher backs up an existing product release's metadata and every asset,
-verifies their hashes, and uploads that backup as a 90-day workflow artifact
-before replacement. Retain a durable local copy before that artifact expires.
-It verifies remote state again before writing. Existing immutable assets or
-registry versions with different bytes are conflicts, not overwrite candidates.
-After publication it fetches and hashes all current/immutable downloads and the
-registry tarball, checks `latest`, and verifies release metadata.
-
-The publisher can create an absent product tag. It deliberately refuses to move
-an existing tag to a different commit. A later update needs a specific approved
-tag-movement operation, with the previous target recorded and backed up first.
-No workflow in this lane moves shared refs, deletes historical tags or removes
-historical release objects. Do not bypass that refusal with a force push.
-Version derivation reads the package version at the reachable product tag, while
-retaining legacy version tags as historical anchors.
-
-### Comparison: smallest immutable version-tag route (not implemented here)
-
-The publisher may create an absent `gladius` tag but never moves an existing one.
-With `gladius` bound to an older commit, every newer landed plan reaches that
-refusal. The smallest route that removes the repeated refusal keeps the shared
-name as a stable alias and makes each release's identity immutable:
-
-1. Tag each landed release once with `vX.Y.Z`. That tag never moves and becomes
-   the historical anchor version derivation reads instead of the shared tag.
-2. Keep `gladius` as the human-facing alias and the source of the stable download
-   URL. Move it only through the separately approved tag-movement operation;
-   the publisher never moves it.
-3. Keep the version-specific `gladius-vX.Y.Z-windows-x86_64.zip` assets and their
-   checksums accumulating under the `gladius` release, and keep
-   `gladius-windows-x86_64.zip` as the clobbered current alias. Published npm
-   versions pin the immutable asset, so they survive an alias move.
-
-Cost: one extra tag per release, a version-derivation source change and an
-approved alias-move step per release. Benefit: no shared-tag mismatch refusal on
-the normal path, and historical pins stay immutable. This slice only exposes the
-refusal earlier; it does not change tags, version derivation, asset names or the
-publish destination.
-
-## First-cutover audit and backup
-
-`gladius-mcp@0.7.1` embeds:
-
-```text
-https://github.com/nathwn12/gladius/releases/download/v0.7.1/gladius-v0.7.1-windows-x86_64.zip
-size: 5166733
-sha256: 6cb9d77a9e30e45907898e5ad61d5946cb79b02214bdeecab0f687e1a4182d9c
-```
-
-Removing or retagging its release breaks fresh installs of that immutable package.
-Keeping the old Git tag alone does not retain release assets. The owner accepted
-that compatibility risk, but this implementation does not perform removal.
-Until a separately authorized cutover handles that historical object, the old
-entry remains; creating a product entry would temporarily produce two entries.
-Do not report the one-entry migration complete in that state.
-
-The audited original release ID is `431913217`. Its three assets were downloaded
-to `release-backups/v0.7.1` and verified against GitHub asset digests and the
-published npm runtime pin. This ignored local directory is operator state, not
-included in a clone. Retain it before authorizing any historical removal. `verified-backup.json` records
-the original tag target and all asset sizes/hashes; `release.json` records the body
-and metadata. Unknown external consumers remain unverified.
-
-Recovery, if explicitly approved, recreates the old release at its preserved tag
-and uploads the exact original basenames and bytes. Verify the original URLs and
-hashes afterward. A backup does not preserve the release ID or uninterrupted
-service. Never delete or recreate a published npm version.
+The publisher creates an absent `vX.Y.Z` tag and refuses to move an existing one
+to a different commit. Version derivation reads the highest reachable version tag.
+No workflow in this lane moves shared refs, deletes historical tags, removes
+historical release objects, or creates a release page. Do not bypass a refusal
+with a force push. An existing immutable registry version with different bytes is
+a conflict, never an overwrite candidate. After publication the publisher fetches
+and hashes the registry tarball, checks `latest`, and reports the exact integrity;
+it verifies no release metadata because there is no release page.
 
 ## Cheap checks
 
