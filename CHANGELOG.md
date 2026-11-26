@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-11-26
+
+### Changed
+
+- npm package page: one uniform install-first README — a benefit-led pitch, `## Tools` in place of `## Capabilities`, a resolvable platform badge, `## Status` immediately before `## Links`, MIT licence last, and the retired signature-glyph footer removed.
+- npm package metadata: discovery keywords and a benefit-led description aligned with the package page.
+
+### Fixed
+
+- The npm install pin no longer names the retired 0.8.0 build: `npx gladius-mcp@0.8.1` and the `gladius-v0.8.1-windows-x86_64.zip` runtime asset are the build actually published. That README pin note is left pointing at the published build; this cosmetic release only aligns the committed version cells.
+- All four release version cells now agree at 0.8.2 — the version `scripts/derive-release.mjs` derives from history — in `Cargo.toml`, `Cargo.lock`, `npm/package.json` (including the global-install hint) and `npm/engine-manifest.json` (`serverVersion`, runtime source and archive name). No engine, source or dependency change.
+
 ## [0.8.1] - 2026-11-23
 
 ### Added

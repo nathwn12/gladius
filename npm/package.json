@@ -1,6 +1,6 @@
 {
   "name": "gladius-mcp",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "A stdio MCP server that drives a pinned headless browser over CDP with typed tools.",
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "browser-automation", "rust", "windows", "cdp", "headless-browser", "toolchain", "agent", "server", "browser"],
   "license": "MIT",
@@ -16,7 +16,7 @@
     "gladius-mcp": "./bin/gladius-mcp.js"
   },
   "scripts": {
-    "preinstall": "node -e \"if(process.env.npm_config_global==='true'){console.error('gladius-mcp: global install refused \u2014 use npx gladius-mcp@0.8.1');process.exit(1)}\""
+    "preinstall": "node -e \"if(process.env.npm_config_global==='true'){console.error('gladius-mcp: global install refused \u2014 use npx gladius-mcp@0.8.2');process.exit(1)}\""
   },
   "files": [
     "bin/",
