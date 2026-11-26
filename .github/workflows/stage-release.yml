@@ -1,3 +1,5 @@
+# Staging writes only an Actions artifact: no GitHub Release page, no asset
+# upload, no registry write. It hands immutable bytes to release.yml.
 name: stage release
 on:
   workflow_dispatch:

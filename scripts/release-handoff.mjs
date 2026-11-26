@@ -43,6 +43,8 @@ export function validateBlobMap(text) {
   return map;
 }
 
+// Historical only: the release-page helpers below are retained for reading old
+// fixtures. No lane here creates, patches or uploads a GitHub Release page.
 export function releaseIdentity(release) {
   if (!release) return null;
   const { id, tag_name, name, body, draft, prerelease } = release;
@@ -119,7 +121,7 @@ export function verifyReceipt(dir, expected) {
 
 export function releaseNotes(version, hash) {
   const asset = `gladius-v${version}-windows-x86_64.zip`;
-  return `gladius ${version}\n\nGladius provides headless browser tools over MCP.\n\nDownload: https://github.com/nathwn12/gladius/releases/download/gladius/${asset}\nSHA-256: ${hash} (${asset})\n`;
+  return `gladius ${version}\n\nGladius provides headless browser tools over MCP.\n\nInstall: npx gladius-mcp@${version} (npm is the release; no GitHub Release page). This version's tarball bundles ${asset}.\nSHA-256: ${hash} (${asset}, bundled under bin/)\n`;
 }
 
 export function verifyArtifacts(dir, r) {
@@ -130,13 +132,17 @@ export function verifyArtifacts(dir, r) {
   need(artifact("manifest").name === "engine-manifest.json" && artifact("notes").name === "release-notes.md", "metadata artifact name mismatch");
   need(artifact("checksum").name === `${runtime.name}.sha256`, "checksum artifact name mismatch");
   const tar = (file, args) => execFileSync("tar", [...args, join(dir, file)], { windowsHide: true, maxBuffer: 128 * 1024 * 1024 });
-  const packed = (member) => execFileSync("tar", ["-xzf", join(dir, artifact("npm").name), "-O", member], { windowsHide: true, maxBuffer: 16 * 1024 * 1024 });
+  const packed = (member) => execFileSync("tar", ["-xzf", join(dir, artifact("npm").name), "-O", member], { windowsHide: true, maxBuffer: 256 * 1024 * 1024 });
   const pkg = JSON.parse(packed("package/package.json"));
   const manifest = JSON.parse(readFileSync(join(dir, "engine-manifest.json")));
   need(JSON.stringify(JSON.parse(packed("package/engine-manifest.json"))) === JSON.stringify(manifest), "packaged manifest mismatch");
   need(pkg.name === "gladius-mcp" && pkg.version === r.version && manifest.serverVersion === r.version && manifest.commit === r.commit, "package identity mismatch");
-  need(manifest.runtime.source === "https://github.com/nathwn12/gladius/releases/download/gladius", "runtime product URL mismatch");
+  need(manifest.runtime.source === `https://github.com/nathwn12/gladius/releases/download/v${r.version}`, "runtime legacy URL marker mismatch");
   need(manifest.runtime.archive.name === runtime.name && manifest.runtime.archive.size === runtime.size && manifest.runtime.archive.sha256 === runtime.sha256, "manifest archive mismatch");
+  // npm is the release: the runtime zip must ride inside the tarball under
+  // bin/, byte-identical to the staged runtime artifact.
+  const bundled = packed(`package/bin/${runtime.name}`);
+  need(Buffer.isBuffer(bundled) && bundled.length === runtime.size && sha256(bundled) === runtime.sha256, "bundled runtime zip missing from npm tarball or byte mismatch");
   const browser = JSON.parse(readFileSync(new URL("./chromium-manifest.json", import.meta.url))).browser;
   need(JSON.stringify(manifest.browser) === JSON.stringify(browser), "packaged browser pin drift");
   const members = tar(runtime.name, ["-tf"]).toString().trim().split(/\r?\n/);

@@ -237,12 +237,15 @@ function checkManifests(versions, manifest, pkgText, derived) {
         "commit range as the change it releases; this lane asserts the version, it never writes it",
     );
   }
+  // npm is the release: runtime.source is a retained legacy URL marker; the
+  // Releases page is empty, so it may 404 and is not a supported source.
+  // Pinning it to v<derived> keeps the manifest identity unambiguous.
   const source = manifest?.runtime?.source ?? "";
   const archive = manifest?.runtime?.archive?.name ?? "";
   if (!source.endsWith(`/v${derived}`) || !archive.includes(`v${derived}`)) {
     refuse(
       "manifest-paths",
-      `${FILES.man} runtime.source/archive do not name v${derived}:\n` +
+      `${FILES.man} runtime.source (legacy URL marker) / bundled runtime.archive.name must name v${derived}:\n` +
         `  runtime.source: ${source || "(missing)"}\n` +
         `  runtime.archive.name: ${archive || "(missing)"}`,
     );

@@ -1,4 +1,5 @@
-# Trusted publisher identity stays release.yml. CI verifies and ships local bytes.
+# Zero GitHub Release pages: npm is the release. The version tag is the only
+# git write; no page is created, patched or uploaded. CI ships verified bytes.
 name: release
 on:
   workflow_dispatch:
@@ -55,15 +56,8 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
       - name: assert lean workflow
         run: node scripts/check-release-workflow.mjs
-      - name: verify handoff and back up current product assets
+      - name: verify handoff
         run: node scripts/publish-release.mjs --prepare
-      - uses: actions/upload-artifact@v7
-        if: inputs.dry_run == false
-        with:
-          name: product-backup
-          path: release-backup/
-          if-no-files-found: error
-          retention-days: 90
       - name: rehearse exact tarball without publishing
         if: inputs.dry_run
         working-directory: staged

@@ -26,7 +26,7 @@ Most browser MCPs wrap a heavyweight driver and leave the agent guessing about p
 - **No pointer steal.** Every action rides CDP: no OS cursor, no window, no foreground tab.
 - **Refs that fail typed.** `snapshot` returns stable `@eN` refs; a stale ref is a typed error, not a click on the wrong element.
 - **Proof in the result.** `assert_layout` measures boxes and geometry; `visual` diffs stored baselines by threshold.
-- **One binary, no sidecar.** The launcher provisions and sha256-verifies the pinned runtime and browser; later runs reuse them.
+- **One binary, no sidecar.** The runtime zip ships inside the npm tarball; the launcher provisions and sha256-verifies it plus the browser on first run, then reuses both.
 - **Bring your own browser.** Set `GLADIUS_CDP_URL` to drive an engine you already run; `close` detaches and never kills it.
 
 ## Install
@@ -47,9 +47,11 @@ Add the server to your MCP client and restart it:
 }
 ```
 
-The client spawns npx, which runs the bundled binary and speaks MCP over stdio. The first tool call provisions the pinned runtime and browser; both are sha256-verified before and after extraction. A global install is refused by the package's `preinstall` script.
+The client spawns npx, which runs the bundled launcher and speaks MCP over stdio. The first tool call provisions the runtime from the zip inside that npm tarball and the browser from Google; both are sha256-verified before and after extraction. npm is the release: no GitHub Release page is involved. A global install is refused by the package's `preinstall` script.
 
 Check the pin without downloading anything: `npx -y gladius-mcp@latest --doctor` prints the manifest and resolved cache paths and exits 0.
+
+Use `@latest`. Only a published tarball that actually carries the runtime zip under `bin/` is supported; verify it before pinning an exact version. npm versions are immutable: versions published before bundling cannot gain the zip and are legacy and unsupported - their manifest URL points at an empty Releases page, so that fallback may 404.
 
 ## Use it
 
@@ -108,7 +110,7 @@ Attach to a browser you run yourself, so the engine is yours and gladius only dr
 - Windows 10/11 x64. The server runtime runs on no other platform.
 - Node 22.14 or newer, for the `npx` launcher.
 - An MCP client that speaks stdio.
-- The first run downloads the pinned browser and runtime and verifies both. There is no fully offline fresh install.
+- The server runtime ships in the npm tarball and provisions offline. Only the pinned browser is fetched from Google on first run; set `GLADIUS_CHROMIUM` to an existing binary to skip that.
 - Headless only: gladius never opens a visible window. To watch a real browser, start your own and attach with `GLADIUS_CDP_URL`.
 
 ## Development
@@ -127,7 +129,7 @@ The toolchain is pinned by `rust-toolchain.toml`. `cargo fmt --all --check` and 
 ## Links
 
 - [Issues](https://github.com/nathwn12/gladius/issues)
-- [Releases](https://github.com/nathwn12/gladius/releases)
+- [Version tags](https://github.com/nathwn12/gladius/tags) (history markers only; npm is the release)
 - [Guide](docs/GUIDE.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Publishing](docs/PUBLISHING.md)
