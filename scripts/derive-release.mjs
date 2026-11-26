@@ -237,12 +237,15 @@ function checkManifests(versions, manifest, pkgText, derived) {
         "commit range as the change it releases; this lane asserts the version, it never writes it",
     );
   }
+  // npm is the release: runtime.source is kept only as the URL fallback for
+  // versions published before the tarball carried the zip. Pinning it to
+  // v<derived> keeps those older installs resolving their exact bytes.
   const source = manifest?.runtime?.source ?? "";
   const archive = manifest?.runtime?.archive?.name ?? "";
   if (!source.endsWith(`/v${derived}`) || !archive.includes(`v${derived}`)) {
     refuse(
       "manifest-paths",
-      `${FILES.man} runtime.source/archive do not name v${derived}:\n` +
+      `${FILES.man} runtime.source (explicit pre-bundle fallback URL) / bundled runtime.archive.name must name v${derived}:\n` +
         `  runtime.source: ${source || "(missing)"}\n` +
         `  runtime.archive.name: ${archive || "(missing)"}`,
     );

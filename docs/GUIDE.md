@@ -29,7 +29,7 @@ refuses and writes nothing.
 
 | Artifact | Source | Cache location |
 |---|---|---|
-| Server runtime bundle | the tagged GitHub Release for this version | `%LOCALAPPDATA%\gladius\engine\<serverVersion>-<bundleSha8>\` |
+| Server runtime bundle | the runtime zip bundled inside this npm tarball under `bin/` (npm is the release; no GitHub Release page exists). Versions published before the tarball carried the zip fall back to the tagged Release URL in the manifest. | `%LOCALAPPDATA%\gladius\engine\<serverVersion>-<bundleSha8>\` |
 | `chrome-headless-shell` `156.0.8078.80` | Google's Chrome-for-Testing endpoint (~120 MB) | `%LOCALAPPDATA%\gladius\chromium\<version>-<zipSha8>\` |
 
 Both are reused on later runs and re-verified each time. `--doctor` and
@@ -109,7 +109,7 @@ unsupported error and a pointer to `GLADIUS_CDP_URL`.
 | `GLADIUS_CHROMIUM` | unset | Absolute path to your own `chrome-headless-shell` binary. When set and non-blank it wins, and browser provisioning is skipped entirely. Must be a file. |
 | `GLADIUS_ENGINE_CACHE` | `%LOCALAPPDATA%` | Root for the runtime cache; the versioned `<serverVersion>-<bundleSha8>` folder lives under it. |
 | `GLADIUS_CHROMIUM_CACHE` | `%LOCALAPPDATA%` | Root for the browser cache; the versioned `<version>-<zipSha8>` folder lives under it. |
-| `GLADIUS_ENGINE_BUNDLE` | unset | Path to a local runtime zip to verify and extract instead of downloading. Pre-publish diagnostics only; size and sha256 are still checked. |
+| `GLADIUS_ENGINE_BUNDLE` | unset | Path to a local runtime zip that overrides the zip bundled under `bin/`; verify and extract it instead. Pre-publish diagnostics only; size and sha256 are still checked. |
 | `GLADIUS_MCP_ALLOW_NON_WINDOWS` | unset | Set to `1` to bypass the Windows-only gate for diagnostics. The server runtime still runs on Windows x64 only. |
 | `GLADIUS_EXPECTED_VERSION` | set by launcher | The version the launcher expects. A mismatch makes the server refuse to serve rather than run a mixed pair. Do not set it by hand. |
 | `GLADIUS_CDP_URL` | unset | Attach to an engine you already run instead of launching one. `ws://`/`wss://` connects directly; `http://`/`https://` resolves via `GET <base>/json/version`. That engine is yours: `close` detaches and never kills. |
@@ -128,16 +128,18 @@ force failure paths so the suite can hit them deterministically.
 
 ### Installing a version
 
-Use `@latest`. A pinned version is only installable while its GitHub release
-still exists, and the one-release policy deletes older releases, so pinned
-versions are not a supported long-term install. Global installs are refused by
-the package's `preinstall` script.
+Use `@latest`. A pinned version stays usable because its runtime zip ships
+inside that version's tarball, so no GitHub Release page is needed. Version
+tags (`vX.Y.Z`) are history markers only; npm is the release. Global installs
+are refused by the package's `preinstall` script.
 
-### There is no fully offline fresh install
+### Fresh installs are offline for the runtime
 
-The first run always downloads the pinned runtime and browser. `GLADIUS_CHROMIUM`
-and `GLADIUS_ENGINE_BUNDLE` can supply bytes you already hold, but treat them as
-overrides, not as a no-network setup.
+The pinned server runtime ships inside the npm tarball, so provisioning it on
+first run needs no network. The browser is still fetched from Google's
+Chrome-for-Testing endpoint on first run; `GLADIUS_CHROMIUM` can supply a binary
+you already hold. `GLADIUS_ENGINE_BUNDLE` overrides the bundled zip with a file
+you hold (diagnostics only) - size and sha256 are checked either way.
 
 ---
 
@@ -297,7 +299,7 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 | `global install refused` | The package's `preinstall` refuses `npm i -g` on purpose. | Install the way the README's Install section shows: through `npx`, never globally. |
 | `platform: windows-x86_64 only` at startup | You are not on Windows x64. | Nothing to install around it - the runtime is Windows x64 only. `GLADIUS_MCP_ALLOW_NON_WINDOWS=1` bypasses the gate for diagnostics only. |
 | `version mismatch: launcher X, engine Y` | A stale runtime cache paired with a newer launcher. | Run `--doctor` to see the skew, then reinstall at `@latest` the way the README's Install section shows. |
-| Provisioning refuses and writes nothing | A download hash or size did not match the pinned manifest. | Delete the versioned cache folder named by `--doctor` and retry; if it repeats, the network path is rewriting bytes. |
+| Provisioning refuses and writes nothing | The bundled (or override) zip's hash or size did not match the pinned manifest. | Delete the versioned cache folder named by `--doctor` and retry; if it repeats, the installed tarball is corrupt - reinstall `@latest`. |
 | First tool call takes seconds | The browser is provisioning or spawning. | Expected once. `--doctor` shows the resolved paths without downloading. |
 | `stale_ref` | The `@eN` ref came from an older `snapshot`, the node was removed, or the page navigated. | Re-run `snapshot` and use the new ref. Shadow-DOM refs are supported. |
 | `not_actionable` | The target is covered by another element or never became clickable. | Close the overlay, scroll it into view, or assert with `assert_layout` first. |

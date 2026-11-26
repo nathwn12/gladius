@@ -209,10 +209,11 @@ test("release-page append preserves every old asset and proves the versioned ass
   assert.throws(() => verifyReleaseAppend(old, pageSwapped, [appended]), /release page identity changed/);
 });
 
-test("release notes point at the immutable versioned asset, not the mutable alias", () => {
+test("release notes point at npm, not a GitHub Release page", () => {
   const notes = releaseNotes("0.8.1", "a".repeat(64));
+  assert.match(notes, /npx gladius-mcp@0\.8\.1/);
   assert.match(notes, /gladius-v0\.8\.1-windows-x86_64\.zip/);
-  assert.doesNotMatch(notes, /releases\/download\/gladius\/gladius-windows-x86_64\.zip/);
+  assert.doesNotMatch(notes, /github\.com\/nathwn12\/gladius\/releases/);
 });
 
 test("OC_NO_NETWORK refusal is typed and names the guard", () => {
@@ -235,6 +236,68 @@ test("OC_NO_NETWORK stops the upload route before any gh call, blob write or dis
     assert.equal(lines.length, 1, child.stderr);
     assert.match(lines[0], /^stage-release: OC_NO_NETWORK guard: refused network call to gh api repos\/nathwn12\/gladius\/git\/ref\/heads\/main/);
     assert.doesNotMatch(child.stdout, /Staging dispatched/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bundled zip under bin/ provisions through the launcher with no override or download", { skip: process.platform !== "win32" }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "gladius-bundled-"));
+  try {
+    const stage = join(dir, "runtime");
+    mkdirSync(stage);
+    writeFileSync(join(stage, "gladius.exe"), "fixture executable bytes");
+    const zipName = "gladius-v0.8.2-windows-x86_64.zip";
+    const pkg = join(dir, "package");
+    mkdirSync(join(pkg, "bin"), { recursive: true });
+    cpSync("npm/bin", join(pkg, "bin"), { recursive: true });
+    cpSync("npm/package.json", join(pkg, "package.json"));
+    // Stage the built zip into bin/ exactly as prepare-release.mjs does.
+    const zip = join(pkg, "bin", zipName);
+    assembleRuntime(stage, zip);
+    const manifest = JSON.parse(readFileSync("npm/engine-manifest.json"));
+    const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
+    manifest.runtime.archive = { name: zipName, size: readFileSync(zip).length, sha256: hash(readFileSync(zip)) };
+    manifest.runtime.server.size = readFileSync(join(stage, "gladius.exe")).length;
+    manifest.runtime.server.sha256 = hash(readFileSync(join(stage, "gladius.exe")));
+    manifest.browser.asset.sha256 = "unpublished";
+    writeFileSync(join(pkg, "engine-manifest.json"), JSON.stringify(manifest));
+    const cache = join(dir, "engine");
+    // No GLADIUS_ENGINE_BUNDLE and OC_NO_NETWORK=1: the engine must come from
+    // the bundled zip, not a download or the diagnostics override. It exits 1
+    // only because the browser pin is deliberately unpublished.
+    const result = spawnSync(process.execPath, [join(pkg, "bin/gladius-mcp.js")], {
+      env: { ...releaseEnvironment(null), OC_NO_NETWORK: "1", GLADIUS_ENGINE_CACHE: cache },
+      input: "", encoding: "utf8", windowsHide: true, timeout: 10000,
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /reading bundled runtime/);
+    assert.match(result.stderr, /no pinned browser archive hash/);
+    const engine = join(cache, "gladius", "engine");
+    const leaf = existsSync(engine) && readdirSync(engine).find((name) => existsSync(join(engine, name, "gladius.exe")));
+    assert.ok(leaf, result.stderr);
+    assert.equal(readFileSync(join(engine, leaf, "gladius.exe"), "utf8"), "fixture executable bytes");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("npm pack dry-run includes the runtime zip staged under bin/", { skip: process.platform !== "win32" }, () => {
+  const dir = mkdtempSync(join(tmpdir(), "gladius-pack-"));
+  try {
+    const pkg = join(dir, "npm");
+    cpSync("npm", pkg, { recursive: true });
+    const manifest = JSON.parse(readFileSync("npm/engine-manifest.json"));
+    const name = manifest.runtime.archive.name;
+    writeFileSync(join(pkg, "bin", name), "staged runtime zip bytes");
+    const result = spawnSync("npm", ["pack", "--dry-run", "--ignore-scripts", "--json"], {
+      cwd: pkg, encoding: "utf8", windowsHide: true, timeout: 60000, shell: true,
+    });
+    assert.equal(result.status, 0, result.error?.message ?? (result.stderr + result.stdout));
+    const packed = JSON.parse(result.stdout);
+    const entry = Array.isArray(packed) ? packed[0] : Object.values(packed)[0];
+    const files = (entry.files ?? []).map((f) => f.path);
+    assert.ok(files.includes(`bin/${name}`), `tarball missing bin/${name}: ${files.join(",")}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

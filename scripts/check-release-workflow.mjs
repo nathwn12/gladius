@@ -9,6 +9,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const readSibling = (rel) => readFileSync(join(here, rel), "utf8");
 const publishText = readSibling("publish-release.mjs");
 const stageText = readSibling("../.github/workflows/stage-release.yml");
+const prepText = readSibling("prepare-release.mjs");
 // A release page is a remote write we no longer make anywhere in the lane.
 const pageWrite = /(?:releases\/tags|api\(\s*["']releases|release\s*["'],\s*["']upload|browser_download_url|product-backup|["']PATCH["']|sharedRef|verifyReleaseAppend)/;
 const noPages = (s) => !pageWrite.test(s);
@@ -22,6 +23,12 @@ const checks = [
   ["trusted-publisher", text.includes("id-token: write") && text.includes("registry-url: 'https://registry.npmjs.org'")],
   ["verify-before-publish", text.indexOf("publish-release.mjs --prepare") > 0 && text.indexOf("publish-release.mjs --prepare") < text.indexOf("publish-release.mjs --publish")],
   ["zero-release-pages", noPages(text) && noPages(publishText) && noPages(stageText)],
+  ["runtime-ships-in-npm", (() => {
+    const zipStaged = prepText.includes('path.join(pkg, "bin", bundle)') && /sha256\(read\(stagedZip\)\)/.test(prepText);
+    const fallbackOnly = !/manifest\.runtime\.source\s*=/.test(prepText) && prepText.includes("pre-bundle fallback");
+    const cleanroomFromTarball = !/cleanroom-check\.mjs[^)]*--bundle/.test(prepText) && /cleanroom-check\.mjs", "--tarball", tarball\]/.test(prepText);
+    return zipStaged && fallbackOnly && cleanroomFromTarball;
+  })()],
   ["dry-run", text.includes("default: true") && text.includes("if: inputs.dry_run == false") && text.includes("--dry-run --ignore-scripts")],
   ["no-rebuild", !/cargo (build|test)|selftest|fetch-chromium|cleanroom-check|npm pack/.test(text)],
   ["no-history-destruction", !/release delete|git push|--force|overwrite_files: true/.test(text)],

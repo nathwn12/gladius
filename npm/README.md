@@ -21,7 +21,7 @@ With no arguments this starts the long-lived stdio server. `--doctor` and `--ver
 ```text
 Install nathwn12/gladius (gladius-mcp) with npx gladius-mcp@latest, then prove it works.
 1. Run: npx gladius-mcp@latest
-2. First run: provisions the pinned runtime and browser, verifies both, then serves MCP over stdio; needs Windows x64, Node >= 22.14.0 and network access.
+2. First run: provisions the pinned runtime from the zip bundled in this tarball and the browser from Google, verifies both, then serves MCP over stdio; needs Windows x64 and Node >= 22.14.0.
 3. Done when: npx gladius-mcp@latest --doctor exits 0 and prints "network": "none: this diagnostic performs no fetch and exits before any download code".
 If it fails, stop and paste the full output; do not improvise a fix.
 ```
@@ -48,7 +48,7 @@ The `-y` flag keeps the non-interactive spawn from prompting. Any stdio MCP clie
 
 ### Offline or pinned
 
-Pin the npm package with `npx gladius-mcp@0.8.1`. That pins the package version; the bundled `engine-manifest.json` records the runtime asset the launcher fetches. For the published 0.8.1 build that record points under the `gladius` release tag to `gladius-v0.8.1-windows-x86_64.zip`. The release workflow performs no deletion; both the `gladius` and `v0.7.1` releases are present. The package ships no browser or server bytes, so a fresh run still needs network. Set `GLADIUS_CHROMIUM` to an existing `chrome-headless-shell` binary to skip browser provisioning.
+Pin the npm package with `npx gladius-mcp@0.8.1`. npm is the release: that version's tarball carries its runtime zip under `bin/`, and the launcher provisions from it with no GitHub Release page. Version tags are history markers only, so a pinned version stays usable. Versions published before the tarball carried a zip fall back to the tagged Release URL recorded in `engine-manifest.json`. The package ships the server runtime but not the browser, so a fresh run still fetches `chrome-headless-shell` from Google; set `GLADIUS_CHROMIUM` to an existing binary to skip that.
 
 ## Tools
 
@@ -59,7 +59,7 @@ Twenty-five tools over one stdio connection: navigate, snapshot, click, type, sc
 - Windows x64. Other platforms refuse at startup; `GLADIUS_MCP_ALLOW_NON_WINDOWS=1` bypasses the gate for diagnostics only.
 - Node.js >= 22.14.0 for the launcher; no package dependencies.
 - An MCP client that speaks stdio.
-- Network on first run to fetch the pinned runtime and browser. There is no fully offline fresh install; headless only.
+- Network on first run to fetch the browser only; the server runtime is bundled in the tarball. Headless only.
 
 ## Status
 
@@ -68,6 +68,6 @@ Twenty-five tools over one stdio connection: navigate, snapshot, click, type, sc
 ## Links
 
 - [Issues](https://github.com/nathwn12/gladius/issues)
-- [Releases](https://github.com/nathwn12/gladius/releases)
+- [Version tags](https://github.com/nathwn12/gladius/tags) (history markers only; npm is the release)
 - [npm package](https://www.npmjs.com/package/gladius-mcp)
 - [MIT licence](LICENSE)
