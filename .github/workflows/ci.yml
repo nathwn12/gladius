@@ -105,6 +105,8 @@ jobs:
         if: steps.scope.outputs.code == 'true'
       - run: cargo build --locked
         if: steps.scope.outputs.code == 'true'
+      - run: node scripts/mcp-conformance.mjs --bin target/debug/gladius.exe
+        if: steps.scope.outputs.code == 'true'
       - name: Scope
         if: always()
         run: |

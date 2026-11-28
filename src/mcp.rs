@@ -198,6 +198,7 @@ fn skill_object(skill: &EmbeddedSkill) -> Value {
     let uri = format!("skill://{}/SKILL.md", skill.name);
     json!({
         "uri": uri,
+        "name": name,
         "frontmatter": {"name": name, "description": description},
         "resources": skill_resources(skill)
     })
@@ -1196,6 +1197,11 @@ async fn handle_fast(req: &Value, _browser: &Arc<Browser>) -> Option<Value> {
             }
             Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
         }
+        // The capability is advertised, so the method must answer (an empty
+        // set is valid); -32601 here kills clients that honour capabilities.
+        // Skill resources are enumerated by skills/list and read by resources/read.
+        "resources/list" => Some(json!({"jsonrpc": "2.0", "id": id,
+            "result": {"resources": []}})),
         "skills/list" => {
             let mut skills: Vec<Value> = SKILLS.iter().map(skill_object).collect();
             skills.sort_by_key(|v| {
@@ -1205,6 +1211,7 @@ async fn handle_fast(req: &Value, _browser: &Arc<Browser>) -> Option<Value> {
                     .to_string()
             });
             Some(json!({"jsonrpc": "2.0", "id": id, "result": {
+                "resultType": "complete",
                 "skills": skills,
                 "ttlMs": 0,
                 "cacheScope": "private"
@@ -1221,6 +1228,7 @@ async fn handle_fast(req: &Value, _browser: &Arc<Browser>) -> Option<Value> {
                 .find(|s| format!("skill://{}/SKILL.md", s.name) == uri)
             {
                 Some(skill) => Some(json!({"jsonrpc": "2.0", "id": id, "result": {
+                    "resultType": "complete",
                     "skill": skill_object(skill),
                     "ttlMs": 0,
                     "cacheScope": "private"

@@ -117,6 +117,11 @@ fn skills_capability_and_list() {
     );
 
     let r = c.result("skills/list", json!({}));
+    assert_eq!(
+        r.get("resultType"),
+        Some(&json!("complete")),
+        "skills/list resultType: {r}"
+    );
     let skills = r
         .get("skills")
         .and_then(|v| v.as_array())
@@ -124,6 +129,11 @@ fn skills_capability_and_list() {
     assert_eq!(skills.len(), 1, "one seed skill");
     let skill = &skills[0];
     assert_eq!(skill.get("uri"), Some(&json!("skill://sessions/SKILL.md")));
+    assert_eq!(
+        skill.get("name"),
+        Some(&json!("sessions")),
+        "entry-level name"
+    );
     let fm = skill.get("frontmatter").expect("frontmatter");
     assert_eq!(fm.get("name"), Some(&json!("sessions")));
     let desc = fm.get("description").and_then(|v| v.as_str()).unwrap_or("");
@@ -170,9 +180,20 @@ fn skills_get_and_resources_read() {
     let _ = c.result("initialize", json!({"protocolVersion": "2025-11-25"}));
 
     let r = c.result("skills/get", json!({"uri": "skill://sessions/SKILL.md"}));
+    assert_eq!(
+        r.get("resultType"),
+        Some(&json!("complete")),
+        "skills/get resultType: {r}"
+    );
     let skill = r.get("skill").expect("skill");
     assert_eq!(skill.get("uri"), Some(&json!("skill://sessions/SKILL.md")));
+    assert_eq!(
+        skill.get("name"),
+        Some(&json!("sessions")),
+        "get entry-level name"
+    );
     assert_eq!(r.get("ttlMs"), Some(&json!(0)));
+    assert_eq!(r.get("cacheScope"), Some(&json!("private")));
 
     let r = c.result(
         "resources/read",

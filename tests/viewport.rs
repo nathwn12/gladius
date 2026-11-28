@@ -177,14 +177,19 @@ fn viewport_override_readback_reset_and_new_tab() {
         .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("viewport"))
         .expect("viewport listed");
     let schema = vp.get("inputSchema").expect("viewport inputSchema");
-    assert_eq!(
-        schema.get("oneOf"),
-        Some(&json!([
-            {"properties": {"reset": {"const": true}}, "required": ["reset"]},
-            {"properties": {"reset": {"const": false}}, "required": ["reset", "width", "height"]},
-            {"required": ["width", "height"], "not": {"required": ["reset"]}}
-        ])),
-        "reset-vs-size oneOf: {vp}"
+    for key in ["oneOf", "anyOf", "allOf", "enum", "const", "not"] {
+        assert!(
+            schema.get(key).is_none(),
+            "viewport inputSchema root carries {key}: {vp}"
+        );
+    }
+    let props = schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .expect("viewport inputSchema properties");
+    assert!(
+        props.get("__argumentConstraints").is_none(),
+        "no invented argument property published to models: {vp}"
     );
     assert!(
         schema.get("required").is_none(),
@@ -255,47 +260,13 @@ fn viewport_override_readback_reset_and_new_tab() {
     shutdown(c);
 }
 
-/// G6: the viewport input schema models the runtime exactly. A small
-/// evaluator over the schema's own keywords (`required`, `properties`
-/// `const`, `not`, `oneOf`): no jsonschema dep, just enough to prove the
-/// six reset/dimensions cases the tool actually implements.
-fn schema_valid(schema: &Value, instance: &Value) -> bool {
-    let obj = match instance.as_object() {
-        Some(o) => o,
-        None => return false,
-    };
-    if let Some(req) = schema.get("required").and_then(|r| r.as_array()) {
-        for k in req {
-            if !obj.contains_key(k.as_str().unwrap_or("")) {
-                return false;
-            }
-        }
-    }
-    if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
-        for (k, sub) in props {
-            if let Some(v) = obj.get(k) {
-                if let Some(c) = sub.get("const") {
-                    if v != c {
-                        return false;
-                    }
-                }
-            }
-        }
-    }
-    if let Some(not) = schema.get("not") {
-        if schema_valid(not, instance) {
-            return false;
-        }
-    }
-    if let Some(one) = schema.get("oneOf").and_then(|o| o.as_array()) {
-        return one.iter().filter(|b| schema_valid(b, instance)).count() == 1;
-    }
-    true
-}
-
+/// G6: the reset/dimensions rule is enforced by the handler, not by a
+/// provider-incompatible root combinator or an invented argument property.
+/// The six cases below go through the real MCP entry point.
 #[test]
-fn viewport_input_schema_models_reset_branches() {
+fn viewport_handler_models_reset_branches() {
     let mut c = Client::spawn();
+    c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     let listed = c.result("tools/list", json!({}));
     let vp = listed
         .get("tools")
@@ -305,11 +276,25 @@ fn viewport_input_schema_models_reset_branches() {
         .find(|t| t.get("name").and_then(|n| n.as_str()) == Some("viewport"))
         .expect("viewport listed")
         .clone();
-    let schema = vp.get("inputSchema").expect("viewport inputSchema").clone();
-    let closed = c.call("close", json!({}));
-    assert!(closed.get("isError").is_none(), "close ok: {closed}");
-    shutdown(c);
-    for (args, want) in [
+    let schema = vp.get("inputSchema").expect("viewport inputSchema");
+    for key in ["oneOf", "anyOf", "allOf", "enum", "const", "not"] {
+        assert!(
+            schema.get(key).is_none(),
+            "viewport inputSchema root carries {key}: {vp}"
+        );
+    }
+    let props = schema
+        .get("properties")
+        .and_then(|p| p.as_object())
+        .expect("viewport inputSchema properties");
+    assert!(
+        props.get("__argumentConstraints").is_none(),
+        "no invented argument property published to models: {vp}"
+    );
+
+    let nav = c.call("navigate", json!({"url": fixture_url()}));
+    assert!(nav.get("isError").is_none(), "navigate ok: {nav}");
+    for (args, want_ok) in [
         (json!({"reset": false}), false),
         (json!({"reset": false, "width": 800, "height": 600}), true),
         (json!({"reset": true}), true),
@@ -317,10 +302,15 @@ fn viewport_input_schema_models_reset_branches() {
         (json!({"width": 800, "height": 600}), true),
         (json!({}), false),
     ] {
+        let r = c.call("viewport", args.clone());
         assert_eq!(
-            schema_valid(&schema, &args),
-            want,
-            "viewport schema case {args}: {schema}"
+            r.get("isError").is_none(),
+            want_ok,
+            "viewport handler case {args}: {r}"
         );
     }
+
+    let closed = c.call("close", json!({}));
+    assert!(closed.get("isError").is_none(), "close ok: {closed}");
+    shutdown(c);
 }

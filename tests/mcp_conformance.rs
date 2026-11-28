@@ -283,10 +283,64 @@ fn unsupported_meta_version() {
 #[test]
 fn unknown_methods_rejected() {
     let mut c = Client::spawn();
-    for m in ["prompts/list", "resources/list", "logging/setLevel"] {
+    for m in ["prompts/list", "logging/setLevel"] {
         let resp = c.request(m, json!({}));
         let err = resp.get("error").expect("must be protocol error");
         assert_eq!(err.get("code"), Some(&json!(-32601)), "{m} code: {resp}");
+    }
+}
+
+/// An advertised resources capability must answer: -32601 makes clients
+/// that honour capabilities give up before any tool runs.
+#[test]
+fn resources_list_is_implemented() {
+    let mut c = Client::spawn();
+    let r = c.result("resources/list", json!({}));
+    let resources = r
+        .get("resources")
+        .and_then(|x| x.as_array())
+        .expect("resources/list returns a resources array, never -32601");
+    assert!(
+        resources.is_empty(),
+        "no standalone resources advertised: {r}"
+    );
+}
+
+/// Model providers reject a request whose inputSchema ROOT carries a
+/// combinator. Property-level combinators are legal.
+#[test]
+fn tools_input_schemas_have_provider_safe_roots() {
+    let mut c = Client::spawn();
+    let listed = c.result("tools/list", json!({}));
+    let tools = listed
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .expect("tools array");
+    assert_eq!(tools.len(), 25, "25 tools");
+    for t in tools {
+        let name = t.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+        let schema = t
+            .get("inputSchema")
+            .unwrap_or_else(|| panic!("{name} missing inputSchema"));
+        assert_eq!(
+            schema.get("type"),
+            Some(&json!("object")),
+            "{name} inputSchema root type object"
+        );
+        for key in ["oneOf", "anyOf", "allOf", "enum", "const", "not"] {
+            assert!(
+                schema.get(key).is_none(),
+                "{name} inputSchema root carries {key}: {schema}"
+            );
+        }
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .unwrap_or_else(|| panic!("{name} inputSchema.properties"));
+        assert!(
+            props.get("__argumentConstraints").is_none(),
+            "{name} publishes an invented argument property: {schema}"
+        );
     }
 }
 
