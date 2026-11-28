@@ -315,6 +315,7 @@ dependencies = [
  "base64",
  "futures-util",
  "reqwest",
+ "ring",
  "serde_json",
  "tempfile",
  "tokio",

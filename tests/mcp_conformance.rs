@@ -112,8 +112,12 @@ impl Drop for Client {
 fn exact_tools_capabilities(caps: &Value) {
     assert_eq!(
         caps,
-        &json!({"tools": {"listChanged": false}}),
-        "capabilities must be exactly tools/listChanged"
+        &json!({
+            "tools": {"listChanged": false},
+            "resources": {},
+            "extensions": {"io.modelcontextprotocol/skills": {}}
+        }),
+        "capabilities must include tools, resources and skills extension"
     );
 }
 
