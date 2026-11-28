@@ -3,7 +3,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/gladius-mcp"><img src="https://img.shields.io/npm/v/gladius-mcp" alt="npm version" /></a>
-  <img src="https://img.shields.io/badge/platform-windows--64bit-2b3137" alt="Windows x64" />
+  <img src="https://img.shields.io/badge/platform-Windows--64bit-2b3137" alt="Windows x64" />
   <img src="https://img.shields.io/badge/tools-25-brightgreen" alt="25 tools" />
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT licence" />
 </p>

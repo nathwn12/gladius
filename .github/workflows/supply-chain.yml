@@ -20,14 +20,16 @@ concurrency:
 
 jobs:
   audit:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       # The action compiles cargo-audit, whose own MSRV is newer than this
       # crate's rust-toolchain.toml pin. Only the audit job moves; the crate's
       # MSRV stays what ci.yml and rust-toolchain.toml say it is.
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         env:
           # rust-toolchain.toml outranks the default toolchain, and this
           # outranks the file, so cargo install and cargo audit both use

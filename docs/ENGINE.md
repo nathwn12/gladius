@@ -26,7 +26,7 @@ Headless-only by owner decision (2026-10-17): there is no headed path at all,
 and a headed request fails closed with an explicit unsupported error. Each
 owned instance launches the pinned `chrome-headless-shell.exe` as:
 
-```
+```text
 chrome-headless-shell.exe --headless --remote-debugging-port=<free> --user-data-dir=<private> --no-first-run --no-default-browser-check --disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-background-timer-throttling --remote-allow-origins=http://127.0.0.1:<port> about:blank
 ```
 

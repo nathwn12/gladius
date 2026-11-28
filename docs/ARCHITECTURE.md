@@ -8,13 +8,13 @@
 ## 1. Frozen tool contract (v2 - additive only; every v1 call is unchanged)
 
 | name | args | returns |
-|---|---|---|
+| --- | --- | --- |
 | `navigate` | `url: string` | text after load event (timeout -> error) |
 | `snapshot` | `mode?: "ax"\|"legacy"\|"text"` (default AX) | Real Accessibility tree: one line per actionable node with a stable ref (`@e1`, `@e2`, ...), role/name/value, plus page text (capped 8000 chars). Hidden/ignored subtrees (display:none, aria-hidden) are excluded from the lines; an old ref to such a node is a typed `stale_ref`, never a silent click. `mode:"legacy"` keeps the old DOM heuristic (stamps hidden nodes); `mode:"text"` = text-only output. Shadow-DOM nodes in open shadow roots resolve in the snapshot and refs to them are actionable by the action tools through the backend-node-id resolver; closed shadow roots and refs to hidden, ignored or removed nodes are typed `stale_ref`, never a silent action. `frame` (CDP frameId) scopes the snapshot to that iframe |
 | `screenshot` | `fullPage?: bool`, `path?: string`, `deterministic?: bool` (default false), `width?: number`, `height?: number` (only with `deterministic`) | PNG bytes (base64 `image` part) of viewport / full page; refuses under `dom-only`. `deterministic:true` fixes device metrics (current viewport or `width`/`height`, `deviceScaleFactor:1`, `mobile:false`) and restores them afterwards, sets `prefers-reduced-motion:reduce`, applies the freeze walk (a stylesheet plus WAAPI/SMIL/media holds over the main document, same-process frames and open shadow roots), waits on font STATUS plus every `img` `complete` plus two animation frames, then captures `{format:png, fromSurface:true, captureBeyondViewport:fullPage}`. The reply adds `viewport`, `deviceScaleFactor`, `url`, `bytes`, a FNV-1a `checksum`, `settled`, `settleTimeouts`, `fontsPending`, `freezeMode` and `freeze`. deterministic pins the capture so two captures of the same page in the same engine produce the same PNG bytes; the scope of the freeze is the main document, same-process frames, open shadow roots, CSS animation, WAAPI, SMIL and media (see `freeze`). Canvas, WebGL, video frames and cross-process iframes are sampled, not frozen. |
 | `assert_layout` | `ref?: string\|string[]`, `selector?: string\|string[]` (one of them), `checks?: object`, `screenshotOnFail?: bool`, `screenshotPath?: string` | geometry proved without pixels. Checks: `exists`, `visible`, `stableFrames` (N animation frames, identical bbox), `box {x,y,w,h,tolerance}` (VIEWPORT css px from `DOM.getBoxModel`), `hitTarget` (`elementFromPoint` at the centre is the target or a descendant), `computed` (subset of `getComputedStyle`), `noOverflow` (`scrollWidth/Height <= clientWidth/Height + tolerance`), `inViewport`. Returns `{pass, checks:[{target,check,pass,expected,actual,delta}], targets:[...]}`; `screenshotOnFail` adds one deterministic capture's path/bytes/checksum |
 | `layout` | `ref?`, `selector?`, `includeOverlaps?: bool` (default true) | every match's viewport `rect`, page-coordinate `box` (`DOM.getBoxModel`), content quad count, scroll size (`scrollWidth/Height` vs `clientWidth/Height`), computed `display`/`visibility`/`opacity`, a z-order hint (`paintIndex`, `zIndex`, `position`, `stackingContext`) and every overlapping pair with its intersection rect and area |
-| `visual` | `action: "save"\|"compare"\|"list"\|"delete"`, `name?: string`, `fullPage?: bool`, `threshold?: number` (per-channel 0..1, default 0.1), `maxDiffPixels?: number`, `maxDiffRatio?: number`, `maskRects?: {x,y,w,h}[]`, `update?: bool`, `antialias?: bool` (default true), `includeAA?: bool` (default false, the inverse), `minDiffCluster?: number` (default 2), `requireEnvironmentMatch?: bool` | deterministic baselines under `GLADIUS_VISUAL_DIR` (default `%LOCALAPPDATA%/gladius/visual`, never the caller's cwd), names sanitised to `[A-Za-z0-9._-]`, capped at 500 baselines and 500 `.diff.png` by-products (`GLADIUS_VISUAL_CAP` overrides both; a save at the cap is a typed refusal naming `visual delete`, and only diff by-products age out automatically, oldest first); each baseline writes a `<name>.meta.json` sidecar (browser, browserMajor, viewport, deviceScaleFactor, url, checksum, createdAt). `compare` diffs the current deterministic capture against the baseline **inside a scratch headless target created with `background:true`** (both PNGs ride in as `data:` URLs and are decoded onto a canvas, so no PNG crate is added) and returns `{pixelsIdentical, passWithinTolerance, pass, diffPixels, totalPixels, ratio, bbox, maxChannelDelta, ignoredPixels, ignoredClusters, baselinePath, diffPath, antialias, minDiffCluster, scratchBackground, environment {match, baseline, current}}`. `pixelsIdentical` is checksum equality (a fact about the bytes); `passWithinTolerance` is the whole predicate; `pass` is an alias of `passWithinTolerance`, always equal to it, and means "within the requested tolerance", never "the images are the same". Anti-aliasing is subtracted by a mechanical rule, but since 0.8.0 the subtraction does not pass by default: `ignoredPixels > 0` fails `passWithinTolerance` unless `allowIgnoredAA:true` is passed explicitly. The rule: a candidate is suppressed only when its 3x3 luminance neighbourhood has ≥32 levels of contrast in **both** images, so a 1 px edge artefact can be subtracted while a 1 px change in a flat fill or a 2x2 block counts. A browser-major / viewport / DSF mismatch raises a `baseline_environment_mismatch` warning (not a failure unless `requireEnvironmentMatch:true`); `update:true` rewrites the PNG and the sidecar |
+| `visual` | `action: "save"\|"compare"\|"list"\|"delete"`, `name?: string`, `fullPage?: bool`, `threshold?: number` (per-channel 0..1, default 0.1), `maxDiffPixels?: number`, `maxDiffRatio?: number`, `maskRects?: {x,y,w,h}[]`, `update?: bool`, `antialias?: bool` (default true), `includeAA?: bool` (default false, the inverse), `minDiffCluster?: number` (default 2), `requireEnvironmentMatch?: bool` | deterministic baselines under `GLADIUS_VISUAL_DIR` (default `%LOCALAPPDATA%/gladius/visual`, never the caller's cwd), names sanitised to `[A-Za-z0-9._-]`, capped at 500 baselines and 500 `.diff.png` by-products (`GLADIUS_VISUAL_CAP` overrides both; a save at the cap is a typed refusal naming `visual delete`, and only diff by-products age out automatically, oldest first); each baseline writes a `<name>.meta.json` sidecar (browser, browserMajor, viewport, deviceScaleFactor, url, checksum, createdAt). `compare` diffs the current deterministic capture against the baseline **inside a scratch headless target created with `background:true`** (both PNGs ride in as `data:` URLs and are decoded onto a canvas, so no PNG crate is added) and returns `{pixelsIdentical, passWithinTolerance, pass, diffPixels, totalPixels, ratio, bbox, maxChannelDelta, ignoredPixels, ignoredClusters, baselinePath, diffPath, antialias, minDiffCluster, scratchBackground, environment {match, baseline, current}}`. `pixelsIdentical` is checksum equality (a fact about the bytes); `passWithinTolerance` is the whole predicate; `pass` is an alias of `passWithinTolerance`, always equal to it, and means "within the requested tolerance", never "the images are the same". Anti-aliasing is subtracted by a mechanical rule, but since 0.8.0 the subtraction does not pass by default: `ignoredPixels > 0` fails `passWithinTolerance` unless `allowIgnoredAA:true` is passed explicitly. The rule: a candidate is suppressed only when its 3x3 luminance neighbourhood has ≥32 levels of contrast in **both** images, so a 1 px edge artef... (line truncated to 2000 chars) |
 | `click` | `element: string` (CSS, or AX ref `@eN`), `frame?: string` (CDP frameId), `hoverFirst?: bool` (default false) | trusted pointer sequence at the exact float box centre: `mousePressed` + `mouseReleased` only, plus ONE `mouseMoved` positioning event when `hoverFirst:true` - no movement loop, no interpolation; `isTrusted:true` pointer/mouse/click events after scroll + hit-test; occluded targets are typed `not_actionable`, never a click into the overlay. `frame` scopes to that iframe (same-process CSS selectors; per-level owner hit-test up the ancestor chain; OOPIF without a mapped target is a typed error, never a main-frame click) |
 | `type` | `element: string, text: string, submit?: bool, frame?: string` | focus + select-all in the (frame) realm, then trusted `Input.insertText` (`isTrusted:true` input event); the seed is replaced, not appended. File/date-like and non-editable targets are typed `not_editable`, never a silent no-op |
 | `evaluate` | `expression: string, target?: string, frame?: string` | JSON-serialised JS result (`undefined` -> tool error, distinct from explicit `null`); `target` (CDP targetId) evaluates in that realm, `frame` (CDP frameId) in that iframe's isolated world |
@@ -26,15 +26,14 @@
 | `select` | `element: string, value?: string, text?: string, frame?: string` | `{ ok: true }` after choosing a `<select>` option by value (preferred) or visible text (same JS selection in the frame realm when scoped) |
 | `key` | `key: string` (Enter, Tab, Escape, ..., or `Ctrl+A`-style combos) | `{ ok: true }` after the key press on the focused element; combos hold modifiers (Alt=1/Ctrl=2/Meta=4/Shift=8) and dispatch `rawKeyDown` with no text when Ctrl/Meta/Alt is held |
 | `viewport` | `width?: number, height?: number, deviceScaleFactor?: number, mobile?: bool, reset?: bool` (oneOf: `reset:true` alone; `reset:false` + `width`+`height`; no `reset` + `width`+`height` — exactly one branch) | applied metrics + live read-back of `window.innerWidth`/`innerHeight`/`devicePixelRatio` (`matched` false when the engine ignored the override); `reset:true` clears the override |
-| `tabs` | `action: "list"|"new"|"select"|"close", url?: string, index?: number` | tab list / mutation result (list, new, close, select) |
+| `tabs` | `action: "list" \| "new" \| "select" \| "close", url?: string, index?: number` | tab list / mutation result (list, new, close, select) |
 | `close` | - | `{ ok: true }`; reaps the owned browser process tree (or detaches from an attached external engine, leaving it running) |
 | `storage` | `action?: "get"\|"set"\|"clear"\|"save"\|"load", scope?: "cookies"\|"localStorage"\|"sessionStorage"\|"all", cookies?: object[], items?: object, path?: string, allSites?: bool, redact?: bool, overwrite?: bool, force?: bool, confirm?: bool` | cookies + Web Storage in one call, plus versioned file save/load (`{gladiusStorage:1,...}`; replies carry counts/bytes/origin only, never values). Cookie writes are read-back-verified (`cookie_rejected` otherwise); `load` enforces origin match unless `force:true`; `redact:true` masks values (`••••`) |
-| `targets` | `action?: "list"|"select", target?: string` | every CDP target with its stable id + the active page's frame tree; `select` makes a page target current |
+| `targets` | `action?: "list" \| "select", target?: string` | every CDP target with its stable id + the active page's frame tree; `select` makes a page target current |
 | `dialog` | `action?: "get"\|"policy", accept?: bool, promptText?: string` | last auto-handled dialog + live policy; `policy` sets the default handling |
 | `history` | `action: "back"\|"forward"\|"reload"` | live url+title after the load settle; boundary steps are typed errors |
 | `network` | `action?: "get"\|"drain"\|"clear", filter?: string, limit?: number` | captured requests/responses (method/url/status/type/timing, cap 500) |
 | `cdp` | `method: string, params?: object, session?: string` | raw CDP `result`; CDP errors are tool errors |
-
 
 Rules: tools are **dumb primitives** - no planner, no LLM, no judgement-retries in the server
 (RESEARCH rule 7). Selector grammar is deliberately tiny; anything fancier goes through `evaluate`.
@@ -42,19 +41,8 @@ Rules: tools are **dumb primitives** - no planner, no LLM, no judgement-retries 
 ## 2. Backend: one owned engine, plus explicit attach (swap the engine, keep the contract)
 
 | Tier | Backend | When | Notes |
-|---|---|---|---|
-| **Tier 0 (only launch)** | owned pinned Chromium (`chrome-headless-shell`) | now | versioned cache under `%LOCALAPPDATA%\gladius\chromium\`, provisioned by
-  `scripts/fetch-chromium.ps1` (pinned 156.0.8078.80, self-hashed manifest).
-  Headless-only (owner decision 2026-10-17, no headed path). Launched as
-  `chrome-headless-shell --headless --remote-debugging-port <free>
-  --user-data-dir <private> --no-first-run --no-default-browser-check
-  --disable-backgrounding-occluded-windows
-  --disable-renderer-backgrounding --disable-background-timer-throttling
-  --remote-allow-origins http://127.0.0.1:<port> about:blank`, readiness via
-  `GET /json/version`. The three `--disable-*` flags exist so a tab that is
-  NOT the active page still renders, still screenshots and still runs its
-  timers (asserted by the selftest). Full pin record: `docs/CHROMIUM.md`,
-  launch contract: `docs/ENGINE.md`. |
+| --- | --- | --- | --- |
+| **Tier 0 (only launch)** | owned pinned Chromium (`chrome-headless-shell`) | now | versioned cache under `%LOCALAPPDATA%\gladius\chromium\`, provisioned by `scripts/fetch-chromium.ps1` (pinned 156.0.8078.80, self-hashed manifest). Headless-only (owner decision 2026-10-17, no headed path). Launched as `chrome-headless-shell --headless --remote-debugging-port <free> --user-data-dir <private> --no-first-run --no-default-browser-check --disable-backgrounding-occluded-Windows --disable-renderer-backgrounding --disable-background-timer-throttling --remote-allow-origins <http://127.0.0.1>:<port> about:blank`, readiness via `GET /json/version`. The three `--disable-*` flags exist so a tab that is NOT the active page still renders, still screenshots and still runs its timers (asserted by the selftest). Full pin record: `docs/CHROMIUM.md`, launch contract: `docs/ENGINE.md`. |
 | **Tier 1 (rejected)** | Lightpanda no-render | — | Rejected: no Windows target; AGPL-3.0 §13-only; text-only raster. |
 
 No full-Chrome tier: there is no headed path and none is planned - the shell
@@ -90,7 +78,7 @@ gladius opened and never kills, never sweeps. `GLADIUS_BACKEND_CAPS` declares `r
 
 ## 4. Browser lifecycle (lazy start, kill-tree on close)
 
-```
+```text
 tools/call (first, non-close) --► resolve owned browser binary --► create fresh
       private profile --► spawn child
       (chrome-headless-shell on a free loopback port, private --user-data-dir)
@@ -124,7 +112,7 @@ running by design - no `kill_tree`, no pid kill, nothing deleted.
 ## 5. RAM / latency budget + how it is measured
 
 | Budget | Target | Rationale |
-|---|---|---|
+| --- | --- | --- |
 | MCP `initialize` (no browser) | **< 100 ms** cold | proves the server itself is free; browser cost is never on this path |
 | First-action latency (incl. spawn+CDP) | **< 2 s** on dev Windows | owned-engine spawn + CDP handshake dominates; asserted, not hoped |
 | Steady-state action p50 | **< 200 ms** (plus site/network) | CDP round-trip over `tokio-tungstenite`; `fastwebsockets` on standby if profiles implicate framing |
@@ -132,6 +120,7 @@ running by design - no `kill_tree`, no pid kill, nothing deleted.
 | Browser child peak RSS | **< 250 MB** single page | owned engine, single page |
 
 **Measurement (Windows-local, CI-runnable):**
+
 - Cold start: `Measure-Command { Start-Process gladius.exe ... }` to first `initialize` response;
   timestamp deltas printed by the harness, asserted `< 100 ms`.
 - Child RSS: sample the job-object child's `WorkingSet64` via `Get-Process` at 100 ms cadence

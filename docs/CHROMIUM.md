@@ -8,10 +8,10 @@ see below).
 
 - Project: Chrome for Testing: `chrome-headless-shell` (headless-only //content wrapper)
 - Channel: Stable, resolved to an explicit version (a channel name is NOT a pin)
-- Resolved from: https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json
+- Resolved from: <https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json>
 - Version: `156.0.8078.80`
 - Asset: `chrome-headless-shell-win64.zip`
-- Asset URL: https://storage.googleapis.com/chrome-for-testing-public/156.0.8078.80/win64/chrome-headless-shell-win64.zip
+- Asset URL: <https://storage.googleapis.com/chrome-for-testing-public/156.0.8078.80/win64/chrome-headless-shell-win64.zip>
 
 ## Pin
 

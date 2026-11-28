@@ -22,7 +22,7 @@ No `.git` in `<repo>` (directory listing: `.gitignore` only). Provenance is
 established by hashes + mtimes + an isolated fresh rebuild.
 
 | Artifact | Size (B) | mtime (local) | SHA256 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `bin\gladius.exe` | 5,497,344 | 2026-10-10 5:23:32 PM | `DCD0CE9F82C36BE2365B4EE7B8C5CF439D80E40C66F2A9B059BF7F038C2F8C63` |
 | `target\release\gladius.exe` | 5,497,344 | 2026-10-10 5:23:32 PM | `DCD0CE9F82C36BE2365B4EE7B8C5CF439D80E40C66F2A9B059BF7F038C2F8C63` (identical to `bin`) |
 | fresh isolated build (`CARGO_TARGET_DIR=%TEMP%\opencode\ses_ed8bd551cffeHmdMpTecyGZT4W\fresh-target`) | 5,497,344 | 2026-10-11 3:34:45 AM | `456F56816CDE9A2B87F9ED8564140A83C3E014DE3A710ADD2A599632C5BC5BDC` |
@@ -34,7 +34,7 @@ The 5:23:32 PM binary postdates the last edit by 16 s.
 **Fresh-vs-shipped byte diff:** 24 differing bytes out of 5,497,344 - all link metadata, zero code/data:
 
 | Offset(s) | Bytes | What |
-|---|---|---|
+| --- | --- | --- |
 | 264-265 (PE header) | 2 | `TimeDateStamp`: bin `0x6aca0414` vs fresh `0x6aca9355` |
 | 4609876, 4609904, 4609932 | 3 x 2 | debug-directory date stamps |
 | 4610292-4610307 | 16 | CodeView RSDS GUID (RSDS record at 4610288, `gladius.pdb` path at 4610312) |
@@ -47,7 +47,7 @@ in link timestamps/GUID (normal MSVC linker metadata).
 ## 2. Build + selftest
 
 | Command | Exit | Evidence |
-|---|---|---|
+| --- | --- | --- |
 | `cargo build --release` (repo target) | **0** | first run 4.12 s refresh, second run 0.25 s fresh no-op (log: `%TEMP%\...\build.log`) |
 | `cargo clean -p gladius; cargo build --release` | **0** | clean removed 86 files / 29.7 MiB, rebuild no-op (freshness re-confirmed; log in shell transcript) |
 | fresh isolated build (`CARGO_TARGET_DIR` scratch) | **0** | 34.15 s full dependency rebuild (`%TEMP%\...\freshbuild.log`) |
@@ -68,7 +68,7 @@ Phase B = one warm session, 5 repeats/op (op latency = send -> response, ms).
 Raw: `%TEMP%\...\timing\results.json`; stderr logs `stderr-cold1..5.log`, `stderr-warm.log`, `stderr-big.log`.
 
 | Op | n | min | **median** | max |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | cold initialize (spawn -> resp, no browser) | 5 | 19.3 | **24.5** | 27.0 |
 | cold navigate (spawn -> resp; chrome spawn + CDP connect + attach + Page.enable + load-poll + 2 evals) | 5 | 175.4 | **281.4** | 333.7 |
 | warm navigate | 5 | 107.4 | **107.6** | 108.5 |
@@ -82,6 +82,7 @@ Raw: `%TEMP%\...\timing\results.json`; stderr logs `stderr-cold1..5.log`, `stder
 | snapshot on 3,000-node page (truncation path; 7,960 B out) | 3 | 108.4 | **114.5** | 150.6 |
 
 Notes (measured unless labelled):
+
 - Two earlier cold-navigate samples under the identical method: 197.5 ms and 390.8 ms -> cold path is
   spawn/profile-variance dominated (range across all runs 175-391 ms).
 - The 0.3-0.5 ms evaluate floor is the loopback CDP RTT: JSON framing and websocket plumbing are NOT
@@ -105,7 +106,7 @@ Notes (measured unless labelled):
 Each row is readable at the cited lines (verified by direct reads of `src\` during this recon).
 
 | Hot path | Where | Why it is hot |
-|---|---|---|
+| --- | --- | --- |
 | Click settle watch (1 s) | `src/tools.rs:519-549` | Non-navigating click pays `1 s` of 50 ms `Runtime.evaluate` polls (`click` measured 1041.3 ms vs evaluate floor 0.3 ms). Single biggest latency defect in the surface. |
 | Navigate load poll (100 ms cadence) | `src/tools.rs:187-193` | `readyState` poll sleeps 100 ms between checks; page is load-complete in ~1 ms on `file://`, so every navigate pays ~100 ms (measured warm navigate 107.6 ms). |
 | Chrome spawn + DevTools-line wait + CDP connect | `src/browser.rs:760-846` (spawn 793-800, stderr line scan loop 816-842, `connect_async` 844-846) | The whole cold path: deadline-bounded stderr line scan for `ws://`, then websocket connect + `attach_to` + `Page.enable` (`browser.rs:415-434`). Cold navigate median 281.4 ms. |
@@ -130,13 +131,13 @@ Rivals read this pass (official docs, webfetch): Microsoft `@playwright/mcp`,
 Google `chrome-devtools-mcp`, `browser-use`, `browsermcp.io`, plus Lightpanda and Browserbase.
 
 | Feature | Who has it (evidence URL) | Gladius status |
-|---|---|---|
-| Network-idle / auto-wait on navigate+actions | Playwright MCP (`--timeout-settle`, `--timeout-navigation` - https://github.com/microsoft/playwright-mcp/blob/main/README.md); CDT (puppeteer auto-wait; `wait_for` tool - https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/main/docs/tool-reference.md) | **LACKS** - fixed 100 ms `readyState` polling (`tools.rs:187-193`); no idle signal anywhere |
-| Console capture | Playwright MCP `browser_console_messages` (README); CDT `list_console_messages` / `get_console_message` (tool-ref); browsermcp.io "Get Console Logs" (https://browsermcp.io) | **LACKS** - reader loop drops all non-dialog events (`browser.rs:619-691`) |
+| --- | --- | --- |
+| Network-idle / auto-wait on navigate+actions | Playwright MCP (`--timeout-settle`, `--timeout-navigation` - <https://github.com/microsoft/playwright-mcp/blob/main/README.md>); CDT (puppeteer auto-wait; `wait_for` tool - <https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/main/docs/tool-reference.md>) | **LACKS** - fixed 100 ms `readyState` polling (`tools.rs:187-193`); no idle signal anywhere |
+| Console capture | Playwright MCP `browser_console_messages` (README); CDT `list_console_messages` / `get_console_message` (tool-ref); browsermcp.io "Get Console Logs" (<https://browsermcp.io>) | **LACKS** - reader loop drops all non-dialog events (`browser.rs:619-691`) |
 | Network capture / mocking / offline | Playwright MCP `browser_network_requests` + `--caps=network` (`browser_route`, offline) (README); CDT `list_network_requests` / `get_network_request` + `emulate` networkConditions (tool-ref) | **LACKS** - no Network domain usage at all |
-| File upload | Playwright MCP `browser_file_upload` (README); CDT `upload_file` (tool-ref); browser-use (31 actions - https://github.com/browser-use/browser-use/blob/main/README.md) | **LACKS** - no file-chooser handling (`Input.*` use is mouse/keys only) |
+| File upload | Playwright MCP `browser_file_upload` (README); CDT `upload_file` (tool-ref); browser-use (31 actions - <https://github.com/browser-use/browser-use/blob/main/README.md>) | **LACKS** - no file-chooser handling (`Input.*` use is mouse/keys only) |
 | Download capture | Playwright MCP download/output-dir model (`--output-dir`, `--output-max-size`, README); browser-use cloud files (README) | **LACKS** - downloads land in the throwaway profile |
-| Cookies / storage / session state | Playwright MCP `--caps=storage` + `--storage-state` + `--isolated` (README); CDT `new_page isolatedContext` (tool-ref); Browserbase contexts (`--contextId`, https://github.com/browserbase/mcp-server-browserbase/blob/main/README.md) | **LACKS** - throwaway profile per session (`browser.rs:903-936`); persistence only designed (`docs\HEADED-MODE.md`) |
+| Cookies / storage / session state | Playwright MCP `--caps=storage` + `--storage-state` + `--isolated` (README); CDT `new_page isolatedContext` (tool-ref); Browserbase contexts (`--contextId`, <https://github.com/browserbase/mcp-server-browserbase/blob/main/README.md>) | **LACKS** - throwaway profile per session (`browser.rs:903-936`); persistence only designed (`docs\HEADED-MODE.md`) |
 | PDF export | Playwright MCP `--caps=pdf` (`browser_pdf_save`, README) | **LACKS** (explicit non-goal in `docs\ARCHITECTURE.md:88-93`) |
 | Screenshot element / formats / quality | Playwright MCP `browser_take_screenshot` (`element`, `type`, `scale`, README); CDT `take_screenshot` (`uid`, `format`, `quality`, tool-ref) | **PARTIAL** - viewport/fullPage PNG only (`tools.rs:424-439`) |
 | Viewport / device / geolocation / UA / media emulation | Playwright MCP `browser_resize`, `--device`, `--mobile`, `browser_emulate_media` (README); CDT `resize_page`, `emulate` (geolocation, userAgent, cpu/net throttle, tool-ref) | **PARTIAL** - the `viewport` tool sets `width`/`height`/`deviceScaleFactor`/`mobile` over `Emulation.setDeviceMetricsOverride` (with a `window.innerWidth`/`innerHeight` read-back, `reset` to clear, and a replay on every new tab). Measured engine default 1280x720 (read back in `tests/viewport.rs`, which records the baseline and requires it again after `reset`). Still LACKS device presets, user-agent, geolocation, and media emulation |
@@ -147,10 +148,10 @@ Google `chrome-devtools-mcp`, `browser-use`, `browsermcp.io`, plus Lightpanda an
 | Batch form fill | Playwright MCP `browser_fill_form` (README); CDT `fill_form` (tool-ref) | **LACKS** - per-field `type`/`select` only |
 | Back / forward / reload / ignoreCache | Playwright MCP `browser_navigate_back` (README); CDT `navigate_page` type=back/forward/reload (tool-ref); browsermcp.io Go Back/Forward | **LACKS** - URL navigation only |
 | Attach to an existing browser (CDP) | Playwright MCP `--cdp-endpoint` (README); CDT advanced usage "connect to a running Chrome"; browser-use remote CDP (README) | **LACKS** - designed, deferred (`docs\HEADED-MODE.md:62-66`) |
-| HTTP/SSE transport | Playwright MCP `--port` (README); CDT WebSocket config (docs/configuration.md); Lightpanda `mcp --port` with per-session isolation (https://github.com/lightpanda-io/browser/blob/main/README.md) | **LACKS** - stdio only (`src/mcp.rs`) |
+| HTTP/SSE transport | Playwright MCP `--port` (README); CDT WebSocket config (docs/configuration.md); Lightpanda `mcp --port` with per-session isolation (<https://github.com/lightpanda-io/browser/blob/main/README.md>) | **LACKS** - stdio only (`src/mcp.rs`) |
 | Stealth / proxies / CAPTCHA | browser-use cloud (stealth, proxies - README); browsermcp.io (real profile fingerprint); Browserbase `--proxies`/`--verified` (README); Lightpanda proxy support (README) | **LACKS** (expected; local rivals also lack) |
 | Snapshot scoping / search / file output | Playwright MCP `browser_find`, snapshot `depth`/`boxes`/`filename` (README); CDT `take_snapshot` `verbose` + filePath, pagination (tool-ref) | **PARTIAL** - always full-dump, 8,000-char cap + truncation footer (`tools.rs:356-399`) |
-| Renderless ultra-light tier | Lightpanda (16x lighter / 9x faster vendor-claim, CDP + MCP, https://github.com/lightpanda-io/browser/blob/main/README.md) | **PLANNED** Tier-1 backend swap (`docs\ARCHITECTURE.md:31-38`); no native Windows binary today |
+| Renderless ultra-light tier | Lightpanda (16x lighter / 9x faster vendor-claim, CDP + MCP, <https://github.com/lightpanda-io/browser/blob/main/README.md>) | **PLANNED** Tier-1 backend swap (`docs\ARCHITECTURE.md:31-38`); no native Windows binary today |
 | Multi-tab depth | All four primary rivals ship tab list/new/select/close; gladius parity | **PARITY** - `tabs list/new/close/select` with stable indices (`browser.rs:178-330`) |
 | Accessibility-ref actions | Playwright MCP refs, CDT uids, browsermcp.io snapshot refs; gladius `@eN` data-gladius-ref | **PARITY (current build)** - stable refs + typed stale-ref errors (`tools.rs:226-247, 441-505`) |
 | Dialog handling | Playwright MCP `browser_handle_dialog` (manual); CDT `handle_dialog` (manual); gladius auto-accepts and reports | **AHEAD** - auto-accept means dialogs can never wedge a run (measured rationale at `browser.rs:637-641`) |
@@ -161,7 +162,7 @@ Ranking arithmetic: `score = impact(1-5) x confidence(1-5) / effort(1-5)`; every
 measured number or a cited hot path above.
 
 | Rank | Optimization | Impact | Confidence | Effort | Score | Measured/projected basis |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | 1 | **Rework `click_settle` (tools.rs:519-549):** make the late-commit watch event-driven (in-page commit flag / MutationObserver / `location.href` change detected inside the click eval itself, or watch <= 250 ms only after dispatch) | 5 | 5 | 1 | **25.0** | click measured 1041.3 ms median; ~1,000 ms is pure watch. Projected click ~40-250 ms. |
 | 2 | **Event-driven navigate load wait (tools.rs:187-193 + reader_loop browser.rs:619-691):** resolve on `Page.loadEventFired`/`readyState` event instead of the 100 ms sleep cadence | 4 | 4 | 2 | **8.0** | warm navigate 107.6 ms vs 0.3 ms RTT floor; projected ~10-25 ms. Shaves ~100 ms off every navigation incl. the cold cycle. |
 | 3 | **Close without `taskkill.exe` (browser.rs:984-989):** use the already-open job handle (`TerminateJobObject`) or child-only kill; keep taskkill as fallback | 3 | 4 | 1.5 | **8.0** | close measured 186-259 ms; projected ~10-40 ms. Also removes a system-process spawn from every close. |
@@ -187,7 +188,7 @@ structural judgement (lines above are a single-function change each).
    Expected payoff: the first debugging signal for "why did my click do nothing" without a screenshot;
    near-zero latency risk.
 3. **File upload (`DOM.setFileInputFiles` via `DOM.querySelector`, or `Page.setInterceptFileChooserDialog`
-   + `DOM.setFileInputFiles`).** Reasoning: all four primary rivals expose upload (Playwright
+   - `DOM.setFileInputFiles`).** Reasoning: all four primary rivals expose upload (Playwright
    `browser_file_upload`, CDT `upload_file`, browser-use action set, browsermcp task docs) and it is a
    hard gate on whole task classes (forms, invoices, CVs) regardless of speed; gladius currently has no
    file-chooser path at all. Expected payoff: unblocks that task class; effort is contained to one new
@@ -210,7 +211,7 @@ optimization #2); it duplicates much of #2's payoff and lands naturally with the
 All scratch under `%TEMP%\opencode\ses_ed8bd551cffeHmdMpTecyGZT4W\` (marker `--drop--ses_ed8bd551cffeHmdMpTecyGZT4W`):
 
 | Path | What | Disposition |
-|---|---|---|
+| --- | --- | --- |
 | `timing\driver2.py`, `timing\driver.py` | stdio JSON-RPC timing drivers | KEEP (fleet re-benchmark may reuse) |
 | `timing\fixture.html`, `timing\big.html` | 13-node and 3,000-node file:// fixtures | KEEP (same reason) |
 | `timing\results.json` | raw measured events + summary | KEEP (evidence) |

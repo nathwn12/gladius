@@ -20,7 +20,7 @@ attaching to an external engine gladius never kills. `bin\obscura.exe` plus
 
 Gladius launches the engine as:
 
-```
+```text
 obscura.exe serve --host 127.0.0.1 --port <free> --allow-private-network --allow-file-access
 ```
 
@@ -69,25 +69,25 @@ hard-fails on a repeated flag
 
 Without `--allow-private-network`, `Page.navigate` to a loopback URL fails:
 
-```
+```text
 -32000 Network error: Access to private/internal IP address 127.0.0.1 is not allowed
 ```
 
 A LAN address behaves the same (measured against `http://192.168.1.187:<p>/`):
 
-```
+```text
 -32000 Network error: Access to private/internal IP address 192.168.1.187 is not allowed
 ```
 
 Without `--allow-file-access`, `Page.navigate` to a `file://` URL fails:
 
-```
+```text
 -32601 Page.navigate to file:// is disabled. Restart with `obscura serve --allow-file-access` to enable.
 ```
 
 and `DOM.setFileInputFiles` is refused on the identical node path:
 
-```
+```text
 DOM.setFileInputFiles is disabled. Restart with `obscura serve --allow-file-access` to enable local file uploads.
 ```
 
@@ -109,7 +109,7 @@ capability-gated failure), and the flag-matrix run proved the gated paths both
 ways.
 
 | tool | verdict | reason |
-|---|---|---|
+| --- | --- | --- |
 | `navigate` | supported | warm-session round trip works; see the blank-load race (section 5), surfaced as a `warning` field, not a failure |
 | `snapshot` | supported | AX snapshot with stable refs works against the engine |
 | `screenshot` | supported | viewport and full-page (`captureBeyondViewport`) PNGs are genuine render pixels, not placeholders |
@@ -176,7 +176,7 @@ Obscura arm:
 Definitional mismatches are named per row, never suppressed.
 
 | metric | control (historical arm, path removed) | Obscura | reading |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | process tree (WorkingSet sum) | 7 procs / 189,063,168 B | 2 procs (`obscura.exe` + its windowless `conhost.exe`) / 44,920,832 B | like-for-like, ~4.2x smaller |
 | profile+storage churn | 1,755,014 B across 47 files | 0 B / 0 files (explicit `--storage-dir` run wrote nothing; default runs show no profile bytes anywhere) | like-for-like |
 | screenshot median (viewport) | 30.4 ms | 17.8 ms | like-for-like, ~1.7x faster |

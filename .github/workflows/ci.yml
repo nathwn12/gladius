@@ -9,7 +9,7 @@ on:
     branches: [main]
 permissions:
   contents: read
-  actions: write
+  actions: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   # Never cancel a push run: a docs-only push landing after a code push to
@@ -29,17 +29,20 @@ jobs:
       # actions/checkout v7 (latest v7.0.1, published 2026-07-20) — the same
       # major the repo's other workflows already use. v4 is Node-20 and the
       # runner annotates its deprecation.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          persist-credentials: false
           fetch-depth: 0
       - name: Detect a docs-only change
         id: scope
         shell: bash
+        env:
+          BASE_REF: $BASE_REF
         run: |
           docs='^(.*\.md|docs/.*|LICEN[CS]E(\.md)?)$'
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch --no-tags origin "${{ github.base_ref }}"
-            changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
+            git fetch --no-tags origin "$BASE_REF"
+            changed=$(git diff --name-only "origin/$BASE_REF...HEAD")
           elif [ "${{ github.event_name }}" = "push" ] && [ -n "${{ github.event.before }}" ]; then
             changed=$(git diff --name-only "${{ github.event.before }}" HEAD || true)
           else
@@ -81,7 +84,7 @@ jobs:
           '
       # Pinned to the crate MSRV (1.88.0, same as rust-toolchain.toml and the
       # release workflow), with the fmt + clippy components the gates need.
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@5445741acf05630efa19e221cc588ebe0842b13d # 1.88.0
         if: steps.scope.outputs.code == 'true'
         with:
           components: rustfmt, clippy
@@ -89,7 +92,7 @@ jobs:
       # typical run inside the <5 min budget.
       - name: restore cargo cache
         if: steps.scope.outputs.code == 'true'
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -117,17 +120,20 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          persist-credentials: false
           fetch-depth: 0
       - name: Detect a docs-only change
         id: scope
         shell: bash
+        env:
+          BASE_REF: $BASE_REF
         run: |
           docs='^(.*\.md|docs/.*|LICEN[CS]E(\.md)?)$'
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch --no-tags origin "${{ github.base_ref }}"
-            changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
+            git fetch --no-tags origin "$BASE_REF"
+            changed=$(git diff --name-only "origin/$BASE_REF...HEAD")
           elif [ "${{ github.event_name }}" = "push" ] && [ -n "${{ github.event.before }}" ]; then
             changed=$(git diff --name-only "${{ github.event.before }}" HEAD || true)
           else
@@ -138,11 +144,11 @@ jobs:
           else
             echo "code=true" >> "$GITHUB_OUTPUT"
           fi
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@5445741acf05630efa19e221cc588ebe0842b13d # 1.88.0
         if: steps.scope.outputs.code == 'true'
       - name: restore cargo cache
         if: steps.scope.outputs.code == 'true'
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -169,19 +175,22 @@ jobs:
     timeout-minutes: 45
     steps:
       # Same action major as the build job and the repo's other workflows.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          persist-credentials: false
           fetch-depth: 0
       # Job-scoped: a job cannot read the build job's step outputs, so the same
       # docs-only detection runs here rather than coupling the two jobs.
       - name: Detect a docs-only change
         id: scope
         shell: bash
+        env:
+          BASE_REF: $BASE_REF
         run: |
           docs='^(.*\.md|docs/.*|LICEN[CS]E(\.md)?)$'
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch --no-tags origin "${{ github.base_ref }}"
-            changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
+            git fetch --no-tags origin "$BASE_REF"
+            changed=$(git diff --name-only "origin/$BASE_REF...HEAD")
           elif [ "${{ github.event_name }}" = "push" ] && [ -n "${{ github.event.before }}" ]; then
             changed=$(git diff --name-only "${{ github.event.before }}" HEAD || true)
           else
@@ -194,13 +203,13 @@ jobs:
           fi
       # Same pin as the build job (crate MSRV 1.88.0). No rustfmt/clippy: this
       # job only compiles and runs tests.
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@5445741acf05630efa19e221cc588ebe0842b13d # 1.88.0
         if: steps.scope.outputs.code == 'true'
       # Its own cache entry, keyed apart from the build job's `cargo-...` key, so
       # the two jobs do not evict each other's `target` on every run.
       - name: restore cargo cache
         if: steps.scope.outputs.code == 'true'
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
             ~/.cargo/registry
@@ -212,7 +221,7 @@ jobs:
       # refuses on mismatch, so a restored dir cannot smuggle in a wrong browser.
       - name: restore pinned browser cache
         if: steps.scope.outputs.code == 'true'
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~\AppData\Local\gladius\chromium
           key: chromium-win64-156.0.8078.80-${{ hashFiles('scripts/chromium-manifest.json') }}

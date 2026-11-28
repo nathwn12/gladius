@@ -19,7 +19,8 @@
 
 ## 1. Playwright-stack MCPs (Node.js + browser driver binaries)
 
-### `@playwright/mcp` - https://github.com/microsoft/playwright-mcp
+### `@playwright/mcp` - <https://github.com/microsoft/playwright-mcp>
+
 - **What it technically does:** MCP server (TypeScript, run via `npx @playwright/mcp`) that drives
   real Chromium/Firefox/WebKit through the Playwright protocol - *not* raw CDP. The headline
   design choice is **accessibility-tree snapshots, not screenshots**: tools like `browser_snapshot`
@@ -35,7 +36,8 @@
 - **Transferable lesson:** a11y-snapshot-first (tokens + determinism beat pixels for most steps);
   ref-based action targeting; opt-in capabilities so the base tool schema stays small.
 
-### Puppeteer reference in `modelcontextprotocol/servers` (archived) - https://github.com/modelcontextprotocol/servers
+### Puppeteer reference in `modelcontextprotocol/servers` (archived) - <https://github.com/modelcontextprotocol/servers>
+
 - **What it technically does:** the original MCP reference servers repo; its Puppeteer server drove
   Chromium via Puppeteer (CDP under the hood) over stdio. Now **archived** - the Puppeteer server
   was superseded by `@playwright/mcp` as the recommended browser route.
@@ -46,7 +48,8 @@
 
 ## 2. Extension-relay MCPs (attach to YOUR browser, no launched browser)
 
-### `hangwin/mcp-chrome` (a.k.a. chrome-mcp-server) - https://github.com/hangwin/mcp-chrome
+### `hangwin/mcp-chrome` (a.k.a. chrome-mcp-server) - <https://github.com/hangwin/mcp-chrome>
+
 - **What it technically does:** a Chrome **extension + MCP bridge**: the extension lives in the
   user's real (headed, logged-in) Chrome and relays tabs/DOM/actions to the MCP server over
   CDP-ish messaging. No browser is launched; automation reuses cookies, logins, and profile.
@@ -59,7 +62,8 @@
 
 ## 3. Python agentic loop (framework, not a driver)
 
-### `browser-use/browser-use` - https://github.com/browser-use/browser-use
+### `browser-use/browser-use` - <https://github.com/browser-use/browser-use>
+
 - **What it technically does:** Python **agent framework** on top of Playwright/Chromium: the LLM
   plans multi-step tasks, extracts structured data, and recovers from failures. The browser is
   still Playwright-driven Chromium; the sophistication is the *loop* (planning, self-healing,
@@ -71,9 +75,12 @@
 
 ## 4. Cloud-browser MCPs (browser runs elsewhere, MCP is a thin client)
 
-### Browserbase - https://github.com/Browserbase/mcp-server-browserbase
-### Steel - https://steel.dev
-### Hyperbrowser - https://github.com/HyperbrowserAI/mcp
+### Browserbase - <https://github.com/Browserbase/mcp-server-browserbase>
+
+### Steel - <https://steel.dev>
+
+### Hyperbrowser - <https://github.com/HyperbrowserAI/mcp>
+
 - **What they technically do:** each vendor runs fleets of real Chromium instances in the cloud
   and ships a small MCP server that maps tool calls -> remote sessions (CDP over websockets,
   session IDs, stealth/anti-bot handling, proxies). The local process holds almost no browser.
@@ -87,24 +94,26 @@
 
 ## 5. Ultralight CDP browser (the one to watch)
 
-### `lightpanda-io/browser` - https://github.com/lightpanda-io/browser
+### `lightpanda-io/browser` - <https://github.com/lightpanda-io/browser>
+
 - **What it technically does:** a **from-scratch headless browser in Zig** - not a Chromium fork:
   its own HTTP loader (libcurl), HTML parser (html5ever), DOM, V8 for JS, adblocker, and a
   **CDP server** (`lightpanda serve --protocol cdp`) plus WebDriver BiDi, a `fetch --dump`
   one-shot mode, and a **native MCP server** (`lightpanda mcp`, stdio *and* HTTP with per-session
   isolation). Deliberately **no graphical/rendering engine**.
 - **Cost profile (their reported benchmark, labelled as vendor-claimed):** 933 real pages on
-  m5.large - peak 123 MB vs 2 GB headless Chrome (~16* lighter), 5 s vs 46 s (~9* faster).
+  m5.large - peak 123 MB vs 2 GB headless Chrome (~16*lighter), 5 s vs 46 s (~9* faster).
   Single static binary, no Node, no Chromium download. Caveats: nightly-only binaries, **no
   native Windows build** (WSL/Docker only), and canvas/WebGL/pixel-perfect rendering are out
-  of scope by design. Details: https://github.com/lightpanda-io/demo/blob/main/BENCHMARKS.md
+  of scope by design. Details: <https://github.com/lightpanda-io/demo/blob/main/BENCHMARKS.md>
 - **Transferable lesson:** this validates gladius's whole bet - CDP-compatible, no-render,
   single-binary is the Pareto frontier for agent browsing. Gladius's Tier-1 plan (Lightpanda
   as the no-render backend) is a *backend swap behind the same 9-tool contract* [archived 2026-10-20: research-phase surface; shipped surface is 25 tools], not a rewrite.
 
 ## 6. Rust building blocks (what gladius itself is built from)
 
-### `chromiumoxide` (mattsse) - https://github.com/mattsse/chromiumoxide
+### `chromiumoxide` (mattsse) - <https://github.com/mattsse/chromiumoxide>
+
 - **What it technically does:** async Rust CDP client: launches/connects Chromium, owns the
   websocket, exposes typed `Page`/`Browser` APIs over tokio. The fastest route to "Rust talking
   CDP" without hand-rolling the protocol.
@@ -113,33 +122,38 @@
 - **Transferable lesson:** use it (or its pattern) for the CDP session, but keep the MCP surface
   frozen at 9 tools [archived 2026-10-20: research-phase surface; shipped surface is 25 tools] - chromiumoxide's API is far wider than agents need.
 
-### `rmcp` - official Rust MCP SDK - https://github.com/modelcontextprotocol/rust-sdk
+### `rmcp` - official Rust MCP SDK - <https://github.com/modelcontextprotocol/rust-sdk>
+
 - **What it technically does:** the official `modelcontextprotocol/rust-sdk` crate (`rmcp`):
   MCP transports (stdio/SSE/streamable HTTP), tool routing, schema derivation. The sanctioned
   way to speak MCP from Rust.
 - **Cost profile:** pure-Rust, no runtime beyond tokio; negligible vs. the browser child.
 - **Transferable lesson:** build the MCP layer on `rmcp` stdio - no hand-rolled JSON-RPC framing.
 
-### `headless_chrome` - https://github.com/rust-headless-chrome/rust-headless-chrome
+### `headless_chrome` - <https://github.com/rust-headless-chrome/rust-headless-chrome>
+
 - **What it technically does:** older/alternative Rust CDP driver: launches Chrome, navigates,
   screenshots via CDP. Largely superseded by `chromiumoxide` for new work.
 - **Cost profile / lesson:** surveyed as the fallback option; lesson is *negative*: pick the
   maintained driver (chromiumoxide), one writer per seam, no driver abstraction layer.
 
-### `fastwebsockets` - https://github.com/littledivy/fastwebsockets
-### `tokio-tungstenite` - https://github.com/snapview/tokio-tungstenite
+### `fastwebsockets` - <https://github.com/littledivy/fastwebsockets>
+
+### `tokio-tungstenite` - <https://github.com/snapview/tokio-tungstenite>
+
 - **What they technically do:** the two candidate websocket transports under the CDP session:
   `fastwebsockets` (SIMD, minimal-copy, fastest) vs `tokio-tungstenite` (standard, most
-  compatible). Docs: https://docs.rs/fastwebsockets / https://docs.rs/chromiumoxide.
+  compatible). Docs: <https://docs.rs/fastwebsockets> / <https://docs.rs/chromiumoxide>.
 - **Cost profile:** both are noise next to a browser process; choice is about latency-per-frame
   and backpressure behaviour.
 - **Transferable lesson:** default to `tokio-tungstenite` for compatibility, benchmark
   `fastwebsockets` as a drop-in if CDP frame latency ever shows up in profiles - measure, don't guess.
 
-### `chrome-headless-shell` + Chrome for Testing - https://googlechromelabs.github.io/chrome-for-testing/
+### `chrome-headless-shell` + Chrome for Testing - <https://googlechromelabs.github.io/chrome-for-testing/>
+
 - **What it technically does:** `chrome-headless-shell` is Google's official **no-UI Chromium
   build** (the old `--headless` split out as its own binary), distributed via the Chrome-for-Testing
-  versioned endpoints. Background: https://developer.chrome.com/blog/chrome-headless-shell.
+  versioned endpoints. Background: <https://developer.chrome.com/blog/chrome-headless-shell>.
   Measured 2026-10-09 on this machine, it resolved via Playwright's cache
   (`%LOCALAPPDATA%\ms-playwright\chromium_headless_shell-*\chrome-headless-shell-win64\chrome-headless-shell.exe`).
   Historical record only: gladius no longer launches this path (self-contained
@@ -189,21 +203,21 @@
 - **Distribution:** one static `.exe`, no `npx`/pip/download step - the anti-Playwright story.
 - **Correct CDP concurrency:** tokio + typed CDP sessions (via `chromiumoxide`/`rmcp` patterns)
   give backpressure and kill-tree semantics that are awkward in GC'd runtimes.
-- **Official SDK exists:** `rmcp` (https://github.com/modelcontextprotocol/rust-sdk) means the MCP
+- **Official SDK exists:** `rmcp` (<https://github.com/modelcontextprotocol/rust-sdk>) means the MCP
   layer is maintained upstream, not hand-rolled.
 
 ## Who we beat / who beats us (axes: startup, RAM, deps, features)
 
 | System | Startup | RAM (local) | Deps | Features | Verdict |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | gladius (target) | ~50 ms server; lazy browser | ~5 MB server + ~150 MB shell child | 1 static exe | 25 tools, CDP-full-fidelity DOM | - |
-| `@playwright/mcp` https://github.com/microsoft/playwright-mcp | seconds (npx+Node+browser) | GBs w/ browser | Node 18+, browser downloads | 30+ tools, multi-browser, vision/pdf | **we beat it** on startup/RAM/deps; **it beats us** on breadth |
-| Puppeteer reference https://github.com/modelcontextprotocol/servers | seconds | GBs | Node + Chromium | archived, minimal | **we beat it** everywhere; it is dead |
-| `hangwin/mcp-chrome` https://github.com/hangwin/mcp-chrome | ~0 (browser already open) | ~0 own | extension + human browser | logged-in human profile | **it beats us** for personal browsing; **we beat it** headless/CI |
-| `browser-use` https://github.com/browser-use/browser-use | seconds + LLM first-step | GBs + model | Python+Playwright+LLM | autonomous multi-step tasks | different game: **it beats us** on agency, **we beat it** as a substrate (it could drive *us*) |
-| Browserbase https://github.com/Browserbase/mcp-server-browserbase / Steel https://steel.dev / Hyperbrowser https://github.com/HyperbrowserAI/mcp | fast local, slow per-action (network) | ~0 local (cloud pays) | account + billing + network | stealth, fleet, sessions | **they beat us** on scale/stealth ops; **we beat them** on offline, $0, data-local |
-| Lightpanda https://github.com/lightpanda-io/browser | fastest w/ renderless (~ms) | ~123 MB / 100 pages (vendor claim) | 1 binary (no Win native!) | no-render DOM/fetch/MCP | **it beats us** on RAM *once its tier lands* (we will adopt it); **we beat it** today on Windows + pixel fidelity |
-| Raw `chromiumoxide` https://github.com/mattsse/chromiumoxide | n/a (library) | n/a | Rust crate | full CDP API | substrate, not rival - we wrap its pattern |
+| `@playwright/mcp` <https://github.com/microsoft/playwright-mcp> | seconds (npx+Node+browser) | GBs w/ browser | Node 18+, browser downloads | 30+ tools, multi-browser, vision/pdf | **we beat it** on startup/RAM/deps; **it beats us** on breadth |
+| Puppeteer reference <https://github.com/modelcontextprotocol/servers> | seconds | GBs | Node + Chromium | archived, minimal | **we beat it** everywhere; it is dead |
+| `hangwin/mcp-chrome` <https://github.com/hangwin/mcp-chrome> | ~0 (browser already open) | ~0 own | extension + human browser | logged-in human profile | **it beats us** for personal browsing; **we beat it** headless/CI |
+| `browser-use` <https://github.com/browser-use/browser-use> | seconds + LLM first-step | GBs + model | Python+Playwright+LLM | autonomous multi-step tasks | different game: **it beats us** on agency, **we beat it** as a substrate (it could drive *us*) |
+| Browserbase <https://github.com/Browserbase/mcp-server-browserbase> / Steel <https://steel.dev> / Hyperbrowser <https://github.com/HyperbrowserAI/mcp> | fast local, slow per-action (network) | ~0 local (cloud pays) | account + billing + network | stealth, fleet, sessions | **they beat us** on scale/stealth ops; **we beat them** on offline, $0, data-local |
+| Lightpanda <https://github.com/lightpanda-io/browser> | fastest w/ renderless (~ms) | ~123 MB / 100 pages (vendor claim) | 1 binary (no Win native!) | no-render DOM/fetch/MCP | **it beats us** on RAM *once its tier lands* (we will adopt it); **we beat it** today on Windows + pixel fidelity |
+| Raw `chromiumoxide` <https://github.com/mattsse/chromiumoxide> | n/a (library) | n/a | Rust crate | full CDP API | substrate, not rival - we wrap its pattern |
 
 **Net:** gladius is the local-minimum box: faster/lighter than every Node/Python/Cloud path on a
 Windows dev machine, conceding only (a) personal-profile browsing to extension relays, (b) fleet

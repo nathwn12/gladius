@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/gladius-mcp"><img src="https://img.shields.io/npm/v/gladius-mcp" alt="npm version" /></a>
-  <img src="https://img.shields.io/badge/platform-windows%20x64-blue" alt="platform" />
+  <img src="https://img.shields.io/badge/platform-Windows%20x64-blue" alt="platform" />
   <img src="https://img.shields.io/badge/tools-25-brightgreen" alt="25 tools" />
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT" />
 </p>
@@ -90,7 +90,7 @@ To drive a browser you already run, set `GLADIUS_CDP_URL` to its CDP endpoint. g
 No flag serves MCP. The launcher's other flags are `--doctor`, `--print-manifest`, `--version` and `--help`.
 
 | Variable | Default | Effect |
-|---|---|---|
+| --- | --- | --- |
 | `GLADIUS_CDP_URL` | unset | Attach to an engine you already run instead of launching one; `close` detaches and never kills it. |
 | `GLADIUS_CHROMIUM` | unset | Absolute path to your own `chrome-headless-shell`; browser provisioning is skipped entirely. |
 | `GLADIUS_VISUAL_DIR` | per-user cache, under `gladius/visual` | Root for `visual` baselines and their sidecars. |

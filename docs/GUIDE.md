@@ -28,7 +28,7 @@ artifacts, each sha256-verified before and after extraction. Any mismatch
 refuses and writes nothing.
 
 | Artifact | Source | Cache location |
-|---|---|---|
+| --- | --- | --- |
 | Server runtime bundle | the runtime zip bundled inside this npm tarball under `bin/` (npm is the release and the only supported source; no GitHub Release page exists). Pre-bundle versions are legacy and unsupported: their manifest URL points at an empty Releases page and may 404. | `%LOCALAPPDATA%\gladius\engine\<serverVersion>-<bundleSha8>\` |
 | `chrome-headless-shell` `156.0.8078.80` | Google's Chrome-for-Testing endpoint (~120 MB) | `%LOCALAPPDATA%\gladius\chromium\<version>-<zipSha8>\` |
 
@@ -86,7 +86,7 @@ part (base64 PNG) and everything else is `text`. `initialize` reports
 ### Launcher flags
 
 | Flag | Default | Effect |
-|---|---|---|
+| --- | --- | --- |
 | *(none)* | - | Provision the pinned runtime plus browser on first run, then serve MCP over stdio. |
 | `--doctor` | off | Print the pinned manifest and resolved cache paths, exit 0, no network. |
 | `--print-manifest` | off | Alias of `--doctor`. |
@@ -105,7 +105,7 @@ unsupported error and a pointer to `GLADIUS_CDP_URL`.
 ### Environment variables
 
 | Variable | Default | Effect |
-|---|---|---|
+| --- | --- | --- |
 | `GLADIUS_CHROMIUM` | unset | Absolute path to your own `chrome-headless-shell` binary. When set and non-blank it wins, and browser provisioning is skipped entirely. Must be a file. |
 | `GLADIUS_ENGINE_CACHE` | `%LOCALAPPDATA%` | Root for the runtime cache; the versioned `<serverVersion>-<bundleSha8>` folder lives under it. |
 | `GLADIUS_CHROMIUM_CACHE` | `%LOCALAPPDATA%` | Root for the browser cache; the versioned `<version>-<zipSha8>` folder lives under it. |
@@ -123,7 +123,7 @@ unsupported error and a pointer to `GLADIUS_CDP_URL`.
 Test-only hooks, never set in production: `GLADIUS_TEST_CRITICAL_DELAY_MS`,
 `GLADIUS_TEST_ENTRY_MS`, `GLADIUS_TEST_ABORT_HOLD_MS`,
 `GLADIUS_TEST_ABORT_SKIP`, `GLADIUS_TEST_DROP_MEDIA_CLEAR`,
-`GLADIUS_TEST_SCRATCH_REJECT_BACKGROUND`. They widen cancellation windows and
+`GLADIUS_TEST_SCRATCH_REJECT_BACKGROUND`. They widen cancellation Windows and
 force failure paths so the suite can hit them deterministically.
 
 ### Installing a version
@@ -155,36 +155,43 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 ### Navigate and manage the session
 
 #### `navigate`
+
 - **Args:** `url: string`
 - **Returns:** page `url` and `title` once the load event fires. A load that never settles is a typed `timeout` error.
 - **Example:** `{"url": "https://example.com"}`
 
 #### `history`
+
 - **Args:** `action: "back" | "forward" | "reload"`
 - **Returns:** live `url` and `title` after the load settles. Stepping past either end is a typed error, not a silent no-op.
 - **Example:** `{"action": "back"}`
 
 #### `tabs`
+
 - **Args:** `action: "list" | "new" | "select" | "close"`, `url?: string`, `index?: number`
 - **Returns:** the tab list, or the mutation result for `new`/`select`/`close`.
 - **Example:** `{"action": "new", "url": "https://example.com"}`
 
 #### `targets`
+
 - **Args:** `action?: "list" | "select"`, `target?: string`
 - **Returns:** every CDP target with its stable id, plus the active page's frame tree. `select` makes a page target current.
 - **Example:** `{"action": "list"}`
 
 #### `viewport`
+
 - **Args:** exactly one of: `reset: true`; `reset: false` + `width` + `height`; or `width` + `height` (plus optional `deviceScaleFactor?: number`, `mobile?: bool`)
 - **Returns:** applied metrics plus a live read-back of `window.innerWidth`/`innerHeight`/`devicePixelRatio`; `matched: false` when the engine ignored the override. `reset: true` clears it.
 - **Example:** `{"width": 1280, "height": 720, "deviceScaleFactor": 1}`
 
 #### `dialog`
+
 - **Args:** `action?: "get" | "policy"`, `accept?: bool`, `promptText?: string`
 - **Returns:** the last auto-handled dialog plus the live policy; `policy` sets the default handling.
 - **Example:** `{"action": "policy", "accept": true}`
 
 #### `close`
+
 - **Args:** none
 - **Returns:** `{ "ok": true }`. Reaps the owned browser tree; on an attached engine it detaches and leaves your process running.
 - **Example:** `{}`
@@ -192,6 +199,7 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 ### Read the page
 
 #### `snapshot`
+
 - **Args:** `mode?: "ax" | "legacy" | "text"` (default `ax`), `frame?: string` (CDP frameId), `offset?: number` (line index, default `0`), `snapshotId: string` (REQUIRED when `offset > 0`: the id the `offset:0` reply returned)
 - **Returns:** the real Accessibility tree, one line per actionable node with a stable ref (`@e1`, `@e2`, ...), role/name/value, plus page text capped at 8000 chars per page. Hidden and `aria-hidden` subtrees are excluded; `legacy` keeps the old DOM heuristic, `text` is text-only. `frame` scopes it to that iframe.
 - **Paging:** when the render exceeds 8000 chars the reply carries `snapshotId`, `totalLines` and `nextOffset`; call again with that `offset` and that `snapshotId` (same `mode`/`frame`) to read the next page. `snapshotId` is required for any `offset > 0` (paging slices one cached render and never re-renders). Pages are slices of one cached render, so refs stay valid across pages - a ref from page 2 acts exactly like a ref from page 1. `nextOffset` is `null` on the last page only; a render whose single line alone exceeds the 8000-char cap is a typed error (re-snapshot with `mode:"text"`) instead of a `nextOffset:null` dead end.
@@ -199,21 +207,25 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 - **Example:** `{}` then `{"offset": 120, "snapshotId": "s7"}`
 
 #### `evaluate`
+
 - **Args:** `expression: string`, `target?: string` (CDP targetId), `frame?: string` (CDP frameId)
 - **Returns:** the JSON-serialised result. `undefined` is a tool error, which stays distinct from an explicit `null`.
 - **Example:** `{"expression": "document.title"}`
 
 #### `console`
+
 - **Args:** `action?: "get" | "drain" | "clear"`, `limit?: number`
 - **Returns:** buffered console messages and uncaught exceptions from a ring buffer capped at 200 entries.
 - **Example:** `{"action": "get", "limit": 50}`
 
 #### `network`
+
 - **Args:** `action?: "get" | "drain" | "clear"`, `filter?: string`, `limit?: number`
 - **Returns:** captured requests and responses (method, url, status, type, timing), capped at 500 entries.
 - **Example:** `{"action": "get", "filter": "api"}`
 
 #### `fetch_text`
+
 - **Args:** `url: string`
 - **Returns:** the page text with tags stripped and scripts dropped, from a plain HTTP GET with **no browser involved**.
 - **Example:** `{"url": "https://example.com"}`
@@ -221,31 +233,37 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 ### Act on the page
 
 #### `click`
+
 - **Args:** `element: string` (CSS or AX ref `@eN`), `frame?: string`, `hoverFirst?: bool` (default `false`)
 - **Returns:** `{ "ok": true }` after a trusted `mousePressed` + `mouseReleased` pair at the exact float box centre (`isTrusted: true` events, after scroll and hit-test). `hoverFirst: true` adds one `mouseMoved`. An occluded target is a typed `not_actionable`, never a click into the overlay.
 - **Example:** `{"element": "@e3"}`
 
 #### `type`
+
 - **Args:** `element: string`, `text: string`, `submit?: bool`, `frame?: string`
 - **Returns:** `{ "ok": true, "valueLength": N }` after focus, select-all and a trusted `Input.insertText`; the seed is replaced, not appended. `valueLength` is the field's real length after the insert (never its value); when it differs from the typed text's UTF-16 length the reply adds a `note` (a `maxlength`, `pattern`, or an input handler transformed it) - the call still succeeds. File/date-like and non-editable targets are a typed `not_editable`.
 - **Example:** `{"element": "#q", "text": "gladius", "submit": true}`
 
 #### `hover`
+
 - **Args:** `element: string`, `frame?: string`
 - **Returns:** `{ "ok": true }` after one trusted `mouseMoved` plus a per-level owner hit-test when frame-scoped.
 - **Example:** `{"element": "#menu"}`
 
 #### `select`
+
 - **Args:** `element: string`, `value?: string`, `text?: string`, `frame?: string`
 - **Returns:** `{ "ok": true }` after choosing a `<select>` option by value (preferred) or visible text. No match is a typed `option_not_found`.
 - **Example:** `{"element": "#sort", "value": "price"}`
 
 #### `key`
+
 - **Args:** `key: string` (`Enter`, `Tab`, `Escape`, ..., or a `Ctrl+A`-style combo)
 - **Returns:** `{ "ok": true }` after the press on the focused element. Combos hold a modifier mask (Alt=1/Ctrl=2/Meta=4/Shift=8) and dispatch `rawKeyDown` with no text when Ctrl/Meta/Alt is held.
 - **Example:** `{"key": "Ctrl+A"}`
 
 #### `upload`
+
 - **Args:** `element: string`, `paths: string[]` (at least one), `frame?: string`
 - **Returns:** `{ "ok": true }` after setting files on an `<input type=file>`. A frame-scoped upload resolves the node in the frame realm, never the main document. A missing path is a typed `file_not_found`.
 - **Example:** `{"element": "#avatar", "paths": ["C:\\\\tmp\\\\a.png"]}`
@@ -253,16 +271,19 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 ### Wait and prove layout
 
 #### `wait_for`
+
 - **Args:** at least one of `selector?: string`, `text?: string`, `ms?: number`, `networkIdle?: bool`, `idleMs?: number`, `expression?: string`
 - **Returns:** `{ "ok": true }` when the condition holds. On expiry the call is a typed `timeout` error (`structuredContent.code = "timeout"`), never a silent `ok:true` (maximum 15 s). `expression` polls a JS predicate with backoff.
 - **Example:** `{"selector": "#results", "ms": 5000}`
 
 #### `assert_layout`
+
 - **Args:** `ref?: string | string[]` or `selector?: string | string[]` (exactly one of them), `checks?: object`, `screenshotOnFail?: bool`, `screenshotPath?: string`, `deterministic?: bool` (default `false`)
 - **Returns:** geometry proved without pixels: `{ pass, checks: [{ target, check, pass, expected, actual, delta }], targets: [...] }`. Checks are `exists`, `visible`, `stableFrames`, `box {x,y,w,h,tolerance}`, `hitTarget`, `computed`, `noOverflow`, `inViewport`. `screenshotOnFail` adds one deterministic capture's path, bytes and checksum. `deterministic: true` measures under the same freeze a deterministic capture uses and echoes `freezeApplied: true` - the only way to compare geometry with that capture, because **a deterministic capture measures the animation-off state**: `animation: none` resets a mid-flight transform to its untransformed base box. `animation-play-state: paused` is deliberately not the default, because a paused animation keeps a wall-clock-dependent frame.
 - **Example:** `{"selector": "#hero", "checks": {"visible": true, "inViewport": true}}`
 
 #### `layout`
+
 - **Args:** `ref?` or `selector?`, `includeOverlaps?: bool` (default `true`)
 - **Returns:** every match's viewport `rect`, page-coordinate `box`, content quad count, scroll size, computed `display`/`visibility`/`opacity`, a z-order hint (`paintIndex`, `zIndex`, `position`, `stackingContext`), and every overlapping pair with its intersection rect and area.
 - **Example:** `{"selector": ".card", "includeOverlaps": true}`
@@ -270,11 +291,13 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 ### Pixels
 
 #### `screenshot`
+
 - **Args:** `fullPage?: bool`, `path?: string` (absolute only), `deterministic?: bool` (default `false`), `width?: number`, `height?: number` (only with `deterministic`)
 - **Returns:** an `image` content part with base64 PNG, plus `size` (the PNG's real pixel width/height, parsed from its IHDR chunk - on `fullPage` this is taller than `viewport` by construction), `viewport`, `deviceScaleFactor`, `url`, `bytes` and a FNV-1a `checksum`. `deterministic: true` pins the capture so two captures of the same page in the same engine produce the same PNG bytes; the scope of the freeze is the main document, same-process frames, open shadow roots, CSS animation, WAAPI, SMIL and media (see `freeze`). Canvas, WebGL, video *frames* and cross-process iframes are **sampled**, not frozen. It fixes metrics, applies the freeze walk, waits for fonts (by `FontFace` status), images and animation frames, and restores everything afterwards. Byte-identity assumes gladius's own PNG encoder: an attached engine may encode differently. Note that no scrolling is performed: below-the-fold `loading="lazy"` content is captured unloaded. A deterministic reply also carries `settled` (did every settle wait finish in budget?), `settleTimeouts` (the closed set `fonts`/`images`/`raf`/`settleCap` that lost), `fontsPending` (how many `FontFace`s were still `loading` when the shot was taken), `freezeMode` (`animation-none`) and `freeze` (what the walk reached); a capture that gave up still returns its PNG, only the claim changes. Fonts are waited by status - `document.fonts.status` plus every face `loaded` or `error` - so a `font-display:swap` page that swaps late is reported, not repaired. Refuses with `capability_gated` under `dom-only`.
 - **Example:** `{"deterministic": true, "fullPage": true}`
 
 #### `visual`
+
 - **Args:** `action: "save" | "compare" | "list" | "delete"`, `name?: string`, `fullPage?: bool`, `threshold?: number` (per-channel, default `0.1`), `maxDiffPixels?: number`, `maxDiffRatio?: number`, `maskRects?: {x,y,w,h}[]`, `update?: bool`, `antialias?: bool` (default `true`), `includeAA?: bool` (default `false`), `allowIgnoredAA?: bool` (default `false`), `minDiffCluster?: number` (default `2`), `requireEnvironmentMatch?: bool`
 - **Returns:** `save` writes `<name>.png` plus a `<name>.meta.json` sidecar (browser, browserMajor, viewport, deviceScaleFactor, url, checksum, createdAt, settled, settleTimeouts). The store lives under `GLADIUS_VISUAL_DIR` (`%LOCALAPPDATA%/gladius/visual` by default, never the caller's cwd) and is capped at 500 baselines and 500 `.diff.png` by-products (`GLADIUS_VISUAL_CAP` overrides both): a save that would grow past the cap is a typed `invalid_args`/`bad_value` naming `visual delete` and `GLADIUS_VISUAL_CAP`, never a silent eviction, while overwriting a stored baseline is always allowed; `.diff.png` files are the only by-products aged out automatically, oldest first, and `list` reports `dir`, `count`, `cap` and `diffCount`. `compare` returns two separate verdicts and the numbers behind them: `pixelsIdentical` (checksum equality - a fact about the bytes, never a judgement) and `passWithinTolerance` (the whole predicate: size, `diffPixels`/`maxDiffPixels`, `ratio`/`maxDiffRatio`, `ignoredPixels` while `allowIgnoredAA` is off, and `environment.match` under `requireEnvironmentMatch`). `pass` is an alias of `passWithinTolerance`, always equal to it and kept for 0.7.x clients: it means "the diff is within the requested tolerance", never "the images are the same". Alongside: `diffPixels, totalPixels, ratio, bbox, maxChannelDelta, ignoredPixels, ignoredClusters, maskedPixels, maskCoverageRatio, maskRectsApplied, baselinePath, diffPath, scratchBackground, settled, settleTimeouts, environment { match, baseline, current }`. A baseline whose sidecar says `settled:false` adds a `baseline_unsettled` warning - and is a typed `baseline_environment_unsettled` failure under `requireEnvironmentMatch: true`, because a strict gate must not pass on an unsettled baseline; a 0.7.x sidecar with no settle state is reported as `baseline_settle_unknown`, never assumed settled. A browser-major, viewport, deviceScaleFactor, full browser version, platform, user agent, colour scheme, forced-colours state, contrast preference, reduced-motion preference, installed-font fingerprint or scrollbar width mismatch is a `baseline_environment_mismatch` warning unless `requireEnvironmentMatch: true`; every axis is read live from the page and the engine, `environment.unknownAxes` lists the ones a 0.7.x sidecar does not record (reported as `baseline_environment_unknown_axes`, never as a silent match). A mask is metered: `maskRectsApplied` echoes the rects actually used (clipped to the image and rounded to whole pixels), `maskedPixels` counts the pixels they cover (union, not sum) and `maskCoverageRatio` is that count over `totalPixels`; a rect that clips away to nothing is dropped and named as `mask_rect_dropped`, and coverage over 10 % appends a `mask_coverage` warning, because a regression inside a mask is invisible. Anti-aliasing is subtracted mechanically: a candidate is suppressed only when its 3x3 luminance neighbourhood has at least 32 levels of contrast in **both** images. Since 0.8.0 that subtraction does **not** pass by default: whenever `ignoredPixels > 0` the reply carries a `warning` naming the subtraction and `passWithinTolerance` is false unless you pass `allowIgnoredAA: true`, which is the explicit opt-in (so a 1-2 px edge change cannot pass silently).
 - **Example:** `{"action": "compare", "name": "home", "maxDiffRatio": 0.001}`
@@ -282,6 +305,7 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 ### State
 
 #### `storage`
+
 - **Args:** `action?: "get" | "set" | "clear" | "save" | "load"`, `scope?: "cookies" | "localStorage" | "sessionStorage" | "all"`, `cookies?: object[]`, `items?: object`, `path?: string`, `allSites?: bool`, `redact?: bool`, `overwrite?: bool`, `force?: bool`, `confirm?: bool`
 - **Returns:** cookies and Web Storage in one call, plus versioned file save/load (`{gladiusStorage: 1, ...}`). Replies carry counts, bytes and origin - never values - unless you ask for them; `redact: true` masks values as `••••`. Cookie writes are read-back-verified (`cookie_rejected` otherwise), and `load` enforces an origin match unless `force: true` (`origin_mismatch`).
 - **Example:** `{"action": "get", "scope": "all"}`
@@ -289,6 +313,7 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 ### Escape hatch
 
 #### `cdp`
+
 - **Args:** `method: string`, `params?: object`, `session?: string`
 - **Returns:** the raw CDP `result`. CDP errors are tool errors, never swallowed.
 - **Example:** `{"method": "Page.getLayoutMetrics"}`
@@ -298,7 +323,7 @@ server. The selector grammar is deliberately tiny; anything fancier goes through
 ## 4. Troubleshooting
 
 | Symptom | Cause | Fix |
-|---|---|---|
+| --- | --- | --- |
 | `global install refused` | The package's `preinstall` refuses `npm i -g` on purpose. | Install the way the README's Install section shows: through `npx`, never globally. |
 | `platform: windows-x86_64 only` at startup | You are not on Windows x64. | Nothing to install around it - the runtime is Windows x64 only. `GLADIUS_MCP_ALLOW_NON_WINDOWS=1` bypasses the gate for diagnostics only. |
 | `version mismatch: launcher X, engine Y` | A stale runtime cache paired with a newer launcher. | Run `--doctor` to see the skew, then reinstall at `@latest` the way the README's Install section shows. |

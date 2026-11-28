@@ -1,0 +1,73 @@
+name: dependabot-auto-merge
+
+# Auto-merge is armed, never forced: GitHub's native auto-merge still waits for
+# every required check and review. No PR code is checked out or executed here;
+# only the API and Dependabot's signed metadata are read.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  auto-merge:
+    # Dependabot only. A fork or a human never gets a write token from this job.
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR_URL: ${{ github.event.pull_request.html_url }}
+    steps:
+      - name: Classify the Dependabot bump
+        id: meta
+        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a # v2
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Check the default branch has required checks
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          body="$(gh api "repos/$GH_REPO/branches/main/protection" 2>/dev/null)" || {
+            echo "has_gate=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          checks="$(printf '%s' "$body" | jq -r '.required_status_checks.contexts // [] | length')"
+          if [ "$checks" -gt 0 ]; then
+            echo "has_gate=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_gate=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Leave an ungated PR for review
+        if: steps.gate.outputs.has_gate == 'false'
+        shell: bash
+        run: |
+          gh pr comment "$PR_URL" --body "No required status checks on main, so auto-merge is not armed. Leaving this PR for review."
+
+      - name: Arm squash auto-merge (patch and minor only)
+        if: steps.gate.outputs.has_gate == 'true' && (steps.meta.outputs.update-type == 'semver-patch' || steps.meta.outputs.update-type == 'semver-minor')
+        shell: bash
+        run: |
+          gh pr merge --auto --squash "$PR_URL"
+
+      - name: Flag a major for review
+        if: steps.meta.outputs.update-type == 'semver-major'
+        shell: bash
+        env:
+          DEPS: ${{ steps.meta.outputs.dependency-names }}
+          FROM: ${{ steps.meta.outputs.previous-version }}
+          TO: ${{ steps.meta.outputs.new-version }}
+        run: |
+          gh label create dependencies-major --color B60205 --description "Major dependency bump; review required" --force >/dev/null 2>&1 || true
+          gh pr edit "$PR_URL" --add-label dependencies-major
+          gh pr comment "$PR_URL" --body "Major bump: $DEPS $FROM -> $TO. Auto-merge is not armed; this one needs review."
