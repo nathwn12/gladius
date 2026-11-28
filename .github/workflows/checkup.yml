@@ -1,0 +1,12 @@
+name: checkup
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checkup:
+    uses: nathwn12/nstack-fleet/.github/workflows/checkup.yml@main
