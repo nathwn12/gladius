@@ -691,7 +691,9 @@ fn capabilities_manifest() {
     );
     assert_eq!(
         init.get("capabilities"),
-        Some(&json!({"tools": {"listChanged": false}})),
+        Some(
+            &json!({"tools": {"listChanged": false}, "resources": {}, "extensions": {"io.modelcontextprotocol/skills": {}}})
+        ),
         "exact tools-only capabilities: {init}"
     );
     let info = init.get("serverInfo").expect("serverInfo present");
@@ -730,7 +732,9 @@ fn capabilities_manifest() {
     let init2 = d.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     assert_eq!(
         init2.get("capabilities"),
-        Some(&json!({"tools": {"listChanged": false}})),
+        Some(
+            &json!({"tools": {"listChanged": false}, "resources": {}, "extensions": {"io.modelcontextprotocol/skills": {}}})
+        ),
         "exact tools-only capabilities: {init2}"
     );
     let info2 = init2.get("serverInfo").expect("serverInfo present");
@@ -1005,7 +1009,9 @@ fn capabilities_invalid_caps() {
     let init = c.result("initialize", json!({"protocolVersion": "2025-06-18"}));
     assert_eq!(
         init.get("capabilities"),
-        Some(&json!({"tools": {"listChanged": false}})),
+        Some(
+            &json!({"tools": {"listChanged": false}, "resources": {}, "extensions": {"io.modelcontextprotocol/skills": {}}})
+        ),
         "exact tools-only capabilities: {init}"
     );
     assert_eq!(

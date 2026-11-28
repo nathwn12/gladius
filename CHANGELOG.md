@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- MCP skills (SEP-2640): the server now advertises `resources` and the `io.modelcontextprotocol/skills` extension, and implements `skills/list`, `skills/get` and `resources/read` for embedded skills; ships a seed `sessions` skill carrying the attach/ensure lifecycle and visual-vs-layout guidance.
+
 ### Fixed
 
 - A hard-killed server's stale profile is swept even when Windows still holds a lock on a file in it: `sweep_stale_profiles` now uses the same bounded `sweep_profile_dir` retries as `close()`, so a job-reaped browser whose pid reads dead no longer leaves its profile behind for the next launch's recovery check.
