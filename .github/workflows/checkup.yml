@@ -10,3 +10,5 @@ permissions:
 jobs:
   checkup:
     uses: nathwn12/nstack-fleet/.github/workflows/checkup.yml@main
+    with:
+      strict: true
