@@ -107,6 +107,9 @@ jobs:
         if: steps.scope.outputs.code == 'true'
       - run: cargo build --locked
         if: steps.scope.outputs.code == 'true'
+      - name: compile test targets
+        if: steps.scope.outputs.code == 'true'
+        run: cargo test --locked --no-run
       - name: Scope
         if: always()
         run: |
