@@ -23,6 +23,8 @@ concurrency:
 
 jobs:
   automerge:
+    # Dependabot PRs, majors included, are left for a human.
+    if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Re-derive the changed files from the API

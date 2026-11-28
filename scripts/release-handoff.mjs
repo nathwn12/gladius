@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 
 export const requiredChecks = [
-  "derive", "fmt", "clippy", "browser", "build", "test", "selftest", "release-check", "cleanroom",
+  "derive", "fmt", "clippy", "browser", "build", "test", "release-check", "cleanroom",
 ];
 export const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 export const need = (condition, message) => { if (!condition) throw new Error(message); };

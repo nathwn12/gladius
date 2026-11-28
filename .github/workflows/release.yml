@@ -33,7 +33,7 @@ permissions:
 jobs:
   publish:
     if: github.repository == 'nathwn12/gladius' && github.ref == 'refs/heads/main'
-    runs-on: windows-latest
+    runs-on: windows-2022
     permissions:
       actions: read
       contents: write
