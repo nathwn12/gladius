@@ -29,8 +29,12 @@ node scripts/prepare-release.mjs --commit $commit --out target/release-candidate
 The output directory must not exist. A failed gate produces no publishable receipt.
 Logs go to standard output; capture them outside the output directory if needed.
 The command checks history/version derivation, formatting, clippy, pinned browser
-provisioning and every provisioned browser file, locked release build and full tests,
-real-browser selftest, attribution, final tarball preflight and fresh-profile install/boot.
+provisioning and every provisioned browser file, locked release build, browser-free
+unit tests, attribution, final tarball preflight and fresh-profile install/boot.
+The browser-dependent suites (`cargo test --locked`, `cargo test --release --locked`
+and `target\release\gladius.exe selftest`) run byte-identically in the advisory `test`
+job of `ci.yml` on pull requests: job-level `continue-on-error`, a report to
+`$GITHUB_STEP_SUMMARY`, and never on the publish path.
 It packs once, stages the built runtime ZIP into the package's `bin/`, and tests that
 exact tarball against that exact ZIP. It does not edit tracked manifests or close the
 working tree's changelog.

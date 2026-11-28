@@ -22,7 +22,7 @@ permissions:
 jobs:
   stage:
     if: github.repository == 'nathwn12/gladius' && github.ref == 'refs/heads/main'
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
